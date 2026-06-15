@@ -7,7 +7,7 @@ export default function Home() {
       <header className="mb-6">
         <h1 className="text-2xl font-semibold">Smartroom Control</h1>
         <p className="text-sm text-neutral-500">
-          Synchronized recording across {NODES.length} camera nodes.
+          Live preview and synchronized recording across {NODES.length} camera nodes.
         </p>
       </header>
       <Panel nodes={NODES} />
