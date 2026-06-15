@@ -2,8 +2,8 @@
 
 import { useQuery } from "@tanstack/react-query";
 
+import { NodeCard } from "@/components/node-card";
 import { RecordBar } from "@/components/record-bar";
-import { StreamTile } from "@/components/stream-tile";
 import type { CombinedStatus, NodeConfig, NodeStatus } from "@/lib/types";
 
 export function Panel({ nodes: initial }: { nodes: NodeConfig[] }) {
@@ -24,9 +24,9 @@ export function Panel({ nodes: initial }: { nodes: NodeConfig[] }) {
 
   return (
     <div className="flex flex-col gap-5">
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
         {nodes.map((n) => (
-          <StreamTile key={n.id} node={n} />
+          <NodeCard key={n.id} node={n} />
         ))}
       </div>
       <RecordBar anyRunning={anyRunning} />
