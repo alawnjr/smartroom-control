@@ -5,6 +5,7 @@ import { useQuery } from "@tanstack/react-query";
 import { NodeCard } from "@/components/node-card";
 import { RecordBar } from "@/components/record-bar";
 import { SaveBar } from "@/components/save-bar";
+import { SavedGallery } from "@/components/saved-gallery";
 import type { CombinedStatus, NodeConfig, NodeStatus } from "@/lib/types";
 
 export function Panel({ nodes: initial }: { nodes: NodeConfig[] }) {
@@ -32,6 +33,7 @@ export function Panel({ nodes: initial }: { nodes: NodeConfig[] }) {
       </div>
       <RecordBar anyRunning={anyRunning} />
       <SaveBar />
+      <SavedGallery />
     </div>
   );
 }

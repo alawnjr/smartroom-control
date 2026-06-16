@@ -1,6 +1,6 @@
 "use client";
 
-import { useMutation } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Download } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
@@ -11,11 +11,13 @@ function mb(bytes: number) {
 }
 
 export function SaveBar() {
+  const qc = useQueryClient();
   const save = useMutation({
     mutationFn: async (): Promise<SaveResponse> => {
       const res = await fetch("/api/save-all", { method: "POST" });
       return res.json();
     },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }), // refresh the gallery
   });
   const data = save.data;
 

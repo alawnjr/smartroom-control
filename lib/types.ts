@@ -45,3 +45,16 @@ export type SaveResult = {
 };
 
 export type SaveResponse = { saveRoot: string; nodes: SaveResult[] };
+
+// A video saved under recordings/ (cam1/day_*/rec_*/streams/file.mp4).
+export type SavedVideo = {
+  node: string; // cam1 / cam2
+  day: string; // day_NN_YYYY-MM-DD
+  rec: string; // rec_YYYYMMDD_NNN
+  file: string; // camera_main.mp4
+  relPath: string; // full path relative to the recordings root
+  size: number;
+  mtime: number;
+};
+
+export type SavedListing = { root: string; videos: SavedVideo[] };
