@@ -8,9 +8,16 @@ dashboard can toggle between models (nano / small / medium):
 - `camera_main.detections.<model>.json` — occupancy stats + per-sampled-frame timeline
 - `camera_main.annotated.<model>.mp4` — boxes burned in, re-encoded to H.264 (browser-playable)
 
-Default models: `yolo26n, yolo26s, yolo26m, yolo26l`. Measured here (OpenVINO
-intel:cpu, 640px): nano ~48 FPS, small ~18 FPS, medium ~7 FPS (large is slower
-still) — all fine for offline batch.
+Default models: `yolo26n, yolo26s, yolo26m, yolo26l, yolo26n-pose`. Measured here
+(OpenVINO intel:cpu, 640px): nano ~48 FPS, small ~18 FPS, medium ~7 FPS (large
+slower still) — all fine for offline batch.
+
+A model key containing **`pose`** runs the pose task instead of detection: it
+draws **skeletons** (COCO-17) in the annotated video and additionally writes
+`camera_main.keypoints.<model>.json` (per-sampled-frame normalized keypoints per
+person) — the input for a downstream temporal action classifier. The dashboard
+shows it as another toggle option ("pose"); occupancy stats still come from the
+person count.
 
 It's idempotent (skips clips whose results are current), safe against concurrent
 runs (a global `flock` on `recordings/.detect.lock`), and writes a

@@ -49,7 +49,9 @@ def saved_root() -> Path:
 
 def model_specs():
     """(key, openvino_dir) for each configured model."""
-    keys = os.environ.get("SMARTROOM_YOLO_MODELS", "yolo26n,yolo26s,yolo26m,yolo26l").split(",")
+    keys = os.environ.get(
+        "SMARTROOM_YOLO_MODELS", "yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose"
+    ).split(",")
     base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
     return [(k.strip(), base / f"{k.strip()}_openvino_model") for k in keys if k.strip()]
 
@@ -57,6 +59,31 @@ def model_specs():
 IMGSZ = int(os.environ.get("SMARTROOM_DETECT_IMGSZ", "640"))
 SAMPLE_FPS = float(os.environ.get("SMARTROOM_DETECT_SAMPLE_FPS", "5"))
 ANNOTATE = os.environ.get("SMARTROOM_DETECT_ANNOTATE", "1") != "0"
+KPT_CONF = 0.3  # keypoint visibility threshold for drawing
+
+# COCO-17 skeleton edges (joint index pairs), for drawing pose annotations.
+COCO_SKELETON = [
+    (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16), (0, 1), (0, 2), (1, 3), (2, 4),
+    (0, 5), (0, 6),
+]
+
+
+def _is_pose(key: str) -> bool:
+    return "pose" in key
+
+
+def _draw_skeleton(frame, persons):
+    """persons: list of (kpts_xy [(x,y),...17], conf [c,...17])."""
+    import cv2
+
+    for kpts, conf in persons:
+        for a, b in COCO_SKELETON:
+            if conf[a] > KPT_CONF and conf[b] > KPT_CONF:
+                cv2.line(frame, tuple(map(int, kpts[a])), tuple(map(int, kpts[b])), (0, 200, 0), 2)
+        for (x, y), c in zip(kpts, conf):
+            if c > KPT_CONF:
+                cv2.circle(frame, (int(x), int(y)), 3, (0, 255, 255), -1)
 
 
 def sidecar_paths(mp4: Path, key: str):
@@ -95,6 +122,7 @@ def needs_processing(mp4: Path, key: str, force: bool) -> bool:
 def process_clip(model, key: str, mp4: Path):
     import cv2
 
+    pose = _is_pose(key)
     json_path, annotated_path = sidecar_paths(mp4, key)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
@@ -115,28 +143,64 @@ def process_clip(model, key: str, mp4: Path):
                                  native_fps, (width, height))
 
     timeline = []
-    last_boxes = []
+    keypoints_timeline = []  # pose only: normalized keypoints per sampled frame (for action models)
+    last_boxes = []          # detection: [(x1,y1,x2,y2)]
+    last_persons = []        # pose: [(kpts_xy, conf)] in pixels, for drawing
     idx = 0
     while True:
         ok, frame = cap.read()
         if not ok:
             break
         if idx % stride == 0:
-            res = model.predict(frame, imgsz=IMGSZ, classes=[PERSON_CLASS],
-                                device="intel:cpu", verbose=False)[0]
-            last_boxes = [tuple(map(int, b)) for b in res.boxes.xyxy.tolist()] if res.boxes else []
-            timeline.append({"t": round(idx / native_fps, 3), "count": len(last_boxes)})
+            t = round(idx / native_fps, 3)
+            if pose:
+                res = model.predict(frame, imgsz=IMGSZ, device="intel:cpu", verbose=False)[0]
+                kp = res.keypoints
+                xy = kp.xy.tolist() if kp is not None else []
+                xyn = kp.xyn.tolist() if kp is not None else []
+                conf = (kp.conf.tolist() if (kp is not None and kp.conf is not None) else
+                        [[1.0] * len(p) for p in xy])
+                last_persons = [(xy[i], conf[i]) for i in range(len(xy))]
+                count = len(xy)
+                timeline.append({"t": t, "count": count})
+                keypoints_timeline.append({
+                    "t": t,
+                    "persons": [
+                        {"kpts": [[round(x, 4), round(y, 4)] for x, y in xyn[i]],
+                         "conf": [round(c, 3) for c in conf[i]]}
+                        for i in range(len(xyn))
+                    ],
+                })
+            else:
+                res = model.predict(frame, imgsz=IMGSZ, classes=[PERSON_CLASS],
+                                    device="intel:cpu", verbose=False)[0]
+                last_boxes = [tuple(map(int, b)) for b in res.boxes.xyxy.tolist()] if res.boxes else []
+                timeline.append({"t": t, "count": len(last_boxes)})
         if writer is not None:
-            for (x1, y1, x2, y2) in last_boxes:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
-            if last_boxes:
-                cv2.putText(frame, f"people: {len(last_boxes)}", (10, 28),
+            count = len(last_persons) if pose else len(last_boxes)
+            if pose:
+                _draw_skeleton(frame, last_persons)
+            else:
+                for (x1, y1, x2, y2) in last_boxes:
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+            if count:
+                cv2.putText(frame, f"people: {count}", (10, 28),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
             writer.write(frame)
         idx += 1
     cap.release()
     if writer is not None:
         writer.release()
+
+    if pose:
+        # Bulky per-frame keypoints go in a separate sidecar (the dashboard
+        # listing doesn't read this — it's input for the action classifier).
+        _atomic_write_json(mp4.with_name(f"{mp4.stem}.keypoints.{key}.json"), {
+            "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
+            "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
+            "sampleFps": SAMPLE_FPS, "keypointFormat": "coco17_xyn",
+            "frames": keypoints_timeline,
+        })
 
     has_annotated = False
     if tmp_annotated is not None and tmp_annotated.exists():

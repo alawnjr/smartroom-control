@@ -6,12 +6,13 @@ import { useQuery } from "@tanstack/react-query";
 import { OccupancySparkline } from "@/components/occupancy-sparkline";
 import type { DetectionSummary, SavedListing, SavedVideo } from "@/lib/types";
 
-const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l"];
+const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose"];
 const MODEL_LABEL: Record<string, string> = {
   yolo26n: "nano",
   yolo26s: "small",
   yolo26m: "medium",
   yolo26l: "large",
+  "yolo26n-pose": "pose",
 };
 
 function mb(b: number) {
@@ -65,7 +66,7 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
             onClick={() => setAnnotated((a) => !a)}
             className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-300 hover:bg-neutral-800"
           >
-            {showAnnotated ? "raw" : "boxes"}
+            {showAnnotated ? "raw" : "overlay"}
           </button>
         )}
       </div>
@@ -101,7 +102,10 @@ export function SavedGallery() {
   // models present across all clips, in nano→small→medium order
   const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
   const [sel, setSel] = useState<string | null>(null);
-  const model = sel && available.includes(sel) ? sel : (available[available.length - 1] ?? null); // default: largest available
+  // default to the largest available *detection* model (not pose)
+  const detection = available.filter((m) => !m.includes("pose"));
+  const fallback = detection[detection.length - 1] ?? available[available.length - 1] ?? null;
+  const model = sel && available.includes(sel) ? sel : fallback;
 
   const byNode = new Map<string, SavedVideo[]>();
   for (const v of videos) {
