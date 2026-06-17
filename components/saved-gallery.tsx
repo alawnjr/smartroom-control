@@ -1,11 +1,92 @@
 "use client";
 
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import { OccupancySparkline } from "@/components/occupancy-sparkline";
 import type { SavedListing, SavedVideo } from "@/lib/types";
 
 function mb(b: number) {
   return `${(b / 1e6).toFixed(b >= 1e7 ? 0 : 1)} MB`;
+}
+
+function fileUrl(relPath: string) {
+  return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
+}
+
+function OccupancyBadge({ v }: { v: SavedVideo }) {
+  const d = v.detection;
+  if (!d || d.status === "none") {
+    return <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-500">not analyzed</span>;
+  }
+  if (d.status === "analyzing") {
+    return (
+      <span className="flex items-center gap-1 rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] text-amber-400">
+        <span className="size-1.5 animate-pulse rounded-full bg-amber-400" /> analyzing…
+      </span>
+    );
+  }
+  if (d.status === "error") {
+    return (
+      <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] text-red-400" title={d.error}>
+        analysis failed
+      </span>
+    );
+  }
+  return (
+    <span className="rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+      👤 max {d.maxPersons} · avg {d.avgPersons}
+    </span>
+  );
+}
+
+function ClipCard({ v }: { v: SavedVideo }) {
+  const d = v.detection;
+  const hasAnnotated = Boolean(d?.hasAnnotated && d.annotatedRelPath);
+  const [annotated, setAnnotated] = useState(false);
+  const showAnnotated = annotated && hasAnnotated;
+  const src = showAnnotated ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
+
+  return (
+    <div className="flex flex-col gap-1 rounded-lg border border-neutral-800 bg-black/30 p-2">
+      <video
+        key={src}
+        controls
+        preload="none"
+        className="aspect-video w-full rounded bg-black"
+        src={src}
+      />
+      {d?.status === "done" && d.timeline && (
+        <OccupancySparkline timeline={d.timeline} max={d.maxPersons ?? 0} />
+      )}
+      <div className="flex items-center justify-between gap-2">
+        <OccupancyBadge v={v} />
+        {hasAnnotated && (
+          <button
+            onClick={() => setAnnotated((a) => !a)}
+            className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-300 hover:bg-neutral-800"
+          >
+            {showAnnotated ? "raw" : "boxes"}
+          </button>
+        )}
+      </div>
+      <div className="flex items-center justify-between gap-2 text-xs text-neutral-400">
+        <span className="truncate" title={`${v.day}/${v.rec}/${v.file}`}>
+          {v.rec || v.file}
+        </span>
+        <a
+          className="shrink-0 text-emerald-400 hover:underline"
+          href={fileUrl(v.relPath)}
+          download={`${v.node}_${v.rec}_${v.file}`}
+        >
+          download
+        </a>
+      </div>
+      <span className="text-[10px] text-neutral-600">
+        {v.day} · {mb(v.size)}
+      </span>
+    </div>
+  );
 }
 
 export function SavedGallery() {
@@ -16,6 +97,9 @@ export function SavedGallery() {
       return res.json();
     },
     refetchOnWindowFocus: false,
+    // Live-update while any clip is being analyzed.
+    refetchInterval: (q) =>
+      q.state.data?.videos?.some((v) => v.detection?.status === "analyzing") ? 3000 : false,
   });
 
   const videos = data?.videos ?? [];
@@ -45,37 +129,9 @@ export function SavedGallery() {
                 </span>
               </div>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
-                {byNode.get(node)!.map((v) => {
-                  const url = `/api/saved/file?path=${encodeURIComponent(v.relPath)}`;
-                  return (
-                    <div
-                      key={v.relPath}
-                      className="flex flex-col gap-1 rounded-lg border border-neutral-800 bg-black/30 p-2"
-                    >
-                      <video
-                        controls
-                        preload="none"
-                        className="aspect-video w-full rounded bg-black"
-                        src={url}
-                      />
-                      <div className="flex items-center justify-between gap-2 text-xs text-neutral-400">
-                        <span className="truncate" title={`${v.day}/${v.rec}/${v.file}`}>
-                          {v.rec || v.file}
-                        </span>
-                        <a
-                          className="shrink-0 text-emerald-400 hover:underline"
-                          href={url}
-                          download={`${node}_${v.rec}_${v.file}`}
-                        >
-                          download
-                        </a>
-                      </div>
-                      <span className="text-[10px] text-neutral-600">
-                        {v.day} · {mb(v.size)}
-                      </span>
-                    </div>
-                  );
-                })}
+                {byNode.get(node)!.map((v) => (
+                  <ClipCard key={v.relPath} v={v} />
+                ))}
               </div>
             </div>
           ))}

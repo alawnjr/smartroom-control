@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodically run smartroom person-detection (reliable watcher)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=smartroom-detect.service
+
+[Install]
+WantedBy=timers.target

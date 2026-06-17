@@ -1,13 +1,18 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Download } from "lucide-react";
+import { Download, ScanEye } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import type { SaveResponse } from "@/lib/types";
 
 function mb(bytes: number) {
   return (bytes / 1e6).toFixed(bytes >= 1e7 ? 0 : 1);
+}
+
+function triggerDetect() {
+  // fire-and-forget; the gallery's analyzing-poll surfaces progress
+  return fetch("/api/detect", { method: "POST" }).catch(() => {});
 }
 
 export function SaveBar() {
@@ -17,7 +22,14 @@ export function SaveBar() {
       const res = await fetch("/api/save-all", { method: "POST" });
       return res.json();
     },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }), // refresh the gallery
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["saved"] }); // refresh the gallery
+      triggerDetect(); // analyze freshly pulled clips
+    },
+  });
+  const analyze = useMutation({
+    mutationFn: triggerDetect,
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
   });
   const data = save.data;
 
@@ -32,6 +44,16 @@ export function SaveBar() {
         >
           <Download />
           {save.isPending ? "Saving…" : "Save All to Laptop"}
+        </Button>
+        <Button
+          variant="outline"
+          size="lg"
+          disabled={analyze.isPending}
+          onClick={() => analyze.mutate()}
+          title="Run person-detection over saved recordings (skips already-analyzed)"
+        >
+          <ScanEye />
+          {analyze.isPending ? "Starting…" : "Re-analyze"}
         </Button>
         {data && <span className="text-xs text-neutral-500">→ {data.saveRoot}</span>}
         {save.isError && <span className="text-xs text-red-400">request failed</span>}

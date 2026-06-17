@@ -9,9 +9,17 @@ own `app/api/*` routes server-side (the Pi sets no CORS headers).
 
 **Save All to Laptop** mirrors every recording from both nodes to disk. It reads
 each node's `/recordings` listing and streams the videos into
-`<SMARTROOM_SAVE_DIR>/<nodeId>/<day>/<rec>/streams/...` (default
-`~/Videos/Smartroom Recordings`), skipping files already present at the same
-size — so re-running only fetches new recordings.
+`<SMARTROOM_SAVE_DIR>/<nodeId>/<day>/<rec>/streams/...` (default `./recordings/`,
+gitignored), skipping files already present at the same size — so re-running only
+fetches new recordings.
+
+**Person detection (occupancy).** `detect/detect.py` runs a pretrained YOLO26
+nano model (OpenVINO, `intel:cpu`) over the saved clips, counting people, and
+writes a `*.detections.json` (stats + timeline) and a `*.annotated.mp4` (boxes)
+next to each clip. The gallery shows an occupancy badge, a timeline sparkline,
+and a boxes/raw video toggle. It runs automatically (a systemd timer + path
+watcher, and right after Save All) and via the **Re-analyze** button. See
+[`detect/README.md`](detect/README.md) for setup, env vars, and the systemd units.
 
 > "Record All" fires both POSTs in one tick to minimize start skew, but the
 > clap-at-t0 marker is still the fine-sync mechanism — don't treat the two
