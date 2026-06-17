@@ -12,19 +12,18 @@ export const dynamic = "force-dynamic";
 // Cancel an in-progress detection run: kill the process group recorded in
 // recordings/.detect.pid (detect.py is a group leader, so this also kills its
 // ffmpeg/forkserver children), then clear any stuck "analyzing" markers.
-export async function POST() {
-  const pidFile = path.join(savedRoot(), ".detect.pid");
-  let cancelled = false;
+function killByPidFile(pidFile: string): boolean {
+  let killed = false;
   try {
     const pid = parseInt(readFileSync(pidFile, "utf8").trim(), 10);
     if (pid) {
       try {
         process.kill(-pid, "SIGKILL"); // whole group
-        cancelled = true;
+        killed = true;
       } catch {
         try {
           process.kill(pid, "SIGKILL"); // fallback: just the leader
-          cancelled = true;
+          killed = true;
         } catch {
           /* already gone */
         }
@@ -38,6 +37,14 @@ export async function POST() {
   } catch {
     /* ignore */
   }
+  return killed;
+}
+
+// Cancel both detection and action runs.
+export async function POST() {
+  const root = savedRoot();
+  const a = killByPidFile(path.join(root, ".detect.pid"));
+  const b = killByPidFile(path.join(root, ".action.pid"));
   const cleared = clearAnalyzing();
-  return NextResponse.json({ cancelled, cleared });
+  return NextResponse.json({ cancelled: a || b, cleared });
 }

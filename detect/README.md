@@ -12,6 +12,19 @@ Default models: `yolo26n, yolo26s, yolo26m, yolo26l, yolo26n-pose`. Measured her
 (OpenVINO intel:cpu, 640px): nano ~48 FPS, small ~18 FPS, medium ~7 FPS (large
 slower still) — all fine for offline batch.
 
+## Per-person action recognition (`action.py`)
+
+`action.py` is a separate, heavier pipeline (triggered by the dashboard's
+**Actions** button / `POST /api/action`, not the auto-run timer): YOLO26-pose
+**with tracking** gives a stable id+bbox per person, a per-track-id sliding
+window of body crops is fed to a **pretrained Kinetics-400 video classifier**
+(torchvision `r2plus1d_18`, CPU — no mmcv), and the predicted action label is
+overlaid on each tracked person. Outputs per clip: `camera_main.annotated.action.mp4`,
+`camera_main.detections.action.json` (summary → the dashboard's "actions"
+toggle + badge), and `camera_main.actions.action.json` (per-track timeline).
+Idempotent, flock-guarded (`.action.lock`), and cancellable (`.action.pid`).
+Note: Kinetics-400 labels are generic activity classes, not office-specific.
+
 A model key containing **`pose`** runs the pose task instead of detection: it
 draws **skeletons** (COCO-17) in the annotated video and additionally writes
 `camera_main.keypoints.<model>.json` (per-sampled-frame normalized keypoints per
