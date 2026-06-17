@@ -6,11 +6,12 @@ import { useQuery } from "@tanstack/react-query";
 import { OccupancySparkline } from "@/components/occupancy-sparkline";
 import type { DetectionSummary, SavedListing, SavedVideo } from "@/lib/types";
 
-const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m"];
+const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l"];
 const MODEL_LABEL: Record<string, string> = {
   yolo26n: "nano",
   yolo26s: "small",
   yolo26m: "medium",
+  yolo26l: "large",
 };
 
 function mb(b: number) {

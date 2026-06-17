@@ -49,7 +49,7 @@ def saved_root() -> Path:
 
 def model_specs():
     """(key, openvino_dir) for each configured model."""
-    keys = os.environ.get("SMARTROOM_YOLO_MODELS", "yolo26n,yolo26s,yolo26m").split(",")
+    keys = os.environ.get("SMARTROOM_YOLO_MODELS", "yolo26n,yolo26s,yolo26m,yolo26l").split(",")
     base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
     return [(k.strip(), base / f"{k.strip()}_openvino_model") for k in keys if k.strip()]
 
