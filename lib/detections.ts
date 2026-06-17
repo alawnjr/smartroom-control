@@ -1,43 +1,37 @@
-import { statSync } from "node:fs";
+import { readdirSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { savedRoot } from "@/lib/recordings";
 import type { DetectionSummary } from "@/lib/types";
 
-// Sidecar paths for a source mp4 (absolute): <stem>.detections.json and
-// <stem>.annotated.mp4 — matches detect/detect.py.
-export function sidecarPaths(absMp4: string) {
-  const dir = path.dirname(absMp4);
+// Per-model sidecars for a source mp4 (matches detect/detect.py):
+//   <stem>.detections.<model>.json  and  <stem>.annotated.<model>.mp4
+function detectionsPrefix(absMp4: string) {
   const stem = path.basename(absMp4, path.extname(absMp4));
-  return {
-    json: path.join(dir, `${stem}.detections.json`),
-    annotated: path.join(dir, `${stem}.annotated.mp4`),
-  };
+  return `${stem}.detections.`;
 }
 
-// Read a clip's detection summary, applying the same staleness check as the
-// Python script (stale/missing → "none"). Never throws.
-export async function readDetectionSummary(absMp4: string): Promise<DetectionSummary> {
-  const { json, annotated } = sidecarPaths(absMp4);
-  try {
-    const raw = JSON.parse(await readFile(json, "utf8"));
-    const status = raw.status as DetectionSummary["status"];
+function annotatedName(absMp4: string, model: string) {
+  const stem = path.basename(absMp4, path.extname(absMp4));
+  return `${stem}.annotated.${model}.mp4`;
+}
 
-    if (status === "error") {
-      return { status: "error", error: raw.error ?? "analysis failed", hasAnnotated: false };
+async function readOne(jsonPath: string, absMp4: string, model: string): Promise<DetectionSummary> {
+  try {
+    const raw = JSON.parse(await readFile(jsonPath, "utf8"));
+    const status = raw.status as DetectionSummary["status"];
+    if (status === "error") return { model, status: "error", error: raw.error ?? "analysis failed", hasAnnotated: false };
+    if (status === "analyzing") return { model, status: "analyzing", hasAnnotated: false };
+
+    // done: stale (→ none) if the source mp4 is newer
+    if ((raw.sourceMtimeMs ?? 0) < statSync(absMp4).mtimeMs) {
+      return { model, status: "none", hasAnnotated: false };
     }
-    if (status === "analyzing") {
-      return { status: "analyzing", hasAnnotated: false };
-    }
-    // status === "done": treat as stale (→ none) if the mp4 is newer
-    const mp4Mtime = statSync(absMp4).mtimeMs;
-    if ((raw.sourceMtimeMs ?? 0) < mp4Mtime) {
-      return { status: "none", hasAnnotated: false };
-    }
-    let annotatedRelPath: string | undefined;
     let hasAnnotated = false;
+    let annotatedRelPath: string | undefined;
     if (raw.hasAnnotated) {
+      const annotated = path.join(path.dirname(absMp4), annotatedName(absMp4, model));
       try {
         statSync(annotated);
         hasAnnotated = true;
@@ -47,6 +41,7 @@ export async function readDetectionSummary(absMp4: string): Promise<DetectionSum
       }
     }
     return {
+      model,
       status: "done",
       maxPersons: raw.maxPersons,
       avgPersons: raw.avgPersons,
@@ -56,6 +51,26 @@ export async function readDetectionSummary(absMp4: string): Promise<DetectionSum
       annotatedRelPath,
     };
   } catch {
-    return { status: "none", hasAnnotated: false };
+    return { model, status: "none", hasAnnotated: false };
   }
+}
+
+// All models' summaries for a clip, keyed by model. Empty object if none.
+export async function readDetections(absMp4: string): Promise<Record<string, DetectionSummary>> {
+  const dir = path.dirname(absMp4);
+  const prefix = detectionsPrefix(absMp4);
+  let names: string[] = [];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return {};
+  }
+  const out: Record<string, DetectionSummary> = {};
+  for (const name of names) {
+    if (!name.startsWith(prefix) || !name.endsWith(".json")) continue;
+    const model = name.slice(prefix.length, -".json".length);
+    if (!model) continue;
+    out[model] = await readOne(path.join(dir, name), absMp4, model);
+  }
+  return out;
 }
