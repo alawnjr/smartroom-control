@@ -19,8 +19,11 @@ function detectPython() {
 // extra runs exit immediately. Optional { relPath } re-analyzes a single clip.
 export async function POST(req: NextRequest) {
   let relPath: string | undefined;
+  let force = false;
   try {
-    relPath = (await req.json())?.relPath;
+    const body = await req.json();
+    relPath = body?.relPath;
+    force = Boolean(body?.force);
   } catch {
     // no body
   }
@@ -28,7 +31,8 @@ export async function POST(req: NextRequest) {
   const projectRoot = process.cwd();
   const script = path.join(projectRoot, "detect", "detect.py");
   const args = [script];
-  if (relPath) args.push("--path", relPath, "--force");
+  if (relPath) args.push("--path", relPath);
+  if (force || relPath) args.push("--force"); // re-analyze forces a reprocess
 
   try {
     const child = spawn(detectPython(), args, {

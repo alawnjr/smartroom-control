@@ -1,7 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { RefreshCw } from "lucide-react";
 
 import { OccupancySparkline } from "@/components/occupancy-sparkline";
 import type { DetectionSummary, SavedListing, SavedVideo } from "@/lib/types";
@@ -55,20 +56,41 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
   const showAnnotated = annotated && hasAnnotated;
   const src = showAnnotated ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
 
+  const qc = useQueryClient();
+  const reanalyze = useMutation({
+    mutationFn: () =>
+      fetch("/api/detect", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ relPath: v.relPath, force: true }),
+      }).catch(() => {}),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
+  });
+
   return (
     <div className="flex flex-col gap-1 rounded-lg border border-neutral-800 bg-black/30 p-2">
       <video key={src} controls preload="none" className="aspect-video w-full rounded bg-black" src={src} />
       {d?.status === "done" && d.timeline && <OccupancySparkline timeline={d.timeline} max={d.maxPersons ?? 0} />}
       <div className="flex items-center justify-between gap-2">
         <OccupancyBadge d={d} />
-        {hasAnnotated && (
+        <div className="flex items-center gap-1">
+          {hasAnnotated && (
+            <button
+              onClick={() => setAnnotated((a) => !a)}
+              className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-300 hover:bg-neutral-800"
+            >
+              {showAnnotated ? "raw" : "overlay"}
+            </button>
+          )}
           <button
-            onClick={() => setAnnotated((a) => !a)}
-            className="rounded border border-neutral-700 px-1.5 py-0.5 text-[10px] text-neutral-300 hover:bg-neutral-800"
+            onClick={() => reanalyze.mutate()}
+            disabled={reanalyze.isPending}
+            title="Re-run detection on this clip (all models)"
+            className="flex items-center rounded border border-neutral-700 p-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
           >
-            {showAnnotated ? "raw" : "overlay"}
+            <RefreshCw className={`size-3 ${reanalyze.isPending ? "animate-spin" : ""}`} />
           </button>
-        )}
+        </div>
       </div>
       <div className="flex items-center justify-between gap-2 text-xs text-neutral-400">
         <span className="truncate" title={`${v.day}/${v.rec}/${v.file}`}>{v.rec || v.file}</span>
