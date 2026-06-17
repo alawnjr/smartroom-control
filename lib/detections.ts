@@ -1,9 +1,46 @@
-import { readdirSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { savedRoot } from "@/lib/recordings";
 import type { DetectionSummary } from "@/lib/types";
+
+// On cancel, remove stuck "analyzing" sidecars (so the UI clears) and any leftover
+// transcode temp files. Returns how many analyzing markers were cleared.
+export function clearAnalyzing(): number {
+  let cleared = 0;
+  const walk = (dir: string) => {
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const e of entries) {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) {
+        walk(full);
+      } else if (e.name.endsWith(".raw.mp4") || e.name.endsWith(".enc.mp4")) {
+        try {
+          rmSync(full, { force: true });
+        } catch {
+          /* ignore */
+        }
+      } else if (e.name.includes(".detections.") && e.name.endsWith(".json")) {
+        try {
+          if (JSON.parse(readFileSync(full, "utf8")).status === "analyzing") {
+            rmSync(full, { force: true });
+            cleared++;
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+  };
+  walk(savedRoot());
+  return cleared;
+}
 
 // Per-model sidecars for a source mp4 (matches detect/detect.py):
 //   <stem>.detections.<model>.json  and  <stem>.annotated.<model>.mp4
