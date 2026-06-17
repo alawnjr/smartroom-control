@@ -1,9 +1,10 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Download, ScanEye } from "lucide-react";
+import { Download, Loader2, ScanEye } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
+import { analyzingCount, useSaved } from "@/lib/use-saved";
 import type { SaveResponse } from "@/lib/types";
 
 function mb(bytes: number) {
@@ -35,6 +36,9 @@ export function SaveBar() {
     mutationFn: () => triggerDetect({ force: true }), // re-run all clips
     onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
   });
+  const saved = useSaved();
+  const analyzing = analyzingCount(saved.data); // clips currently being analyzed
+  const busy = analyze.isPending || analyzing > 0;
   const data = save.data;
 
   return (
@@ -52,12 +56,16 @@ export function SaveBar() {
         <Button
           variant="outline"
           size="lg"
-          disabled={analyze.isPending}
+          disabled={busy}
           onClick={() => analyze.mutate()}
-          title="Run person-detection over saved recordings (skips already-analyzed)"
+          title="Re-run person-detection over all saved recordings"
         >
-          <ScanEye />
-          {analyze.isPending ? "Starting…" : "Re-analyze"}
+          {busy ? <Loader2 className="animate-spin" /> : <ScanEye />}
+          {analyzing > 0
+            ? `Analyzing ${analyzing}…`
+            : analyze.isPending
+              ? "Starting…"
+              : "Re-analyze"}
         </Button>
         {data && <span className="text-xs text-neutral-500">→ {data.saveRoot}</span>}
         {save.isError && <span className="text-xs text-red-400">request failed</span>}
