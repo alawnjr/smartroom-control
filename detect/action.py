@@ -1,25 +1,23 @@
 #!/usr/bin/env python3
 """
-Per-person action recognition over the saved recordings.
+Per-person action recognition over the saved recordings (NTU-RGB+D actions).
 
-YOLO26-pose with tracking gives a stable id + bbox per person each frame; we
-keep a per-track-id sliding window of body crops and feed each window to a
-pretrained Kinetics-400 video classifier (torchvision r2plus1d_18, CPU), then
-overlay the predicted action label on each tracked person.
+YOLO26-pose with tracking gives a stable id + COCO-17 skeleton per person each
+frame; we keep a per-track-id sliding window of keypoints and feed each window
+to a pretrained 2D ST-GCN++ trained on NTU-RGB+D 60 (mmaction2, CPU), then
+overlay the predicted NTU action label on each tracked person.
 
-Per clip it writes, next to camera_main.mp4:
-  camera_main.annotated.action.mp4   per-person boxes + id + action label (H.264)
+Runs in the dedicated Python 3.10 venv (.venv-action) which has the
+mmcv/mmaction2 stack. Per clip it writes, next to camera_main.mp4:
+  camera_main.annotated.action.mp4   per-person skeleton + id + NTU action (H.264)
   camera_main.detections.action.json summary (dashboard: tracks + per-track action)
   camera_main.actions.action.json    per-track action timeline
 
-Idempotent (skips current results), flock-guarded (.action.lock), cancellable
-(writes .action.pid, becomes a process-group leader). Heavier than detection, so
-it's on-demand (/api/action), not in the auto-run timer.
+Idempotent, flock-guarded (.action.lock), cancellable (.action.pid).
 
 Config (env): SMARTROOM_SAVE_DIR, SMARTROOM_YOLO_DIR (yolo26n-pose.pt),
-SMARTROOM_ACTION_WINDOW (16), SMARTROOM_ACTION_STRIDE (2).
-
-Usage: python action.py [--path <rel>] [--force]
+SMARTROOM_STGCN_CONFIG, SMARTROOM_STGCN_CKPT, SMARTROOM_ACTION_WINDOW (48),
+SMARTROOM_ACTION_STRIDE (2).
 """
 
 import argparse
@@ -34,10 +32,30 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-WINDOW = int(os.environ.get("SMARTROOM_ACTION_WINDOW", "16"))
+WINDOW = int(os.environ.get("SMARTROOM_ACTION_WINDOW", "48"))
 STRIDE = int(os.environ.get("SMARTROOM_ACTION_STRIDE", "2"))
-CLASSIFY_EVERY = 8
-SCHEMA_VERSION = 1
+CLASSIFY_EVERY = 12
+SCHEMA_VERSION = 2
+
+# NTU-RGB+D 60 action labels, index-aligned with the model's classes (A1..A60).
+NTU60 = [
+    "drink water", "eat meal", "brush teeth", "brush hair", "drop", "pick up", "throw",
+    "sit down", "stand up", "clapping", "reading", "writing", "tear up paper", "put on jacket",
+    "take off jacket", "put on a shoe", "take off a shoe", "put on glasses", "take off glasses",
+    "put on a hat", "take off a hat", "cheer up", "hand waving", "kick something",
+    "reach into pocket", "hopping", "jump up", "phone call", "play with phone", "type on keyboard",
+    "point to something", "take a selfie", "check time", "rub two hands", "nod head/bow",
+    "shake head", "wipe face", "salute", "put palms together", "cross hands in front",
+    "sneeze/cough", "staggering", "falling down", "headache", "chest pain", "back pain",
+    "neck pain", "nausea/vomiting", "fan self", "punch/slap", "kicking", "pushing",
+    "pat on back", "point finger", "hugging", "give object", "touch pocket", "handshake",
+    "walk towards", "walk apart",
+]
+
+COCO_SKELETON = [
+    (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12),
+    (11, 13), (13, 15), (12, 14), (14, 16), (0, 5), (0, 6),
+]
 
 
 def saved_root() -> Path:
@@ -47,6 +65,19 @@ def saved_root() -> Path:
 def pose_weights() -> Path:
     base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
     return base / "yolo26n-pose.pt"
+
+
+def stgcn_config() -> str:
+    if os.environ.get("SMARTROOM_STGCN_CONFIG"):
+        return os.environ["SMARTROOM_STGCN_CONFIG"]
+    import mmaction
+    return os.path.join(os.path.dirname(mmaction.__file__), ".mim", "configs", "skeleton",
+                        "stgcnpp", "stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d.py")
+
+
+def stgcn_ckpt() -> str:
+    return os.environ.get("SMARTROOM_STGCN_CKPT") or str(
+        Path.home() / "Code" / "yolo-bench" / "stgcnpp_ntu60_2d.pth")
 
 
 def sidecars(mp4: Path):
@@ -78,26 +109,14 @@ def needs_action(mp4: Path, force: bool) -> bool:
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
 
 
-def process_clip(net, preprocess, categories, pose, mp4: Path):
+def process_clip(model, infer, pose, mp4: Path):
     import cv2
     import numpy as np
-    import torch
 
     json_path, actions_path, annotated_path = sidecars(mp4)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
                                    "model": "action", "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
-
-    @torch.inference_mode()
-    def classify(crops):
-        frames = []
-        for c in crops:
-            c = cv2.resize(c, (128, 128))  # common size so frames stack; transform crops to 112
-            frames.append(torch.from_numpy(np.ascontiguousarray(c[:, :, ::-1])).permute(2, 0, 1))
-        clip = preprocess(torch.stack(frames)).unsqueeze(0)  # 1,C,T,H,W
-        probs = net(clip).softmax(-1)[0]
-        conf, idx = probs.max(0)
-        return categories[int(idx)], float(conf)
 
     cap = cv2.VideoCapture(str(mp4))
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -105,6 +124,16 @@ def process_clip(net, preprocess, categories, pose, mp4: Path):
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     cap.release()
+
+    def classify(window):
+        # window: list of (kpts (17,2) float, conf (17,) float) -> NTU label, conf
+        pose_results = [{"keypoints": kp[None].astype("float32"),
+                         "keypoint_scores": sc[None].astype("float32")} for kp, sc in window]
+        res = infer(model, pose_results, (height, width))
+        score = res.pred_score
+        probs = score.softmax(-1) if hasattr(score, "softmax") else score
+        c, i = float(probs.max()), int(probs.argmax())
+        return (NTU60[i] if i < len(NTU60) else str(i)), c
 
     tmp_raw = annotated_path.with_suffix(".raw.mp4")
     writer = cv2.VideoWriter(str(tmp_raw), cv2.VideoWriter_fourcc(*"mp4v"), native_fps, (width, height))
@@ -117,24 +146,31 @@ def process_clip(net, preprocess, categories, pose, mp4: Path):
     for r in pose.track(str(mp4), stream=True, persist=True, classes=[0], device="cpu", verbose=False):
         frame = r.orig_img.copy()
         boxes = r.boxes
-        if boxes is not None and boxes.id is not None:
-            for tid, (x1, y1, x2, y2) in zip(boxes.id.int().tolist(), boxes.xyxy.int().tolist()):
-                x1, y1 = max(0, x1), max(0, y1)
+        kpts = r.keypoints
+        if boxes is not None and boxes.id is not None and kpts is not None:
+            ids = boxes.id.int().tolist()
+            xyxy = boxes.xyxy.int().tolist()
+            xy = kpts.xy.cpu().numpy()
+            conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
+            for n, tid in enumerate(ids):
                 if idx % STRIDE == 0:
-                    crop = r.orig_img[y1:y2, x1:x2]
-                    if crop.size:
-                        tubes[tid].append(crop)
+                    tubes[tid].append((xy[n], conf[n]))
                 if len(tubes[tid]) >= WINDOW and idx % CLASSIFY_EVERY == 0:
-                    label, conf = classify(list(tubes[tid]))
-                    labels[tid] = (label, conf)
-                    timeline[tid].append({"t": round(idx / native_fps, 3), "action": label, "conf": round(conf, 3)})
+                    label, cf = classify(list(tubes[tid]))
+                    labels[tid] = (label, cf)
+                    timeline[tid].append({"t": round(idx / native_fps, 3), "action": label, "conf": round(cf, 3)})
                     if label not in seen:
                         seen.append(label)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 200, 0), 2)
+                # draw skeleton + label
+                pts, cs = xy[n], conf[n]
+                for a, b in COCO_SKELETON:
+                    if cs[a] > 0.3 and cs[b] > 0.3:
+                        cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
+                x1, y1 = max(0, xyxy[n][0]), max(0, xyxy[n][1])
                 lab = labels.get(tid)
                 text = f"#{tid} {lab[0]}" if lab else f"#{tid} ..."
-                cv2.rectangle(frame, (x1, max(0, y1 - 20)), (x1 + 9 * len(text), y1), (0, 200, 0), -1)
-                cv2.putText(frame, text, (x1 + 2, y1 - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+                cv2.rectangle(frame, (x1, max(0, y1 - 18)), (x1 + 8 * len(text), y1), (0, 200, 0), -1)
+                cv2.putText(frame, text, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
         writer.write(frame)
         idx += 1
     writer.release()
@@ -167,7 +203,7 @@ def process_clip(net, preprocess, categories, pose, mp4: Path):
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": "action", "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
-        "device": "cpu", "classifier": "r2plus1d_18_kinetics400",
+        "device": "cpu", "classifier": "stgcnpp_ntu60_2d",
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "durationSec": round(total / native_fps, 3) if total else None,
         "tracks": len(timeline), "trackActions": track_actions, "actions": seen,
@@ -177,7 +213,7 @@ def process_clip(net, preprocess, categories, pose, mp4: Path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Per-person action recognition over saved clips.")
+    ap = argparse.ArgumentParser(description="Per-person NTU action recognition over saved clips.")
     ap.add_argument("--path", help="single clip, relative to the recordings root")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
@@ -212,18 +248,15 @@ def main():
         if not todo:
             return 0
 
-        from torchvision.models.video import R2Plus1D_18_Weights, r2plus1d_18
+        from mmaction.apis import inference_skeleton, init_recognizer
         from ultralytics import YOLO
-        weights = R2Plus1D_18_Weights.KINETICS400_V1
-        categories = weights.meta["categories"]
-        preprocess = weights.transforms()
-        net = r2plus1d_18(weights=weights).eval()
+        model = init_recognizer(stgcn_config(), stgcn_ckpt(), device="cpu")
         pose = YOLO(str(pose_weights()))
 
         for mp4 in todo:
             try:
                 print(f"action: processing {mp4.relative_to(root)}", file=sys.stderr)
-                process_clip(net, preprocess, categories, pose, mp4)
+                process_clip(model, inference_skeleton, pose, mp4)
             except Exception as error:  # noqa: BLE001
                 print(f"  action error: {error}", file=sys.stderr)
                 jp, _, _ = sidecars(mp4)

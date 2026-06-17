@@ -16,14 +16,20 @@ slower still) — all fine for offline batch.
 
 `action.py` is a separate, heavier pipeline (triggered by the dashboard's
 **Actions** button / `POST /api/action`, not the auto-run timer): YOLO26-pose
-**with tracking** gives a stable id+bbox per person, a per-track-id sliding
-window of body crops is fed to a **pretrained Kinetics-400 video classifier**
-(torchvision `r2plus1d_18`, CPU — no mmcv), and the predicted action label is
-overlaid on each tracked person. Outputs per clip: `camera_main.annotated.action.mp4`,
+**with tracking** gives a stable id + COCO-17 skeleton per person, a per-track-id
+sliding window of keypoints is fed to a **pretrained 2D ST-GCN++ trained on
+NTU-RGB+D 60** (`mmaction2`, CPU), and the predicted NTU action label (drink
+water, sit down, stand up, reading, writing, type on keyboard, phone call,
+clapping, hand waving, falling down, …) is overlaid on each tracked person.
+Outputs per clip: `camera_main.annotated.action.mp4` (skeleton + id + action),
 `camera_main.detections.action.json` (summary → the dashboard's "actions"
-toggle + badge), and `camera_main.actions.action.json` (per-track timeline).
-Idempotent, flock-guarded (`.action.lock`), and cancellable (`.action.pid`).
-Note: Kinetics-400 labels are generic activity classes, not office-specific.
+toggle + 🎬 badge), `camera_main.actions.action.json` (per-track timeline).
+Idempotent, flock-guarded (`.action.lock`), cancellable (`.action.pid`).
+
+**It runs in a dedicated Python 3.10 venv** (`.venv-action`) because the
+`mmcv`/`mmaction2` stack won't install on the py3.14 detection venv. Build it
+once with `detect/setup-action-env.sh` (needs `uv`); `/api/action` uses
+`SMARTROOM_ACTION_PYTHON` (default `.venv-action/bin/python`).
 
 A model key containing **`pose`** runs the pose task instead of detection: it
 draws **skeletons** (COCO-17) in the annotated video and additionally writes
