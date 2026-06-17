@@ -4,7 +4,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Download, Loader2, ScanEye, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
-import { analyzingCount, useSaved } from "@/lib/use-saved";
+import { analyzingCount, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { SaveResponse } from "@/lib/types";
 
 function mb(bytes: number) {
@@ -30,11 +30,12 @@ export function SaveBar() {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["saved"] }); // refresh the gallery
       triggerDetect(); // analyze freshly pulled clips
+      pingSavedSoon(qc); // pick up the analyzing state once it starts
     },
   });
   const analyze = useMutation({
     mutationFn: () => triggerDetect({ force: true }), // re-run all clips
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
+    onSuccess: () => pingSavedSoon(qc),
   });
   const cancel = useMutation({
     mutationFn: () => fetch("/api/detect/cancel", { method: "POST" }).catch(() => {}),

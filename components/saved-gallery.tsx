@@ -5,7 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, RefreshCw } from "lucide-react";
 
 import { OccupancySparkline } from "@/components/occupancy-sparkline";
-import { analyzingCount, clipAnalyzing, useSaved } from "@/lib/use-saved";
+import { analyzingCount, clipAnalyzing, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { DetectionSummary, SavedVideo } from "@/lib/types";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose"];
@@ -66,7 +66,7 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ relPath: v.relPath, force: true }),
       }).catch(() => {}),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
+    onSuccess: () => pingSavedSoon(qc),
   });
   const spin = analyzing || reanalyze.isPending;
 
