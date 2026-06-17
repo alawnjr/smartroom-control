@@ -112,7 +112,9 @@ def needs_processing(mp4: Path, key: str, force: bool) -> bool:
         return True
     if data.get("status") != "done":
         return True
-    if data.get("sourceMtimeMs", 0) < mp4.stat().st_mtime * 1000:
+    # 2s tolerance: recordings aren't modified after saving, and this avoids
+    # float-rounding flicker (matches lib/detections.ts).
+    if data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000:
         return True
     if ANNOTATE and not annotated.exists():
         return True
