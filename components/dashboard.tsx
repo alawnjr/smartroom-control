@@ -4,6 +4,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, Minus, Plus } from "lucide-react";
 
+import { Analytics } from "@/components/analytics";
 import { analyzingCount, clipAnalyzing, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { CombinedStatus, DetectionSummary, NodeConfig, NodeStatus, SavedVideo } from "@/lib/types";
 
@@ -262,6 +263,7 @@ function roomName(idx: number) {
 export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
   const qc = useQueryClient();
   const [duration, setDuration] = useState(30);
+  const [tab, setTab] = useState<"live" | "analytics">("live");
   const [clock, setClock] = useState("");
   useEffect(() => {
     const tick = () => setClock(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
@@ -315,11 +317,22 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
     <div className="mx-auto w-full max-w-6xl px-5 pb-16">
       {/* header */}
       <header className="flex items-center justify-between py-5">
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-3">
           <span className="flex size-7 items-center justify-center rounded-lg bg-emerald-500">
             <span className="size-2.5 rounded-full bg-white" />
           </span>
           <span className="text-xl font-extrabold">Smartroom</span>
+          <div className="ml-2 flex overflow-hidden rounded-full border border-line">
+            {(["live", "analytics"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className={`px-3.5 py-1 text-sm font-bold capitalize ${tab === t ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
+              >
+                {t}
+              </button>
+            ))}
+          </div>
         </div>
         <div className="flex items-center gap-2.5">
           <Pill className="border border-emerald-300 bg-emerald-50 text-emerald-700">{liveCount} rooms live</Pill>
@@ -332,6 +345,10 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
         </div>
       </header>
 
+      {tab === "analytics" ? (
+        <Analytics nodes={config} />
+      ) : (
+        <>
       {/* rooms + ready to roll */}
       <h2 className="mb-3 text-lg font-extrabold">The rooms right now</h2>
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
@@ -373,6 +390,8 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
             <ClipCard key={v.relPath} v={v} roomIdx={idxByNode.get(v.node) ?? 0} />
           ))}
         </div>
+      )}
+        </>
       )}
     </div>
   );
