@@ -5,7 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
 import { OccupancyGraph } from "@/components/occupancy-graph";
-import { analyzingCount, clipAnalyzing, pingSavedSoon, useSaved } from "@/lib/use-saved";
+import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { NodeConfig, SavedVideo } from "@/lib/types";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action"];
@@ -171,9 +171,21 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
       {videos.length === 0 ? (
         <p className="text-sm text-muted">No clips to analyze yet — “Beam to laptop” on the Live tab first.</p>
       ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {videos.map((v) => (
-            <AnalysisCard key={v.relPath} v={v} model={model} roomName={nameByNode.get(v.node) ?? v.node} />
+        <div className="flex flex-col gap-7">
+          {groupSessions(videos).map((s) => (
+            <div key={s.key}>
+              <div className="mb-2 flex items-center gap-2 text-sm font-bold text-muted">
+                <span className="font-mono">{s.label}</span>
+                <span className="rounded-full bg-card px-2 py-0.5 text-xs">
+                  {s.clips.length} cam{s.clips.length > 1 ? "s" : ""}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {s.clips.map((v) => (
+                  <AnalysisCard key={v.relPath} v={v} model={model} roomName={nameByNode.get(v.node) ?? v.node} />
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       )}

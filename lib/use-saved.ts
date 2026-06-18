@@ -18,6 +18,33 @@ export function clipAnalyzing(v: SavedVideo) {
   return Object.values(v.detections ?? {}).some((d) => d.status === "analyzing");
 }
 
+// A recording "session" = clips captured together (same day/rec across cameras,
+// which is what a single "Record everything" produces). Newest first.
+export type Session = { key: string; label: string; clips: SavedVideo[]; mtime: number };
+
+export function groupSessions(videos: SavedVideo[]): Session[] {
+  const map = new Map<string, SavedVideo[]>();
+  for (const v of videos) {
+    const key = `${v.day}/${v.rec}`;
+    const arr = map.get(key);
+    if (arr) arr.push(v);
+    else map.set(key, [v]);
+  }
+  const sessions = [...map.entries()].map(([key, clips]) => {
+    const { day, rec } = clips[0];
+    const date = day.replace(/^day_\d+_/, ""); // YYYY-MM-DD
+    const take = rec.split("_").pop() ?? rec;
+    return {
+      key,
+      label: `${date} · take ${take}`,
+      clips: [...clips].sort((a, b) => a.node.localeCompare(b.node)),
+      mtime: Math.max(...clips.map((c) => c.mtime)),
+    };
+  });
+  sessions.sort((a, b) => b.mtime - a.mtime);
+  return sessions;
+}
+
 export function analyzingCount(listing?: SavedListing) {
   return listing?.videos?.filter(clipAnalyzing).length ?? 0;
 }
