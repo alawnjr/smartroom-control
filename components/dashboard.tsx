@@ -21,8 +21,9 @@ function fmt(sec: number) {
   const s = Math.max(0, Math.round(sec));
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
-function streamUrl(host: string) {
-  return `http://${host}:8000/stream.mjpg`;
+function streamUrl(id: string) {
+  // proxied through the app (same origin) so it works over a remote tunnel
+  return `/api/stream/${encodeURIComponent(id)}`;
 }
 function fileUrl(relPath: string) {
   return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
@@ -84,7 +85,7 @@ function RoomCard({ node, idx, onWake }: { node: NodeStatus; idx: number; onWake
             // eslint-disable-next-line @next/next/no-img-element
             <img
               key={k}
-              src={`${streamUrl(node.host)}?k=${k}`}
+              src={`${streamUrl(node.id)}?k=${k}`}
               alt={`${node.name} live`}
               className="h-full w-full object-cover scanlines"
               onError={() => setTimeout(() => setK((v) => v + 1), 1500)}
