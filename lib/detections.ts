@@ -87,6 +87,7 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
       maxPersons: raw.maxPersons,
       avgPersons: raw.avgPersons,
       framesAnalyzed: raw.framesAnalyzed,
+      durationSec: raw.durationSec,
       timeline: raw.timeline,
       hasAnnotated,
       annotatedRelPath,

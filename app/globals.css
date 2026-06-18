@@ -1,20 +1,48 @@
 @import "tailwindcss";
 
-/* Force a dark control-panel theme. */
+/* Warm, friendly "Smartroom" theme. */
 :root {
-  --background: #0a0a0a;
-  --foreground: #ededed;
+  --background: #f4ecd8; /* cream */
+  --card: #fffdf6; /* card surface */
+  --foreground: #3a352c; /* warm charcoal */
+  --muted: #8a8270;
+  --line: #e7dcc2; /* hairline border */
 }
 
 @theme inline {
   --color-background: var(--background);
+  --color-card: var(--card);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
+  --color-muted: var(--muted);
+  --color-line: var(--line);
+  --font-sans: var(--font-rounded);
   --font-mono: var(--font-geist-mono);
 }
 
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+  font-family: var(--font-rounded), ui-rounded, "Segoe UI", system-ui, sans-serif;
+}
+
+/* subtle horizontal "screen" texture inside live tiles */
+.scanlines {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgba(255, 255, 255, 0.18) 0px,
+    rgba(255, 255, 255, 0.18) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}
+
+/* diagonal stripes for offline / "napping" tiles */
+.stripes {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(0, 0, 0, 0.05) 0px,
+    rgba(0, 0, 0, 0.05) 10px,
+    transparent 10px,
+    transparent 20px
+  );
 }

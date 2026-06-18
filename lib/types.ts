@@ -68,6 +68,7 @@ export type DetectionSummary = {
   maxPersons?: number;
   avgPersons?: number;
   framesAnalyzed?: number;
+  durationSec?: number;
   timeline?: DetectionTimelinePoint[];
   hasAnnotated: boolean;
   annotatedRelPath?: string; // recordings-relative, for /api/saved/file
