@@ -7,9 +7,10 @@ import { useQuery } from "@tanstack/react-query";
 type Entry = { t: number; action: string; conf: number; kept?: boolean; top?: [string, number][] };
 type Timeline = { tracks: Record<string, Entry[]> };
 
-// Bars are scaled against this absolute confidence so their length reflects the
-// real magnitude (these heads rarely exceed ~0.5; near-uniform = honestly short).
-const SCALE = 0.6;
+// Top-N classes get their own slice; everything else collapses into "other".
+const TOP_N = 3;
+const COLORS = ["#10b981", "#0ea5e9", "#a855f7"]; // emerald / sky / violet
+const OTHER_COLOR = "#d1d5db";
 
 function actionsPath(relPath: string, model: string) {
   return relPath.replace(/\.mp4$/, `.actions.${model}.json`);
@@ -25,10 +26,49 @@ function latestAt(entries: Entry[], t: number): Entry | null {
   return found;
 }
 
-// Live per-person "most confident classes" bar graph, synced to the playing
-// video's currentTime. One panel per tracked person; bars are the top-K classes
-// for the window covering the current instant. Reads the action sidecar directly
-// via /api/saved/file (cached — it's static once analyzed).
+function polar(cx: number, cy: number, r: number, a: number) {
+  return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
+}
+
+// SVG path for a pie wedge from angle a0 to a1 (radians, 0 = 3 o'clock).
+function wedge(cx: number, cy: number, r: number, a0: number, a1: number) {
+  const p0 = polar(cx, cy, r, a0);
+  const p1 = polar(cx, cy, r, a1);
+  const large = a1 - a0 > Math.PI ? 1 : 0;
+  return `M ${cx} ${cy} L ${p0.x.toFixed(2)} ${p0.y.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${p1.x.toFixed(2)} ${p1.y.toFixed(2)} Z`;
+}
+
+type Slice = { label: string; value: number; color: string };
+
+function Pie({ slices }: { slices: Slice[] }) {
+  const S = 72;
+  const c = S / 2;
+  const r = S / 2 - 1;
+  const total = slices.reduce((s, x) => s + x.value, 0) || 1;
+  // A single ~100% slice can't be drawn as a wedge (start == end) — use a full circle.
+  const solo = slices.find((s) => s.value / total >= 0.999);
+  let a = -Math.PI / 2; // start at 12 o'clock
+  return (
+    <svg viewBox={`0 0 ${S} ${S}`} width={S} height={S} className="shrink-0" role="img" aria-label="action probability pie">
+      {solo ? (
+        <circle cx={c} cy={c} r={r} fill={solo.color} />
+      ) : (
+        slices.map((s) => {
+          const a0 = a;
+          const a1 = a + (s.value / total) * 2 * Math.PI;
+          a = a1;
+          return <path key={s.label} d={wedge(c, c, r, a0, a1)} fill={s.color} stroke="white" strokeWidth={1} />;
+        })
+      )}
+    </svg>
+  );
+}
+
+// Live per-person action distribution as a pie (top-3 classes + "other"), synced
+// to the playing video's currentTime. One panel per tracked person; the pie is
+// the softmax distribution for the window covering the current instant — the
+// classes compete for one whole (they sum to 1), so "other" = 1 - sum(top 3).
+// Reads the action sidecar directly via /api/saved/file (static once analyzed).
 export function ActionBars({ relPath, model, currentTime }: { relPath: string; model: string; currentTime: number }) {
   const path = actionsPath(relPath, model);
   const { data } = useQuery({
@@ -56,34 +96,39 @@ export function ActionBars({ relPath, model, currentTime }: { relPath: string; m
     <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
       {ids.map((id) => {
         const cur = latestAt(tracks[id], currentTime);
-        const bars: [string, number][] = cur?.top ?? (cur ? [[cur.action, cur.conf]] : []);
+        const top = cur?.top ?? (cur ? [[cur.action, cur.conf] as [string, number]] : []);
         const idle = !cur || cur.kept === false;
+
+        const head = top.slice(0, TOP_N);
+        const sumHead = head.reduce((s, [, p]) => s + p, 0);
+        const other = Math.max(0, 1 - sumHead);
+        const slices: Slice[] = [
+          ...head.map(([label, value], i) => ({ label, value, color: COLORS[i % COLORS.length] })),
+          ...(other > 0.005 ? [{ label: "other", value: other, color: OTHER_COLOR }] : []),
+        ];
+
         return (
           <div key={id} className="rounded-xl border border-line bg-background p-2">
             <div className="mb-1 flex items-center justify-between text-xs font-bold">
               <span>#{id}</span>
               <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : cur?.action}</span>
             </div>
-            <div className="flex flex-col gap-1">
-              {bars.length === 0 ? (
-                <div className="text-[10px] text-muted">—</div>
-              ) : (
-                bars.map(([label, p], i) => (
-                  <div key={label} className="flex items-center gap-1.5">
-                    <span className="w-24 shrink-0 truncate text-[10px] text-muted" title={label}>
-                      {label}
-                    </span>
-                    <div className="relative h-2.5 flex-1 overflow-hidden rounded bg-line/40">
-                      <div
-                        className={`absolute inset-y-0 left-0 rounded ${i === 0 && !idle ? "bg-emerald-500" : "bg-emerald-300"}`}
-                        style={{ width: `${Math.min(100, Math.max(2, (p / SCALE) * 100))}%` }}
-                      />
+            {slices.length === 0 ? (
+              <div className="text-[10px] text-muted">—</div>
+            ) : (
+              <div className="flex items-center gap-3">
+                <Pie slices={slices} />
+                <div className="flex flex-1 flex-col gap-0.5">
+                  {slices.map((s) => (
+                    <div key={s.label} className="flex items-center gap-1.5 text-[10px]">
+                      <span className="size-2.5 shrink-0 rounded-[3px]" style={{ background: s.color }} />
+                      <span className="flex-1 truncate text-muted" title={s.label}>{s.label}</span>
+                      <span className="shrink-0 font-mono text-muted">{Math.round(s.value * 100)}%</span>
                     </div>
-                    <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted">{p.toFixed(2)}</span>
-                  </div>
-                ))
-              )}
-            </div>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         );
       })}
