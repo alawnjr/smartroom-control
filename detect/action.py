@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Per-person action recognition over the saved recordings (NTU-RGB+D actions).
+Per-person action recognition over the saved recordings.
 
 YOLO26-pose with tracking gives a stable id + COCO-17 skeleton per person each
 frame; we keep a per-track-id sliding window of keypoints and feed each window
-to a pretrained 2D ST-GCN++ trained on NTU-RGB+D 60 (mmaction2, CPU), then
-overlay the predicted NTU action label on each tracked person.
+to a pretrained skeleton recognizer (mmaction2, CPU), then overlay the predicted
+action label on each tracked person. Selectable via --variant:
+  ntu  (default) — 2D ST-GCN++ on NTU-RGB+D 60  -> sidecar key "action"
+  hmdb           — PoseC3D on HMDB51 (adds walk/run) -> sidecar key "action-hmdb"
+Both are skeleton models driven one person at a time, so both are multi-person.
 
 Runs in the dedicated Python 3.10 venv (.venv-action) which has the
 mmcv/mmaction2 stack. Per clip it writes, next to camera_main.mp4:
@@ -21,8 +24,10 @@ SMARTROOM_ACTION_STRIDE (2).
 """
 
 import argparse
+import bisect
 import datetime as dt
 import fcntl
+import gc
 import json
 import os
 import subprocess
@@ -32,9 +37,18 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# WINDOW samples (taken every STRIDE native frames) form the trailing skeleton
+# window fed to the classifier; it spans WINDOW*STRIDE/fps ≈ 3.2s. A label from a
+# trailing window describes the motion at the window's *center*, so the annotator
+# shifts each label back by half a window to align it with the motion that
+# produced it (safe because this is offline — see process_clip pass 2).
 WINDOW = int(os.environ.get("SMARTROOM_ACTION_WINDOW", "48"))
 STRIDE = int(os.environ.get("SMARTROOM_ACTION_STRIDE", "2"))
-CLASSIFY_EVERY = 12
+# How far back to shift each label, as a fraction of the window span. 0.5 = the
+# window's exact center (theoretically correct, but feels early in practice
+# because an action is usually clearest in the latter part of its window); lower
+# = label lands closer to "now". Tunable via SMARTROOM_ACTION_OFFSET_FRAC.
+OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.35"))
 SCHEMA_VERSION = 2
 
 # NTU-RGB+D 60 action labels, index-aligned with the model's classes (A1..A60).
@@ -52,6 +66,18 @@ NTU60 = [
     "walk towards", "walk apart",
 ]
 
+# HMDB51 labels, index-aligned with mmaction2's hmdb51 label map (alphabetical).
+HMDB51 = [
+    "brush hair", "cartwheel", "catch", "chew", "clap", "climb", "climb stairs",
+    "dive", "draw sword", "dribble", "drink", "eat", "fall floor", "fencing",
+    "flic flac", "golf", "handstand", "hit", "hug", "jump", "kick", "kick ball",
+    "kiss", "laugh", "pick", "pour", "pullup", "punch", "push", "pushup",
+    "ride bike", "ride horse", "run", "shake hands", "shoot ball", "shoot bow",
+    "shoot gun", "sit", "situp", "smile", "smoke", "somersault", "stand",
+    "swing baseball", "sword", "sword exercise", "talk", "throw", "turn",
+    "walk", "wave",
+]
+
 COCO_SKELETON = [
     (5, 7), (7, 9), (6, 8), (8, 10), (5, 6), (5, 11), (6, 12), (11, 12),
     (11, 13), (13, 15), (12, 14), (14, 16), (0, 5), (0, 6),
@@ -67,24 +93,50 @@ def pose_weights() -> Path:
     return base / "yolo26n-pose.pt"
 
 
-def stgcn_config() -> str:
-    if os.environ.get("SMARTROOM_STGCN_CONFIG"):
-        return os.environ["SMARTROOM_STGCN_CONFIG"]
+def _mm_skeleton_config(*parts) -> str:
     import mmaction
-    return os.path.join(os.path.dirname(mmaction.__file__), ".mim", "configs", "skeleton",
-                        "stgcnpp", "stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d.py")
+    return os.path.join(os.path.dirname(mmaction.__file__), ".mim", "configs", "skeleton", *parts)
 
 
-def stgcn_ckpt() -> str:
-    return os.environ.get("SMARTROOM_STGCN_CKPT") or str(
-        Path.home() / "Code" / "yolo-bench" / "stgcnpp_ntu60_2d.pth")
+# Selectable action models. Each is a skeleton recognizer fed one person's
+# keypoint window at a time (the per-track loop below), so all support multiple
+# people. `key` is the sidecar/dashboard model id; the NTU one stays "action"
+# for backward compatibility.
+#   ntu  — 2D ST-GCN++ on NTU-RGB+D 60 (light, office gestures, no plain "walk")
+#   hmdb — PoseC3D on HMDB51 (heavier 3D-CNN; adds walk/run, more sports junk)
+VARIANTS = {
+    "ntu": {
+        "key": "action", "labels": NTU60, "classifier": "stgcnpp_ntu60_2d",
+        "classify_every": 12,
+        "config_env": "SMARTROOM_STGCN_CONFIG", "ckpt_env": "SMARTROOM_STGCN_CKPT",
+        "config": lambda: _mm_skeleton_config(
+            "stgcnpp", "stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d.py"),
+        "ckpt_default": str(Path.home() / "Code" / "yolo-bench" / "stgcnpp_ntu60_2d.pth"),
+    },
+    "hmdb": {
+        "key": "action-hmdb", "labels": HMDB51, "classifier": "posec3d_hmdb51",
+        "classify_every": 24,  # PoseC3D is much slower per inference; classify less often
+        "config_env": "SMARTROOM_HMDB_CONFIG", "ckpt_env": "SMARTROOM_HMDB_CKPT",
+        "config": lambda: _mm_skeleton_config(
+            "posec3d", "slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint.py"),
+        "ckpt_default": str(Path.home() / "Code" / "yolo-bench" / "posec3d_hmdb51.pth"),
+    },
+}
 
 
-def sidecars(mp4: Path):
+def variant_config(v: dict) -> str:
+    return os.environ.get(v["config_env"]) or v["config"]()
+
+
+def variant_ckpt(v: dict) -> str:
+    return os.environ.get(v["ckpt_env"]) or v["ckpt_default"]
+
+
+def sidecars(mp4: Path, key: str):
     s = mp4.stem
-    return (mp4.with_name(f"{s}.detections.action.json"),
-            mp4.with_name(f"{s}.actions.action.json"),
-            mp4.with_name(f"{s}.annotated.action.mp4"))
+    return (mp4.with_name(f"{s}.detections.{key}.json"),
+            mp4.with_name(f"{s}.actions.{key}.json"),
+            mp4.with_name(f"{s}.annotated.{key}.mp4"))
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -94,10 +146,10 @@ def _atomic_write_json(path: Path, data: dict):
     os.replace(tmp, path)
 
 
-def needs_action(mp4: Path, force: bool) -> bool:
+def needs_action(mp4: Path, force: bool, key: str) -> bool:
     if force:
         return True
-    json_path, _, annotated = sidecars(mp4)
+    json_path, _, annotated = sidecars(mp4, key)
     if not json_path.exists() or not annotated.exists():
         return True
     try:
@@ -109,14 +161,16 @@ def needs_action(mp4: Path, force: bool) -> bool:
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
 
 
-def process_clip(model, infer, pose, mp4: Path):
+def process_clip(model, infer, pose, mp4: Path, variant: dict):
     import cv2
     import numpy as np
 
-    json_path, actions_path, annotated_path = sidecars(mp4)
+    key, class_names = variant["key"], variant["labels"]
+    classify_every = variant["classify_every"]
+    json_path, actions_path, annotated_path = sidecars(mp4, key)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
-                                   "model": "action", "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
+                                   "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
 
     cap = cv2.VideoCapture(str(mp4))
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -126,27 +180,35 @@ def process_clip(model, infer, pose, mp4: Path):
     cap.release()
 
     def classify(window):
-        # window: list of (kpts (17,2) float, conf (17,) float) -> NTU label, conf
+        # window: list of (kpts (17,2) float, conf (17,) float) -> label, conf
         pose_results = [{"keypoints": kp[None].astype("float32"),
                          "keypoint_scores": sc[None].astype("float32")} for kp, sc in window]
         res = infer(model, pose_results, (height, width))
         score = res.pred_score
         probs = score.softmax(-1) if hasattr(score, "softmax") else score
         c, i = float(probs.max()), int(probs.argmax())
-        return (NTU60[i] if i < len(NTU60) else str(i)), c
+        return (class_names[i] if i < len(class_names) else str(i)), c
 
-    tmp_raw = annotated_path.with_suffix(".raw.mp4")
-    writer = cv2.VideoWriter(str(tmp_raw), cv2.VideoWriter_fourcc(*"mp4v"), native_fps, (width, height))
+    # The label from a trailing window best describes motion at the window's
+    # center, ~half a window before the frame where it's computed. We have the
+    # whole clip, so: pass 1 tracks + classifies (no drawing) and records each
+    # frame's skeletons + each track's classification events; pass 2 re-decodes
+    # and draws, shifting every label back by this offset to line it up with the
+    # motion that produced it.
+    offset_frames = int(WINDOW * STRIDE * OFFSET_FRAC)
 
+    # Pass 1 — track + classify.
+    framedata = []                  # framedata[g] -> list of (tid, (x1,y1), pts, cs)
+    ev_idx = defaultdict(list)      # per track: classify frame indices (ascending)
+    ev_lab = defaultdict(list)      # per track: predicted label at each event
     tubes = defaultdict(lambda: deque(maxlen=WINDOW))
-    labels = {}
     timeline = defaultdict(list)
     seen = []
     idx = 0
     for r in pose.track(str(mp4), stream=True, persist=True, classes=[0], device="cpu", verbose=False):
-        frame = r.orig_img.copy()
         boxes = r.boxes
         kpts = r.keypoints
+        perframe = []
         if boxes is not None and boxes.id is not None and kpts is not None:
             ids = boxes.id.int().tolist()
             xyxy = boxes.xyxy.int().tolist()
@@ -155,24 +217,49 @@ def process_clip(model, infer, pose, mp4: Path):
             for n, tid in enumerate(ids):
                 if idx % STRIDE == 0:
                     tubes[tid].append((xy[n], conf[n]))
-                if len(tubes[tid]) >= WINDOW and idx % CLASSIFY_EVERY == 0:
+                if len(tubes[tid]) >= WINDOW and idx % classify_every == 0:
                     label, cf = classify(list(tubes[tid]))
-                    labels[tid] = (label, cf)
-                    timeline[tid].append({"t": round(idx / native_fps, 3), "action": label, "conf": round(cf, 3)})
+                    ev_idx[tid].append(idx)
+                    ev_lab[tid].append(label)
+                    # center the timeline timestamp on the window, not its end
+                    t = max(0.0, (idx - offset_frames) / native_fps)
+                    timeline[tid].append({"t": round(t, 3), "action": label, "conf": round(cf, 3)})
                     if label not in seen:
                         seen.append(label)
-                # draw skeleton + label
-                pts, cs = xy[n], conf[n]
-                for a, b in COCO_SKELETON:
-                    if cs[a] > 0.3 and cs[b] > 0.3:
-                        cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
                 x1, y1 = max(0, xyxy[n][0]), max(0, xyxy[n][1])
-                lab = labels.get(tid)
-                text = f"#{tid} {lab[0]}" if lab else f"#{tid} ..."
-                cv2.rectangle(frame, (x1, max(0, y1 - 18)), (x1 + 8 * len(text), y1), (0, 200, 0), -1)
-                cv2.putText(frame, text, (x1 + 2, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1)
-        writer.write(frame)
+                perframe.append((tid, (x1, y1), xy[n], conf[n]))
+        framedata.append(perframe)
         idx += 1
+
+    # Pass 2 — re-decode and draw; frame g shows the label whose window was
+    # centered on g, i.e. the latest classification computed at or before g+offset.
+    tmp_raw = annotated_path.with_suffix(".raw.mp4")
+    writer = cv2.VideoWriter(str(tmp_raw), cv2.VideoWriter_fourcc(*"mp4v"), native_fps, (width, height))
+    cap = cv2.VideoCapture(str(mp4))
+    for g, perframe in enumerate(framedata):
+        ret, frame = cap.read()
+        if not ret:
+            break
+        fh, fw = frame.shape[:2]
+        for tid, (x1, y1), pts, cs in perframe:
+            for a, b in COCO_SKELETON:
+                if cs[a] > 0.3 and cs[b] > 0.3:
+                    cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
+            pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
+            text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
+            font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
+            (tw, th), base = cv2.getTextSize(text, font, scale, thick)
+            box_w, box_h = tw + 6, th + base + 4
+            # Keep the label fully on-screen: sit above the box normally, but flip
+            # below the box top when the person is near the top edge, and clamp
+            # horizontally so a wide label never runs off either side.
+            bx = max(0, min(x1, fw - box_w)) if fw >= box_w else 0
+            by = y1 - box_h if y1 - box_h >= 0 else y1
+            by = max(0, min(by, fh - box_h))
+            cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), (0, 200, 0), -1)
+            cv2.putText(frame, text, (bx + 3, by + th + 2), font, scale, (0, 0, 0), thick)
+        writer.write(frame)
+    cap.release()
     writer.release()
 
     has_annotated = False
@@ -196,14 +283,14 @@ def process_clip(model, infer, pose, mp4: Path):
         if counts:
             track_actions[str(tid)] = max(counts, key=counts.get)
 
-    _atomic_write_json(actions_path, {"schemaVersion": SCHEMA_VERSION, "model": "action",
+    _atomic_write_json(actions_path, {"schemaVersion": SCHEMA_VERSION, "model": key,
                                       "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
                                       "nativeFps": round(native_fps, 3), "window": WINDOW, "stride": STRIDE,
                                       "tracks": {str(t): timeline[t] for t in timeline}})
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
-        "model": "action", "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
-        "device": "cpu", "classifier": "stgcnpp_ntu60_2d",
+        "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
+        "device": "cpu", "classifier": variant["classifier"],
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "durationSec": round(total / native_fps, 3) if total else None,
         "tracks": len(timeline), "trackActions": track_actions, "actions": seen,
@@ -213,11 +300,15 @@ def process_clip(model, infer, pose, mp4: Path):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Per-person NTU action recognition over saved clips.")
+    ap = argparse.ArgumentParser(description="Per-person skeleton action recognition over saved clips.")
     ap.add_argument("--path", help="single clip, relative to the recordings root")
+    ap.add_argument("--variant", choices=list(VARIANTS), default="ntu",
+                    help="action model: ntu (ST-GCN++/NTU-60, default) or hmdb (PoseC3D/HMDB51)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
+    variant = VARIANTS[args.variant]
+    key = variant["key"]
     root = saved_root()
     if not root.exists():
         print(f"no recordings dir: {root}", file=sys.stderr)
@@ -243,29 +334,34 @@ def main():
         clips = ([root / args.path] if args.path
                  else sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True))
         clips = [c for c in clips if c.exists()]
-        todo = [c for c in clips if needs_action(c, args.force)]
-        print(f"action: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
+        todo = [c for c in clips if needs_action(c, args.force, key)]
+        print(f"action[{args.variant}]: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
         if not todo:
             return 0
 
         from mmaction.apis import inference_skeleton, init_recognizer
         from ultralytics import YOLO
-        model = init_recognizer(stgcn_config(), stgcn_ckpt(), device="cpu")
+        model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
         pose = YOLO(str(pose_weights()))
 
         for mp4 in todo:
             try:
-                print(f"action: processing {mp4.relative_to(root)}", file=sys.stderr)
-                process_clip(model, inference_skeleton, pose, mp4)
+                print(f"action[{args.variant}]: processing {mp4.relative_to(root)}", file=sys.stderr)
+                process_clip(model, inference_skeleton, pose, mp4, variant)
             except Exception as error:  # noqa: BLE001
                 print(f"  action error: {error}", file=sys.stderr)
-                jp, _, _ = sidecars(mp4)
+                jp, _, _ = sidecars(mp4, key)
                 try:
                     _atomic_write_json(jp, {"schemaVersion": SCHEMA_VERSION, "status": "error",
-                                            "model": "action", "error": str(error), "source": mp4.name,
+                                            "model": key, "error": str(error), "source": mp4.name,
                                             "sourceMtimeMs": mp4.stat().st_mtime * 1000})
                 except Exception:
                     pass
+            finally:
+                # Release this clip's frame buffers before the next one. CPU torch
+                # holds onto allocations, so without this a long batch grows until
+                # the OOM killer stops it a couple of clips in.
+                gc.collect()
         return 0
     finally:
         try:

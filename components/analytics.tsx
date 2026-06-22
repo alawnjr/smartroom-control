@@ -8,10 +8,10 @@ import { OccupancyGraph } from "@/components/occupancy-graph";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { NodeConfig, SavedVideo } from "@/lib/types";
 
-const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action"];
+const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action", "action-hmdb"];
 const MODEL_LABEL: Record<string, string> = {
   yolo26n: "nano", yolo26s: "small", yolo26m: "medium", yolo26l: "large",
-  "yolo26n-pose": "pose", action: "actions",
+  "yolo26n-pose": "pose", action: "actions (NTU)", "action-hmdb": "actions (HMDB)",
 };
 const TAG = ["bg-amber-200 text-amber-900", "bg-sky-200 text-sky-900", "bg-violet-200 text-violet-900", "bg-emerald-200 text-emerald-900", "bg-rose-200 text-rose-900"];
 
@@ -30,7 +30,8 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   const qc = useQueryClient();
   const d = v.detections?.[model];
   const isPose = model.includes("pose");
-  const isAction = model === "action";
+  const isAction = model.startsWith("action");
+  const actionVariant = model === "action-hmdb" ? "hmdb" : "ntu";
   const hasOverlay = Boolean(d?.hasAnnotated && d.annotatedRelPath);
   const [overlay, setOverlay] = useState(true);
   const showOverlay = overlay && hasOverlay;
@@ -40,7 +41,7 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   const reanalyze = useMutation({
     mutationFn: () =>
       isAction
-        ? post("/api/action", { relPath: v.relPath, force: true })
+        ? post("/api/action", { relPath: v.relPath, force: true, variant: actionVariant })
         : post("/api/detect", { relPath: v.relPath, force: true }),
     onSuccess: () => pingSavedSoon(qc),
   });
@@ -117,7 +118,8 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const model = sel && available.includes(sel) ? sel : (available[0] ?? "yolo26n");
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
-  const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true }), onSuccess: () => pingSavedSoon(qc) });
+  const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
+  const actionAllHmdb = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "hmdb" }), onSuccess: () => pingSavedSoon(qc) });
   const cancel = useMutation({ mutationFn: () => post("/api/detect/cancel"), onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }) });
 
   return (
@@ -152,9 +154,18 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
           <button
             onClick={() => actionAll.mutate()}
             disabled={analyzing > 0 || actionAll.isPending}
+            title="Per-person actions on all clips (ST-GCN++ / NTU-RGB+D 60)"
             className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50"
           >
-            <Video className="size-4" /> Actions
+            <Video className="size-4" /> Actions (NTU)
+          </button>
+          <button
+            onClick={() => actionAllHmdb.mutate()}
+            disabled={analyzing > 0 || actionAllHmdb.isPending}
+            title="Per-person actions on all clips (PoseC3D / HMDB51 — adds walk/run, slower)"
+            className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50"
+          >
+            <Video className="size-4" /> Actions (HMDB)
           </button>
           {analyzing > 0 && (
             <button

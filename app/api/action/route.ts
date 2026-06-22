@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
 import path from "node:path";
 
 import { NextRequest, NextResponse } from "next/server";
+
+import { spawnBatch } from "@/lib/spawn-batch";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,27 +22,28 @@ function actionPython() {
 export async function POST(req: NextRequest) {
   let relPath: string | undefined;
   let force = false;
+  let variant = "ntu";
   try {
     const body = await req.json();
     relPath = body?.relPath;
     force = Boolean(body?.force);
+    if (body?.variant === "hmdb") variant = "hmdb";
   } catch {
     /* no body */
   }
   const projectRoot = process.cwd();
-  const args = [path.join(projectRoot, "detect", "action.py")];
+  const args = [path.join(projectRoot, "detect", "action.py"), "--variant", variant];
   if (relPath) args.push("--path", relPath);
   if (force || relPath) args.push("--force");
 
   try {
-    const child = spawn(actionPython(), args, {
+    // Launched in its own cgroup (systemd-run) so a control-panel restart does
+    // not kill an in-flight batch — runs start-to-finish. Logs to .action.log.
+    const { isolated, unit } = spawnBatch(actionPython(), args, {
       cwd: projectRoot,
-      detached: true,
-      stdio: "ignore",
-      env: process.env,
+      logName: ".action.log",
     });
-    child.unref();
-    return NextResponse.json({ started: true });
+    return NextResponse.json({ started: true, isolated, unit });
   } catch (e) {
     return NextResponse.json(
       { started: false, error: e instanceof Error ? e.message : "spawn failed" },

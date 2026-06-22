@@ -4,7 +4,7 @@ import type { NodeConfig } from "./types";
 // `id|name|host` triples; falls back to the two known nodes by IP. We default to
 // raw IPs because `.local` mDNS resolution from this laptop is intermittently
 // flaky (and Node's server-side resolver is worse than the browser's).
-const FALLBACK = "cam1|Smartroom 1|10.61.1.169,cam2|Smartroom 2|10.61.1.176";
+const FALLBACK = "cam1|Smartroom 1|10.61.1.169,cam2|Smartroom 2|10.61.1.206";
 
 export const NODES: NodeConfig[] = (process.env.SMARTROOM_NODES || FALLBACK)
   .split(",")
