@@ -3,16 +3,16 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { barClass } from "@/lib/action-colors";
+import { barClass, strokeColor } from "@/lib/action-colors";
 
 // Per-window classifier output recorded by detect/action.py (camera_main.actions.<model>.json).
 type Entry = { t: number; action: string; conf: number; kept?: boolean; top?: [string, number][] };
 type Timeline = { tracks: Record<string, Entry[]> };
 
 // How many top classes to show as bars, and the confidence a full-width bar maps
-// to (these heads rarely exceed ~0.5; near-uniform reads as honestly short bars).
+// to (lower = longer bars). These heads rarely exceed ~0.4 even when confident.
 const TOP_N = 5;
-const SCALE = 0.6;
+const SCALE = 0.4;
 
 function actionsPath(relPath: string, model: string) {
   return relPath.replace(/\.mp4$/, `.actions.${model}.json`);
@@ -44,6 +44,52 @@ function distAt(entries: Entry[], t: number): { dist: Map<string, number>; ref: 
   add(entryTop(prev), 1 - frac);
   if (next) add(entryTop(next), frac);
   return { dist, ref: frac >= 0.5 && next ? next : prev };
+}
+
+// Probability-over-time line graph for one person: a line per chip-action (same
+// colors as the bars), plus a playhead that tracks the video. Static lines are
+// memoised; only the playhead moves each frame. A class's probability is taken
+// from each window's top-K (0 when it isn't in the top-K that window).
+function ActionLines({ entries, actions, currentTime }: { entries: Entry[]; actions: string[]; currentTime: number }) {
+  const W = 320;
+  const H = 60;
+  const padL = 2;
+  const padT = 4;
+  const padB = 12;
+
+  const plot = useMemo(() => {
+    if (entries.length < 2) return null;
+    const tMax = entries[entries.length - 1].t || 1;
+    const probAt = (e: Entry, label: string) => entryTop(e).find(([l]) => l === label)?.[1] ?? 0;
+    // Only plot labels that meaningfully show up (keeps it to a few lines).
+    const labels = actions.filter((a) => entries.some((e) => probAt(e, a) > 0.08)).slice(0, 5);
+    if (labels.length === 0) return null;
+    let pMax = 0.3;
+    for (const a of labels) for (const e of entries) pMax = Math.max(pMax, probAt(e, a));
+    const innerW = W - padL;
+    const innerH = H - padT - padB;
+    const x = (t: number) => padL + (t / tMax) * innerW;
+    const y = (p: number) => padT + (1 - p / pMax) * innerH;
+    const lines = labels.map((a) => ({
+      label: a,
+      color: strokeColor(a, actions),
+      points: entries.map((e) => `${x(e.t).toFixed(1)},${y(probAt(e, a)).toFixed(1)}`).join(" "),
+    }));
+    return { tMax, x, lines };
+  }, [entries, actions]);
+
+  if (!plot) return null;
+  const px = plot.x(Math.min(currentTime, plot.tMax));
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} className="mt-1.5 w-full" preserveAspectRatio="none" role="img" aria-label="action probability over time">
+      {plot.lines.map((l) => (
+        <polyline key={l.label} points={l.points} fill="none" stroke={l.color} strokeWidth={1.5} vectorEffect="non-scaling-stroke" />
+      ))}
+      <line x1={px} x2={px} y1={padT} y2={H - padB} stroke="rgb(0 0 0 / 0.45)" strokeWidth={1} vectorEffect="non-scaling-stroke" />
+      <text x={padL} y={H - 2} fontSize={8} fill="rgb(0 0 0 / 0.4)">0s</text>
+      <text x={W} y={H - 2} fontSize={8} fill="rgb(0 0 0 / 0.4)" textAnchor="end">{Math.round(plot.tMax)}s</text>
+    </svg>
+  );
 }
 
 // Live per-person "most confident classes" bar graph, synced to the playing
@@ -84,7 +130,7 @@ export function ActionBars({
   if (!tracks || ids.length === 0) return null;
 
   return (
-    <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+    <div className="mt-2 flex flex-col gap-2">
       {ids.map((id) => {
         const at = distAt(tracks[id], currentTime);
         const idle = !at || at.ref.kept === false;
@@ -116,6 +162,7 @@ export function ActionBars({
                 ))
               )}
             </div>
+            <ActionLines entries={tracks[id]} actions={actions} currentTime={currentTime} />
           </div>
         );
       })}
