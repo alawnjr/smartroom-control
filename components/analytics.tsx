@@ -6,6 +6,7 @@ import { Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
 import { ActionBars } from "@/components/action-bars";
 import { OccupancyGraph } from "@/components/occupancy-graph";
+import { tagClass } from "@/lib/action-colors";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { NodeConfig, SavedVideo } from "@/lib/types";
 
@@ -14,7 +15,7 @@ const MODEL_LABEL: Record<string, string> = {
   yolo26n: "nano", yolo26s: "small", yolo26m: "medium", yolo26l: "large",
   "yolo26n-pose": "pose", action: "actions (NTU)", "action-hmdb": "actions (HMDB)",
 };
-const TAG = ["bg-amber-200 text-amber-900", "bg-sky-200 text-sky-900", "bg-violet-200 text-violet-900", "bg-emerald-200 text-emerald-900", "bg-rose-200 text-rose-900"];
+const SPEEDS = [0.25, 0.5, 1, 2];
 
 function fileUrl(relPath: string) {
   return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
@@ -36,6 +37,7 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   const hasOverlay = Boolean(d?.hasAnnotated && d.annotatedRelPath);
   const [overlay, setOverlay] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
+  const [rate, setRate] = useState(1);
   const videoRef = useRef<HTMLVideoElement>(null);
   const showOverlay = overlay && hasOverlay;
   const src = showOverlay ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
@@ -73,6 +75,11 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
     };
   }, [isAction, src]);
 
+  // Apply the chosen playback speed (a fresh <video> on src change resets to 1x).
+  useEffect(() => {
+    if (videoRef.current) videoRef.current.playbackRate = rate;
+  }, [rate, src]);
+
   const reanalyze = useMutation({
     mutationFn: () =>
       isAction
@@ -87,14 +94,29 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
         <div className="text-sm font-extrabold">
           {roomName} <span className="font-mono text-xs font-normal text-muted">· {v.rec.split("_").pop()}</span>
         </div>
-        <button
-          onClick={() => reanalyze.mutate()}
-          disabled={reanalyze.isPending || analyzing}
-          title="Re-run this model on this clip"
-          className="rounded-lg border border-line p-1.5 text-muted hover:bg-background disabled:opacity-50"
-        >
-          <RefreshCw className={`size-3.5 ${reanalyze.isPending || analyzing ? "animate-spin" : ""}`} />
-        </button>
+        <div className="flex items-center gap-2">
+          {d?.status === "done" && (
+            <div className="flex overflow-hidden rounded-lg border border-line text-[10px] font-bold" title="Playback speed">
+              {SPEEDS.map((r) => (
+                <button
+                  key={r}
+                  onClick={() => setRate(r)}
+                  className={`px-1.5 py-1 ${r === rate ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}
+                >
+                  {r}×
+                </button>
+              ))}
+            </div>
+          )}
+          <button
+            onClick={() => reanalyze.mutate()}
+            disabled={reanalyze.isPending || analyzing}
+            title="Re-run this model on this clip"
+            className="rounded-lg border border-line p-1.5 text-muted hover:bg-background disabled:opacity-50"
+          >
+            <RefreshCw className={`size-3.5 ${reanalyze.isPending || analyzing ? "animate-spin" : ""}`} />
+          </button>
+        </div>
       </div>
 
       <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-black">
@@ -139,13 +161,13 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
             <span className="text-xs text-muted">no actions detected</span>
           ) : (
             (d.actions ?? []).slice(0, 8).map((t, i) => (
-              <span key={t} className={`rounded-md px-1.5 py-0.5 text-[10px] font-bold ${TAG[i % TAG.length]}`}>{t}</span>
+              <span key={t} className={`rounded-md px-1.5 py-0.5 text-[10px] font-bold ${tagClass(i)}`}>{t}</span>
             ))
           )}
         </div>
       )}
       {d?.status === "done" && isAction && (
-        <ActionBars relPath={v.relPath} model={model} currentTime={currentTime} />
+        <ActionBars relPath={v.relPath} model={model} currentTime={currentTime} actions={d.actions ?? []} />
       )}
     </div>
   );

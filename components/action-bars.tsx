@@ -3,25 +3,16 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import { barClass } from "@/lib/action-colors";
+
 // Per-window classifier output recorded by detect/action.py (camera_main.actions.<model>.json).
 type Entry = { t: number; action: string; conf: number; kept?: boolean; top?: [string, number][] };
 type Timeline = { tracks: Record<string, Entry[]> };
 
-// Top-N classes get their own slice; everything else collapses into "other".
-const TOP_N = 3;
-const OTHER_COLOR = "#d1d5db";
-// Stable palette — a category is hashed to a fixed color so the same action keeps
-// the same color across people, pies, and time (not reassigned by rank).
-const PALETTE = [
-  "#10b981", "#0ea5e9", "#a855f7", "#f59e0b", "#f43f5e", "#14b8a6",
-  "#6366f1", "#84cc16", "#d946ef", "#fb923c", "#06b6d4", "#ec4899",
-];
-function colorFor(label: string): string {
-  if (label === "other") return OTHER_COLOR;
-  let h = 0;
-  for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) | 0;
-  return PALETTE[Math.abs(h) % PALETTE.length];
-}
+// How many top classes to show as bars, and the confidence a full-width bar maps
+// to (these heads rarely exceed ~0.5; near-uniform reads as honestly short bars).
+const TOP_N = 5;
+const SCALE = 0.6;
 
 function actionsPath(relPath: string, model: string) {
   return relPath.replace(/\.mp4$/, `.actions.${model}.json`);
@@ -32,7 +23,7 @@ function entryTop(e: Entry): [string, number][] {
 }
 
 // Interpolate the class distribution at the playhead by blending the two windows
-// straddling it (linear in their probabilities). This makes the pie glide between
+// straddling it (linear in their probabilities), so the bars glide between
 // windows instead of snapping at each ~0.4s classification. Returns the blended
 // label->prob map plus the nearer window (for the header label / idle state).
 function distAt(entries: Entry[], t: number): { dist: Map<string, number>; ref: Entry } | null {
@@ -55,50 +46,21 @@ function distAt(entries: Entry[], t: number): { dist: Map<string, number>; ref: 
   return { dist, ref: frac >= 0.5 && next ? next : prev };
 }
 
-function polar(cx: number, cy: number, r: number, a: number) {
-  return { x: cx + r * Math.cos(a), y: cy + r * Math.sin(a) };
-}
-
-// SVG path for a pie wedge from angle a0 to a1 (radians, 0 = 3 o'clock).
-function wedge(cx: number, cy: number, r: number, a0: number, a1: number) {
-  const p0 = polar(cx, cy, r, a0);
-  const p1 = polar(cx, cy, r, a1);
-  const large = a1 - a0 > Math.PI ? 1 : 0;
-  return `M ${cx} ${cy} L ${p0.x.toFixed(2)} ${p0.y.toFixed(2)} A ${r} ${r} 0 ${large} 1 ${p1.x.toFixed(2)} ${p1.y.toFixed(2)} Z`;
-}
-
-type Slice = { label: string; value: number; color: string };
-
-function Pie({ slices }: { slices: Slice[] }) {
-  const S = 72;
-  const c = S / 2;
-  const r = S / 2 - 1;
-  const total = slices.reduce((s, x) => s + x.value, 0) || 1;
-  // A single ~100% slice can't be drawn as a wedge (start == end) — use a full circle.
-  const solo = slices.find((s) => s.value / total >= 0.999);
-  let a = -Math.PI / 2; // start at 12 o'clock
-  return (
-    <svg viewBox={`0 0 ${S} ${S}`} width={S} height={S} className="shrink-0" role="img" aria-label="action probability pie">
-      {solo ? (
-        <circle cx={c} cy={c} r={r} fill={solo.color} />
-      ) : (
-        slices.map((s) => {
-          const a0 = a;
-          const a1 = a + (s.value / total) * 2 * Math.PI;
-          a = a1;
-          return <path key={s.label} d={wedge(c, c, r, a0, a1)} fill={s.color} stroke="white" strokeWidth={1} />;
-        })
-      )}
-    </svg>
-  );
-}
-
-// Live per-person action distribution as a pie (top-3 classes + "other"), synced
-// to the playing video's currentTime. One panel per tracked person; the pie is
-// the softmax distribution for the window covering the current instant — the
-// classes compete for one whole (they sum to 1), so "other" = 1 - sum(top 3).
+// Live per-person "most confident classes" bar graph, synced to the playing
+// video's currentTime. One panel per tracked person; bars are the top-N classes
+// for the window covering the current instant, colored to match the action chips.
 // Reads the action sidecar directly via /api/saved/file (static once analyzed).
-export function ActionBars({ relPath, model, currentTime }: { relPath: string; model: string; currentTime: number }) {
+export function ActionBars({
+  relPath,
+  model,
+  currentTime,
+  actions,
+}: {
+  relPath: string;
+  model: string;
+  currentTime: number;
+  actions: string[];
+}) {
   const path = actionsPath(relPath, model);
   const { data } = useQuery({
     queryKey: ["action-timeline", path],
@@ -126,15 +88,7 @@ export function ActionBars({ relPath, model, currentTime }: { relPath: string; m
       {ids.map((id) => {
         const at = distAt(tracks[id], currentTime);
         const idle = !at || at.ref.kept === false;
-        const sorted = at ? [...at.dist.entries()].sort((a, b) => b[1] - a[1]) : [];
-
-        const head = sorted.slice(0, TOP_N);
-        const sumHead = head.reduce((s, [, p]) => s + p, 0);
-        const other = Math.max(0, 1 - sumHead);
-        const slices: Slice[] = [
-          ...head.map(([label, value]) => ({ label, value, color: colorFor(label) })),
-          ...(other > 0.005 ? [{ label: "other", value: other, color: OTHER_COLOR }] : []),
-        ];
+        const bars = at ? [...at.dist.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_N) : [];
 
         return (
           <div key={id} className="rounded-xl border border-line bg-background p-2">
@@ -142,22 +96,26 @@ export function ActionBars({ relPath, model, currentTime }: { relPath: string; m
               <span>#{id}</span>
               <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : at?.ref.action}</span>
             </div>
-            {slices.length === 0 ? (
-              <div className="text-[10px] text-muted">—</div>
-            ) : (
-              <div className="flex items-center gap-3">
-                <Pie slices={slices} />
-                <div className="flex flex-1 flex-col gap-0.5">
-                  {slices.map((s) => (
-                    <div key={s.label} className="flex items-center gap-1.5 text-[10px]">
-                      <span className="size-2.5 shrink-0 rounded-[3px]" style={{ background: s.color }} />
-                      <span className="flex-1 truncate text-muted" title={s.label}>{s.label}</span>
-                      <span className="shrink-0 font-mono text-muted">{Math.round(s.value * 100)}%</span>
+            <div className="flex flex-col gap-1">
+              {bars.length === 0 ? (
+                <div className="text-[10px] text-muted">—</div>
+              ) : (
+                bars.map(([label, p]) => (
+                  <div key={label} className="flex items-center gap-1.5">
+                    <span className="w-24 shrink-0 truncate text-[10px] text-muted" title={label}>
+                      {label}
+                    </span>
+                    <div className="relative h-2.5 flex-1 overflow-hidden rounded bg-line/40">
+                      <div
+                        className={`absolute inset-y-0 left-0 rounded transition-[width] duration-100 ease-linear ${barClass(label, actions)}`}
+                        style={{ width: `${Math.min(100, Math.max(2, (p / SCALE) * 100))}%` }}
+                      />
                     </div>
-                  ))}
-                </div>
-              </div>
-            )}
+                    <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted">{p.toFixed(2)}</span>
+                  </div>
+                ))
+              )}
+            </div>
           </div>
         );
       })}
