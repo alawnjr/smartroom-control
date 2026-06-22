@@ -16,14 +16,32 @@ function actionsPath(relPath: string, model: string) {
   return relPath.replace(/\.mp4$/, `.actions.${model}.json`);
 }
 
-// Latest window at or before the playhead (entries are time-ascending).
-function latestAt(entries: Entry[], t: number): Entry | null {
-  let found: Entry | null = null;
-  for (const e of entries) {
-    if (e.t <= t) found = e;
+function entryTop(e: Entry): [string, number][] {
+  return e.top ?? [[e.action, e.conf]];
+}
+
+// Interpolate the class distribution at the playhead by blending the two windows
+// straddling it (linear in their probabilities). This makes the pie glide between
+// windows instead of snapping at each ~0.4s classification. Returns the blended
+// label->prob map plus the nearer window (for the header label / idle state).
+function distAt(entries: Entry[], t: number): { dist: Map<string, number>; ref: Entry } | null {
+  let i = -1;
+  for (let k = 0; k < entries.length; k++) {
+    if (entries[k].t <= t) i = k;
     else break;
   }
-  return found;
+  if (i < 0) return null; // before the first window
+  const prev = entries[i];
+  const next = entries[i + 1];
+  const frac = next && next.t > prev.t ? Math.min(1, Math.max(0, (t - prev.t) / (next.t - prev.t))) : 0;
+
+  const dist = new Map<string, number>();
+  const add = (pairs: [string, number][], w: number) => {
+    for (const [label, p] of pairs) dist.set(label, (dist.get(label) ?? 0) + p * w);
+  };
+  add(entryTop(prev), 1 - frac);
+  if (next) add(entryTop(next), frac);
+  return { dist, ref: frac >= 0.5 && next ? next : prev };
 }
 
 function polar(cx: number, cy: number, r: number, a: number) {
@@ -95,11 +113,11 @@ export function ActionBars({ relPath, model, currentTime }: { relPath: string; m
   return (
     <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
       {ids.map((id) => {
-        const cur = latestAt(tracks[id], currentTime);
-        const top = cur?.top ?? (cur ? [[cur.action, cur.conf] as [string, number]] : []);
-        const idle = !cur || cur.kept === false;
+        const at = distAt(tracks[id], currentTime);
+        const idle = !at || at.ref.kept === false;
+        const sorted = at ? [...at.dist.entries()].sort((a, b) => b[1] - a[1]) : [];
 
-        const head = top.slice(0, TOP_N);
+        const head = sorted.slice(0, TOP_N);
         const sumHead = head.reduce((s, [, p]) => s + p, 0);
         const other = Math.max(0, 1 - sumHead);
         const slices: Slice[] = [
@@ -111,7 +129,7 @@ export function ActionBars({ relPath, model, currentTime }: { relPath: string; m
           <div key={id} className="rounded-xl border border-line bg-background p-2">
             <div className="mb-1 flex items-center justify-between text-xs font-bold">
               <span>#{id}</span>
-              <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : cur?.action}</span>
+              <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : at?.ref.action}</span>
             </div>
             {slices.length === 0 ? (
               <div className="text-[10px] text-muted">—</div>

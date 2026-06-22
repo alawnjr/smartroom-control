@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
@@ -36,9 +36,42 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   const hasOverlay = Boolean(d?.hasAnnotated && d.annotatedRelPath);
   const [overlay, setOverlay] = useState(true);
   const [currentTime, setCurrentTime] = useState(0);
+  const videoRef = useRef<HTMLVideoElement>(null);
   const showOverlay = overlay && hasOverlay;
   const src = showOverlay ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
   const analyzing = clipAnalyzing(v);
+
+  // While the clip plays, sample currentTime every animation frame so the live
+  // pie interpolates smoothly between windows (onTimeUpdate alone fires ~4x/sec).
+  useEffect(() => {
+    const v = videoRef.current;
+    if (!v || !isAction) return;
+    let raf = 0;
+    const tick = () => {
+      setCurrentTime(v.currentTime);
+      raf = requestAnimationFrame(tick);
+    };
+    const start = () => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(tick);
+    };
+    const stop = () => {
+      cancelAnimationFrame(raf);
+      setCurrentTime(v.currentTime);
+    };
+    v.addEventListener("playing", start);
+    v.addEventListener("pause", stop);
+    v.addEventListener("ended", stop);
+    v.addEventListener("seeked", stop);
+    if (!v.paused) start();
+    return () => {
+      cancelAnimationFrame(raf);
+      v.removeEventListener("playing", start);
+      v.removeEventListener("pause", stop);
+      v.removeEventListener("ended", stop);
+      v.removeEventListener("seeked", stop);
+    };
+  }, [isAction, src]);
 
   const reanalyze = useMutation({
     mutationFn: () =>
@@ -69,6 +102,7 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
           // eslint-disable-next-line @next/next/no-img-element
           <video
             key={src}
+            ref={videoRef}
             controls
             preload="none"
             className="h-full w-full object-contain"
