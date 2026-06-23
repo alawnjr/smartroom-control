@@ -175,41 +175,64 @@ export function ActionBars({
 
   return (
     <div className="mt-2 flex flex-col gap-2">
-      {ids.map((id) => {
-        const at = distAt(tracks[id], currentTime);
-        const idle = !at || at.ref.kept === false;
-        const bars = at ? [...at.dist.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_N) : [];
+      {ids.map((id) => (
+        <PersonPanel key={id} id={id} entries={tracks[id]} actions={actions} currentTime={currentTime} />
+      ))}
+    </div>
+  );
+}
 
-        return (
-          <div key={id} className="rounded-xl border border-line bg-background p-2">
-            <div className="mb-1 flex items-center justify-between text-xs font-bold">
-              <span>#{id}</span>
-              <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : at?.ref.action}</span>
+// One person's panel: a fixed set of bar rows (their overall top classes) that are
+// present from the start and only animate their widths — so nothing "pops in" as
+// the playhead crosses window boundaries — plus the line graph below.
+function PersonPanel({
+  id,
+  entries,
+  actions,
+  currentTime,
+}: {
+  id: string;
+  entries: Entry[];
+  actions: string[];
+  currentTime: number;
+}) {
+  // Stable rows: this person's most prominent classes by peak probability across
+  // the whole clip. Computed once so the rows don't reshuffle frame to frame.
+  const rows = useMemo(() => {
+    const peak = new Map<string, number>();
+    for (const e of entries) for (const [l, p] of entryTop(e)) peak.set(l, Math.max(peak.get(l) ?? 0, p));
+    return [...peak.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_N).map(([l]) => l);
+  }, [entries]);
+
+  const at = distAt(entries, currentTime);
+  const idle = !at || at.ref.kept === false;
+
+  return (
+    <div className="rounded-xl border border-line bg-background p-2">
+      <div className="mb-1 flex items-center justify-between text-xs font-bold">
+        <span>#{id}</span>
+        <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : at?.ref.action}</span>
+      </div>
+      <div className="flex flex-col gap-1">
+        {rows.map((label) => {
+          const p = at?.dist.get(label) ?? 0;
+          return (
+            <div key={label} className="flex items-center gap-1.5">
+              <span className="w-24 shrink-0 truncate text-[10px] text-muted" title={label}>
+                {label}
+              </span>
+              <div className="relative h-2.5 flex-1 overflow-hidden rounded bg-line/40">
+                <div
+                  className={`absolute inset-y-0 left-0 rounded transition-[width] duration-100 ease-linear ${barClass(label, actions)}`}
+                  style={{ width: `${Math.min(100, (p / SCALE) * 100)}%` }}
+                />
+              </div>
+              <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted">{p.toFixed(2)}</span>
             </div>
-            <div className="flex flex-col gap-1">
-              {bars.length === 0 ? (
-                <div className="text-[10px] text-muted">—</div>
-              ) : (
-                bars.map(([label, p]) => (
-                  <div key={label} className="flex items-center gap-1.5">
-                    <span className="w-24 shrink-0 truncate text-[10px] text-muted" title={label}>
-                      {label}
-                    </span>
-                    <div className="relative h-2.5 flex-1 overflow-hidden rounded bg-line/40">
-                      <div
-                        className={`absolute inset-y-0 left-0 rounded transition-[width] duration-100 ease-linear ${barClass(label, actions)}`}
-                        style={{ width: `${Math.min(100, Math.max(2, (p / SCALE) * 100))}%` }}
-                      />
-                    </div>
-                    <span className="w-8 shrink-0 text-right font-mono text-[10px] text-muted">{p.toFixed(2)}</span>
-                  </div>
-                ))
-              )}
-            </div>
-            <ActionLines entries={tracks[id]} actions={actions} currentTime={currentTime} />
-          </div>
-        );
-      })}
+          );
+        })}
+      </div>
+      <ActionLines entries={entries} actions={actions} currentTime={currentTime} />
     </div>
   );
 }
