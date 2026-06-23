@@ -47,6 +47,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # produced it (safe because this is offline — see process_clip pass 2).
 WINDOW = int(os.environ.get("SMARTROOM_ACTION_WINDOW", "48"))
 STRIDE = int(os.environ.get("SMARTROOM_ACTION_STRIDE", "2"))
+# Minimum samples before a track is classified. Waiting for the full WINDOW means
+# no prediction for the first WINDOW*STRIDE frames (~7s at these cameras' real
+# ~13.5fps), so predictions only appear halfway through a short clip. Instead we
+# start classifying once a track has MIN_WINDOW samples and front-pad (repeat the
+# earliest pose) up to WINDOW, so predictions begin early and just sharpen as real
+# history fills in. Defaults to a quarter window.
+MIN_WINDOW = int(os.environ.get("SMARTROOM_ACTION_MIN_WINDOW", str(max(2, WINDOW // 4))))
 # How far back to shift each label, as a fraction of the window span. 0 = no
 # shift (label sits where it was computed); a small value pulls labels slightly
 # earlier toward the window's center so they line up better with the motion. 0.5
@@ -170,6 +177,27 @@ def variant_min_conf(v: dict, num_classes: int) -> float:
     return e if e is not None else v["conf_mult"] / num_classes
 
 
+def _true_fps(mp4: Path) -> float | None:
+    # The real average frame rate, since CAP_PROP_FPS reports the nominal rate the
+    # camera advertises (often ~2x the frames actually delivered) and cv2's
+    # CAP_PROP_FRAME_COUNT is unreliable here. ffprobe's avg_frame_rate is exactly
+    # frames/duration; parse the "num/den" fraction. None if it can't be derived.
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=avg_frame_rate", "-of",
+             "default=noprint_wrappers=1:nokey=1", str(mp4)],
+            capture_output=True, text=True, timeout=20,
+        ).stdout.strip()
+        num, _, den = out.partition("/")
+        fps = float(num) / float(den) if den else float(num)
+        if fps > 0:
+            return fps
+    except Exception:
+        pass
+    return None
+
+
 def sidecars(mp4: Path, key: str):
     s = mp4.stem
     return (mp4.with_name(f"{s}.detections.{key}.json"),
@@ -212,11 +240,17 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
                                    "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
 
     cap = cv2.VideoCapture(str(mp4))
-    native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    reported_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     cap.release()
+    # These USB cameras report a nominal CAP_PROP_FPS (e.g. 30) but actually deliver
+    # far fewer frames (variable rate, ~13.5fps). Using the reported value squashes
+    # the timeline (t = idx/fps) and makes the sliding-window warm-up span ~2x the
+    # real seconds. Prefer the *true* average fps = frame_count / duration so the
+    # timeline lines up with the playing video and warm-up reflects real time.
+    native_fps = _true_fps(mp4) or reported_fps
 
     def classify(window):
         # window: list of (kpts (17,2), conf (17,)) -> (label|None, conf, top)
@@ -269,8 +303,14 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             for n, tid in enumerate(ids):
                 if idx % STRIDE == 0:
                     tubes[tid].append((xy[n], conf[n]))
-                if len(tubes[tid]) >= WINDOW and idx % classify_every == 0:
-                    label, cf, top = classify(list(tubes[tid]))
+                if len(tubes[tid]) >= MIN_WINDOW and idx % classify_every == 0:
+                    # Front-pad partial windows (repeat the earliest pose) so the
+                    # classifier always gets WINDOW frames and predictions can begin
+                    # before the window is naturally full.
+                    win = list(tubes[tid])
+                    if len(win) < WINDOW:
+                        win = [win[0]] * (WINDOW - len(win)) + win
+                    label, cf, top = classify(win)
                     ev_idx[tid].append(idx)
                     # overlay shows "idle" on abstention rather than a stale/guessed
                     # label; the summary vote + chips only count confident windows.
