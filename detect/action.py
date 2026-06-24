@@ -492,13 +492,10 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             for a, b in COCO_SKELETON:
                 if cs[a] > 0.3 and cs[b] > 0.3:
                     cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
-            in_jump = any(e["start"] <= g <= e["end"] for e in jumps.get(tid, ()))
-            if in_jump:
-                text = f"#{tid} JUMP"
-            else:
-                pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
-                text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
-            box_color = (0, 140, 255) if in_jump else (0, 200, 0)  # orange while airborne
+            # Only the classifier's labels go on this video; geometric jump events
+            # are kept separate (sidecar + the Analytics "Geometric" sub-view).
+            pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
+            text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
             font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
             (tw, th), base = cv2.getTextSize(text, font, scale, thick)
             box_w, box_h = tw + 6, th + base + 4
@@ -508,7 +505,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             bx = max(0, min(x1, fw - box_w)) if fw >= box_w else 0
             by = y1 - box_h if y1 - box_h >= 0 else y1
             by = max(0, min(by, fh - box_h))
-            cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), box_color, -1)
+            cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), (0, 200, 0), -1)
             cv2.putText(frame, text, (bx + 3, by + th + 2), font, scale, (0, 0, 0), thick)
         writer.write(frame)
     cap.release()
