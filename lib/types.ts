@@ -77,6 +77,7 @@ export type DetectionSummary = {
   tracks?: number;
   actions?: string[]; // distinct action labels seen
   trackActions?: Record<string, string>; // track id -> dominant action
+  jumps?: number; // geometric jump events detected (count)
 };
 
 export type SavedListing = { root: string; videos: SavedVideo[] };
