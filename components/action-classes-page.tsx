@@ -6,7 +6,9 @@ import { RefreshCw, Search } from "lucide-react";
 
 import { DATASETS } from "@/lib/action-classes";
 
-type Config = Record<string, { disabled: string[] }>;
+type Config = Record<string, { disabled?: string[]; stride?: number }>;
+
+const STRIDE_OPTS = [0, 1, 2, 3, 4]; // 0 = auto (fps-adaptive)
 
 // Browse the full label set each action model can emit, and toggle classes on/off.
 // Disabled classes are masked at inference (detect/action.py) so the model can
@@ -16,6 +18,7 @@ export function ActionClassesPage() {
   const [q, setQ] = useState("");
   const query = q.trim().toLowerCase();
 
+  const qc = useQueryClient();
   const { data: config } = useQuery({
     queryKey: ["action-classes"],
     queryFn: async (): Promise<Config> => {
@@ -28,6 +31,24 @@ export function ActionClassesPage() {
     refetchOnWindowFocus: false,
   });
 
+  const stride = config?.settings?.stride ?? 0;
+  const saveStride = useMutation({
+    mutationFn: async (n: number) => {
+      const res = await fetch("/api/action-classes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ stride: n }),
+      });
+      if (!res.ok) throw new Error("save failed");
+    },
+    onMutate: (n: number) =>
+      qc.setQueryData<Config>(["action-classes"], (old) => ({
+        ...(old ?? {}),
+        settings: { ...old?.settings, stride: n },
+      })),
+    onError: () => qc.invalidateQueries({ queryKey: ["action-classes"] }),
+  });
+
   return (
     <div>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -38,15 +59,31 @@ export function ActionClassesPage() {
             <em>enabled</em> class or falls back to idle. Re-analyze clips to apply.
           </p>
         </div>
-        <label className="flex items-center gap-2 rounded-xl border border-line bg-card px-3 py-1.5">
-          <Search className="size-4 text-muted" />
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="filter classes…"
-            className="w-40 bg-transparent text-sm outline-none placeholder:text-muted"
-          />
-        </label>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2" title="Frames between samples in the classifier window. Auto adapts to each clip's true fps to target a ~3.2s window.">
+            <span className="text-xs font-bold text-muted">stride</span>
+            <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
+              {STRIDE_OPTS.map((n) => (
+                <button
+                  key={n}
+                  onClick={() => saveStride.mutate(n)}
+                  className={`px-2 py-1 ${n === stride ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}
+                >
+                  {n === 0 ? "auto" : n}
+                </button>
+              ))}
+            </div>
+          </div>
+          <label className="flex items-center gap-2 rounded-xl border border-line bg-card px-3 py-1.5">
+            <Search className="size-4 text-muted" />
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="filter classes…"
+              className="w-40 bg-transparent text-sm outline-none placeholder:text-muted"
+            />
+          </label>
+        </div>
       </div>
 
       <div className="flex flex-col gap-6">

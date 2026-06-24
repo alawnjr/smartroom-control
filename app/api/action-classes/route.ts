@@ -16,7 +16,8 @@ function configPath() {
   );
 }
 
-type Config = Record<string, { disabled: string[] }>;
+// Per-variant whitelist plus a `settings` block (e.g. stride override).
+type Config = Record<string, { disabled?: string[]; stride?: number }>;
 
 async function read(): Promise<Config> {
   try {
@@ -41,7 +42,11 @@ export async function POST(req: NextRequest) {
   }
 
   const cfg = await read();
-  if (body && typeof body === "object" && "variant" in body) {
+  if (body && typeof body === "object" && "stride" in body) {
+    // { stride: N } — pin the analysis stride; 0 (or falsy) means auto.
+    const n = Number((body as { stride: unknown }).stride);
+    cfg.settings = { ...cfg.settings, stride: Number.isFinite(n) && n > 0 ? Math.round(n) : 0 };
+  } else if (body && typeof body === "object" && "variant" in body) {
     const { variant, disabled } = body as { variant: string; disabled: string[] };
     if (typeof variant !== "string" || !Array.isArray(disabled)) {
       return NextResponse.json({ error: "expected { variant, disabled[] }" }, { status: 400 });
