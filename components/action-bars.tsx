@@ -205,13 +205,14 @@ function PersonPanel({
   }, [entries]);
 
   const at = distAt(entries, currentTime);
-  const idle = !at || at.ref.kept === false;
+  const kept = !!at && at.ref.kept !== false;
+  const label = at ? at.ref.action : "idle";
 
   return (
     <div className="rounded-xl border border-line bg-background p-2">
       <div className="mb-1 flex items-center justify-between text-xs font-bold">
         <span>#{id}</span>
-        <span className={idle ? "text-muted" : "text-emerald-600"}>{idle ? "idle" : at?.ref.action}</span>
+        <span className={kept ? "text-emerald-600" : "text-muted"}>{label}</span>
       </div>
       <div className="flex flex-col gap-1">
         {rows.map((label) => {
