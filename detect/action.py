@@ -92,6 +92,22 @@ MIN_KEYPOINTS = int(os.environ.get("SMARTROOM_ACTION_MIN_KEYPOINTS", "10"))
 # How many top classes to record per window for the live per-person bar graph.
 TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "5"))
 SCHEMA_VERSION = 2
+# Per-variant class whitelist, written by the dashboard's Classes tab. A JSON map
+# of variant key -> {"disabled": [class name, ...]}; disabled classes are masked
+# (probability zeroed) before argmax, so the model can never emit them — it picks
+# the best *allowed* class or abstains to idle. Absent file = all classes enabled.
+CLASSES_CONFIG = Path(os.environ.get("SMARTROOM_ACTION_CLASSES_FILE")
+                      or (PROJECT_ROOT / "action-classes.json"))
+
+
+def load_disabled(key: str, class_names) -> list:
+    # Indices of classes turned off for this variant (empty if no config / none off).
+    try:
+        cfg = json.loads(CLASSES_CONFIG.read_text())
+        names = set(cfg.get(key, {}).get("disabled", []))
+        return [i for i, n in enumerate(class_names) if n in names]
+    except Exception:
+        return []
 
 
 def _env_float(name):
@@ -248,6 +264,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     key, class_names = variant["key"], variant["labels"]
     classify_every = variant["classify_every"]
     temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
+    disabled_idx = load_disabled(key, class_names)
     json_path, actions_path, annotated_path = sidecars(mp4, key)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
@@ -279,6 +296,12 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         # that made the old confidence numbers meaningless.
         score = res.pred_score
         probs = (score.clamp_min(1e-8).log() / temp).softmax(-1)
+        if disabled_idx:
+            # Whitelist mask: zero out disallowed classes (no renormalize, so the
+            # abstention check below still measures real probability mass — if the
+            # model wanted a disabled class, the best allowed one stays weak -> idle).
+            probs = probs.clone()
+            probs[disabled_idx] = 0.0
         k = min(TOPK, int(probs.numel()))
         vals, idxs = probs.topk(k)
         vals, idxs = [float(v) for v in vals.tolist()], [int(i) for i in idxs.tolist()]

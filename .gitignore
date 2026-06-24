@@ -50,3 +50,6 @@ next-env.d.ts
 # Python bytecode
 __pycache__/
 *.pyc
+
+# local action-class whitelist (written by the Classes tab)
+action-classes.json
