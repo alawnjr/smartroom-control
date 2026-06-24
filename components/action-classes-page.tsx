@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Search } from "lucide-react";
+import { RefreshCw, Search } from "lucide-react";
 
 import { DATASETS } from "@/lib/action-classes";
 
@@ -91,6 +91,18 @@ function DatasetCard({
   };
   const setAll = (off: boolean) => save.mutate(off ? [...ds.classes] : []);
 
+  // Toggles only take effect when clips are re-analyzed (the mask is baked in at
+  // analysis time). Force a re-run of this variant so the change actually applies.
+  const variant = ds.key === "action-hmdb" ? "hmdb" : "ntu";
+  const reanalyze = useMutation({
+    mutationFn: () =>
+      fetch("/api/action", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ force: true, variant }),
+      }),
+  });
+
   // Keep original indices so the chip numbers stay aligned with the model head.
   const rows = useMemo(
     () =>
@@ -125,6 +137,15 @@ function DatasetCard({
             className="rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-background"
           >
             all off
+          </button>
+          <button
+            onClick={() => reanalyze.mutate()}
+            disabled={reanalyze.isPending}
+            title="Re-run this model on all clips so the toggles take effect"
+            className="flex items-center gap-1 rounded-lg bg-emerald-500 px-2 py-1 text-[11px] font-bold text-white hover:bg-emerald-600 disabled:opacity-50"
+          >
+            <RefreshCw className={`size-3 ${reanalyze.isPending ? "animate-spin" : ""}`} />
+            {reanalyze.isSuccess ? "re-analyzing…" : "apply"}
           </button>
         </div>
       </div>
