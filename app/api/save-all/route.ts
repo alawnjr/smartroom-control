@@ -44,8 +44,14 @@ async function saveNode(
     const { videos } = (await res.json()) as { videos: Video[] };
 
     for (const v of videos) {
-      const rel = v.token.replace(/^data\//, ""); // day_X/rec_Y/streams/file.mp4
-      const dest = path.join(root, node.id, rel);
+      // Source token: day_X/rec_Y/streams/file.mp4  or  day_X/rec_Y/metadata.json.
+      // Lay both cameras under one shared rec, with each node inside streams/:
+      //   <root>/day_X/rec_Y/streams/<node>/<file>
+      // (the Pis use identical day/rec names, so same folder == same session).
+      const raw = v.token.replace(/^data\//, "");
+      const [day, rec, ...rest] = raw.split("/");
+      const tail = rest.filter((s) => s !== "streams"); // drop the source 'streams' segment
+      const dest = path.join(root, day, rec, "streams", node.id, ...tail);
       try {
         const st = await stat(dest);
         if (st.size === v.size) {

@@ -33,7 +33,9 @@ export async function GET() {
 
   const videos: SavedVideo[] = [];
   for (const rel of rels) {
+    // Layout: <day>/<rec>/streams/<node>/<file> — node lives inside streams/.
     const parts = rel.split(path.sep);
+    const si = parts.indexOf("streams");
     const abs = path.join(root, rel);
     let size = 0;
     let mtime = 0;
@@ -46,9 +48,9 @@ export async function GET() {
     }
     const detections = await readDetections(abs);
     videos.push({
-      node: parts[0] ?? "",
-      day: parts[1] ?? "",
-      rec: parts[2] ?? "",
+      node: (si >= 0 ? parts[si + 1] : "") ?? "",
+      day: parts[0] ?? "",
+      rec: parts[1] ?? "",
       file: parts[parts.length - 1],
       relPath: rel,
       size,
