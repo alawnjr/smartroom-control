@@ -29,9 +29,13 @@ export async function GET(req: NextRequest) {
   // the zip expands to <name>/... rather than a pile of loose files.
   const parent = path.dirname(abs);
   const name = path.basename(abs);
-  const child = spawn("bsdtar", ["--format", "zip", "-cf", "-", "-C", parent, name], {
-    stdio: ["ignore", "pipe", "ignore"],
-  });
+  // Exclude the per-model annotated overlay videos — they're just visualizations
+  // (boxes/skeletons burned in); the raw camera_main.mp4 + JSON sidecars are the data.
+  const child = spawn(
+    "bsdtar",
+    ["--format", "zip", "-cf", "-", "--exclude", "*.annotated.*.mp4", "-C", parent, name],
+    { stdio: ["ignore", "pipe", "ignore"] },
+  );
 
   const filename = rel.replace(/[\\/]+/g, "_") + ".zip";
   return new Response(Readable.toWeb(child.stdout) as unknown as ReadableStream<Uint8Array>, {
