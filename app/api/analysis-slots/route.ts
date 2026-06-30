@@ -82,7 +82,10 @@ export async function POST(req: NextRequest) {
     slot = Math.round(body.slot);
     for (const dir of clipDirs) mkdirSync(path.join(dir, `analysis_${slot}`), { recursive: true });
   } else {
-    let candidate = Math.max(1, ...existingSlots(clipDirs)) + 1;
+    // Smallest free slot >=2 (reuse gaps left by deletes so numbers stay tidy).
+    const used = new Set(existingSlots(clipDirs));
+    let candidate = 2;
+    while (used.has(candidate)) candidate++;
     for (let tries = 0; ; tries++, candidate++) {
       if (tries > 50) return NextResponse.json({ error: "could not allocate slot" }, { status: 500 });
       try {
