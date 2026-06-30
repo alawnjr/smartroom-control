@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, LineChart, Loader2, Plus, RefreshCw, ScanEye, Trash2, Video, X } from "lucide-react";
 
@@ -8,7 +8,7 @@ import { ClipAnalyticsDrawer } from "@/components/clip-analytics-drawer";
 import { GeometricPanel } from "@/components/geometric-page";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { tagClass } from "@/lib/action-colors";
-import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
+import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved, type Session } from "@/lib/use-saved";
 import type { NodeConfig, SavedVideo } from "@/lib/types";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action", "action-hmdb"];
@@ -158,6 +158,83 @@ function Opt({ on, label, val, set }: { on: number; label: string; val: number[]
   );
 }
 
+// One recording's row: numbered slot tabs (sequential ordinals) + a New-analysis
+// button that uses the shared sticky settings + a Download. Per recording.
+function SlotTabs({
+  session, selected, onSelect, model, stride, spc, disabled,
+}: {
+  session: Session;
+  selected: number;
+  onSelect: (slot: number) => void;
+  model: string;
+  stride: number;
+  spc: number;
+  disabled: Record<string, string[]>;
+}) {
+  const qc = useQueryClient();
+  const { day, rec } = session.clips[0];
+  const realSlots = [...new Set([1, ...session.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])]
+    .sort((a, b) => a - b);
+  const variant = model === "action-hmdb" ? "hmdb" : "ntu";
+
+  const del = useMutation({
+    mutationFn: () =>
+      fetch(`/api/analysis-slots?path=${encodeURIComponent(`${day}/${rec}`)}&slot=${selected}`, { method: "DELETE" }),
+    onSuccess: () => { onSelect(1); qc.invalidateQueries({ queryKey: ["saved"] }); },
+  });
+  const create = useMutation({
+    mutationFn: async () => {
+      const res = await fetch("/api/analysis-slots", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ day, rec, settings: { stride, samplesPerClassify: spc }, variants: [variant], disabled }),
+      });
+      return res.ok ? ((await res.json())?.slot as number | undefined) : undefined;
+    },
+    onSuccess: (slot) => { pingSavedSoon(qc); if (slot) onSelect(slot); },
+  });
+
+  return (
+    <div className="mb-2 flex flex-wrap items-center gap-3">
+      <span className="font-mono text-sm font-bold text-muted">{session.label}</span>
+      <span className="rounded-full bg-card px-2 py-0.5 text-xs font-bold text-muted">
+        {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
+      </span>
+      <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
+        {realSlots.map((real, i) => (
+          <button
+            key={real}
+            onClick={() => onSelect(real)}
+            className={`px-2.5 py-1 ${real === selected ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
+          >
+            {i === 0 ? "1 · original" : i + 1}
+          </button>
+        ))}
+      </div>
+      {selected > 1 && (
+        <button onClick={() => del.mutate()} disabled={del.isPending} title="Delete this analysis" className="rounded-lg border border-line p-1.5 text-rose-500 hover:bg-rose-50 disabled:opacity-50">
+          <Trash2 className="size-3.5" />
+        </button>
+      )}
+      <button
+        onClick={() => create.mutate()}
+        disabled={create.isPending}
+        title={`Run a new ${variant.toUpperCase()} analysis on this recording with the chosen settings (creates a new tab)`}
+        className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"
+      >
+        {create.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />} New analysis ({variant.toUpperCase()})
+      </button>
+      <a
+        href={`/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`}
+        title="Download this whole recording folder (both cameras + all analyses) as a .zip"
+        className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-card"
+      >
+        <Download className="size-3.5" /> Download folder
+      </a>
+    </div>
+  );
+}
+
 export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const qc = useQueryClient();
   const saved = useSaved();
@@ -174,73 +251,26 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const [sel, setSel] = useState<string | null>(null);
   const model = sel && available.includes(sel) ? sel : (available[0] ?? "yolo26n");
   const [view, setView] = useState<"models" | "geometric">("models");
-
-  // One recording is focused at a time (selector below); per-recording selected slot.
-  const [focusedKey, setFocusedKey] = useState<string | null>(null);
-  const focused = sessions.find((s) => s.key === focusedKey) ?? sessions[0];
   const [slotBySession, setSlotBySession] = useState<Record<string, number>>({});
-  const selectedSlot = focused ? slotBySession[focused.key] ?? 1 : 1;
-  const realSlots = focused
-    ? [...new Set([1, ...focused.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])].sort((a, b) => a - b)
-    : [1];
-  const selectedCfg = focused && selectedSlot > 1
-    ? focused.clips.map((c) => c.analyses?.[selectedSlot]?.config).find(Boolean)
-    : undefined;
-  const variant = model === "action-hmdb" ? "hmdb" : "ntu";
 
-  // The single top settings bar STICKS to the selected tab: it shows that tab's
-  // saved settings and resets when you switch tab/recording. Edits are local until
-  // "New analysis" spawns a fresh tab from them.
+  // Shared, STICKY new-analysis settings — they persist until you change them
+  // (no auto-reset). New analysis on any recording uses these.
   const [stride, setStride] = useState(0);
   const [spc, setSpc] = useState(0);
-  const cfgStride = selectedCfg?.settings?.stride ?? 0;
-  const cfgSpc = selectedCfg?.settings?.samplesPerClassify ?? 0;
-  useEffect(() => {
-    setStride(cfgStride);
-    setSpc(cfgSpc);
-  }, [focused?.key, selectedSlot, cfgStride, cfgSpc]);
-
   const { data: globalCfg } = useQuery({
     queryKey: ["action-classes"],
     queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
     staleTime: Infinity,
   });
+  const newDisabled = {
+    action: globalCfg?.action?.disabled ?? [],
+    "action-hmdb": globalCfg?.["action-hmdb"]?.disabled ?? [],
+  };
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
   const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
   const actionAllHmdb = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "hmdb" }), onSuccess: () => pingSavedSoon(qc) });
   const cancel = useMutation({ mutationFn: () => post("/api/detect/cancel"), onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }) });
-
-  const setSlot = (n: number) => focused && setSlotBySession((m) => ({ ...m, [focused.key]: n }));
-  const createSlot = useMutation({
-    mutationFn: async () => {
-      if (!focused) return undefined;
-      const { day, rec } = focused.clips[0];
-      const res = await fetch("/api/analysis-slots", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          day, rec,
-          settings: { stride, samplesPerClassify: spc },
-          variants: [variant],
-          disabled: {
-            action: globalCfg?.action?.disabled ?? [],
-            "action-hmdb": globalCfg?.["action-hmdb"]?.disabled ?? [],
-          },
-        }),
-      });
-      return res.ok ? ((await res.json())?.slot as number | undefined) : undefined;
-    },
-    onSuccess: (slot) => { pingSavedSoon(qc); if (slot) setSlot(slot); },
-  });
-  const delSlot = useMutation({
-    mutationFn: async () => {
-      if (!focused || selectedSlot < 2) return;
-      const { day, rec } = focused.clips[0];
-      await fetch(`/api/analysis-slots?path=${encodeURIComponent(`${day}/${rec}`)}&slot=${selectedSlot}`, { method: "DELETE" });
-    },
-    onSuccess: () => { setSlot(1); qc.invalidateQueries({ queryKey: ["saved"] }); },
-  });
 
   return (
     <div>
@@ -263,8 +293,8 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
         <p className="text-sm text-muted">No clips to analyze yet — “Beam to laptop” on the Live tab first.</p>
       ) : (
         <>
-          {/* top controls: model + the single (tab-sticky) settings bar + New analysis */}
-          <div className="mb-3 flex flex-wrap items-center gap-3">
+          {/* top controls: model + the single sticky settings bar */}
+          <div className="mb-4 flex flex-wrap items-center gap-3">
             {available.length > 0 && (
               <div className="flex items-center gap-2">
                 <span className="text-sm font-bold text-muted">model</span>
@@ -283,14 +313,6 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             )}
             <Opt on={stride} label="stride" val={STRIDE_OPTS} set={setStride} />
             <Opt on={spc} label="samples / classify" val={SPC_OPTS} set={setSpc} />
-            <button
-              onClick={() => createSlot.mutate()}
-              disabled={createSlot.isPending}
-              title={`Run a new ${variant.toUpperCase()} analysis on this recording with the chosen settings (creates a new tab)`}
-              className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"
-            >
-              {createSlot.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />} New analysis ({variant.toUpperCase()})
-            </button>
             <div className="ml-auto flex items-center gap-2">
               <button
                 onClick={() => detectAll.mutate()}
@@ -314,51 +336,29 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             </div>
           </div>
 
-          {/* recording selector + this recording's slot tabs */}
-          {focused && (
-            <div className="mb-3 flex flex-wrap items-center gap-3">
-              <select
-                value={focused.key}
-                onChange={(e) => setFocusedKey(e.target.value)}
-                className="rounded-lg border border-line bg-card px-2 py-1.5 font-mono text-sm font-bold text-foreground"
-              >
-                {sessions.map((s) => (
-                  <option key={s.key} value={s.key}>{s.label} ({s.clips.length} cam{s.clips.length > 1 ? "s" : ""})</option>
-                ))}
-              </select>
-              <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
-                {realSlots.map((real, i) => (
-                  <button
-                    key={real}
-                    onClick={() => setSlot(real)}
-                    className={`px-2.5 py-1 ${real === selectedSlot ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
-                  >
-                    {i === 0 ? "1 · original" : i + 1}
-                  </button>
-                ))}
-              </div>
-              {selectedSlot > 1 && (
-                <button onClick={() => delSlot.mutate()} disabled={delSlot.isPending} title="Delete this analysis" className="rounded-lg border border-line p-1.5 text-rose-500 hover:bg-rose-50 disabled:opacity-50">
-                  <Trash2 className="size-3.5" />
-                </button>
-              )}
-              <a
-                href={`/api/saved/archive?path=${encodeURIComponent(`${focused.clips[0].day}/${focused.clips[0].rec}`)}`}
-                title="Download this whole recording folder (both cameras + all analyses) as a .zip"
-                className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-card"
-              >
-                <Download className="size-3.5" /> Download folder
-              </a>
-            </div>
-          )}
-
-          {focused && (
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-              {focused.clips.map((v) => (
-                <AnalysisCard key={v.relPath} v={v} model={model} slot={selectedSlot} roomName={nameByNode.get(v.node) ?? v.node} />
-              ))}
-            </div>
-          )}
+          <div className="flex flex-col gap-7">
+            {sessions.map((s) => {
+              const slot = slotBySession[s.key] ?? 1;
+              return (
+                <div key={s.key}>
+                  <SlotTabs
+                    session={s}
+                    selected={slot}
+                    model={model}
+                    stride={stride}
+                    spc={spc}
+                    disabled={newDisabled}
+                    onSelect={(n) => setSlotBySession((m) => ({ ...m, [s.key]: n }))}
+                  />
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    {s.clips.map((v) => (
+                      <AnalysisCard key={v.relPath} v={v} model={model} slot={slot} roomName={nameByNode.get(v.node) ?? v.node} />
+                    ))}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </>
       )}
     </div>
