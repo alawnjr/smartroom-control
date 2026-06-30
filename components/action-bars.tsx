@@ -3,7 +3,7 @@
 import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { barClass, strokeColor } from "@/lib/action-colors";
+import { barClass } from "@/lib/action-colors";
 
 // Per-window classifier output recorded by detect/action.py (camera_main.actions.<model>.json).
 type Entry = { t: number; action: string; conf: number; kept?: boolean; top?: [string, number][] };
@@ -55,21 +55,19 @@ const LW = 320;
 const LH = 150;
 const PAD = { l: 30, r: 8, t: 8, b: 26 };
 
-function ActionLines({ entries, actions, currentTime }: { entries: Entry[]; actions: string[]; currentTime: number }) {
+function ActionLines({ entries, currentTime }: { entries: Entry[]; currentTime: number }) {
   const plot = useMemo(() => {
     if (entries.length < 2) return null;
     const tMax = entries[entries.length - 1].t || 1;
     const probAt = (e: Entry, label: string) => entryTop(e).find(([l]) => l === label)?.[1] ?? 0;
-    // Prefer the chip-actions that meaningfully show up (keeps it to a few lines).
-    let labels = actions.filter((a) => entries.some((e) => probAt(e, a) > 0.08)).slice(0, 5);
-    // Fall back to this person's most prominent classes so every panel still gets
-    // a line graph (not just the ones whose top labels happen to be chip-actions).
-    if (labels.length === 0) {
-      const peak = new Map<string, number>();
-      for (const e of entries) for (const [l, p] of entryTop(e)) peak.set(l, Math.max(peak.get(l) ?? 0, p));
-      labels = [...peak.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([l]) => l);
-    }
+    // Every class that shows up in any window's top-K, ordered by peak probability
+    // (most prominent first) — comprehensive, not capped to a handful.
+    const peak = new Map<string, number>();
+    for (const e of entries) for (const [l, p] of entryTop(e)) peak.set(l, Math.max(peak.get(l) ?? 0, p));
+    const labels = [...peak.entries()].sort((a, b) => b[1] - a[1]).map(([l]) => l);
     if (labels.length === 0) return null;
+    // Distinct color per class (golden-angle hue spread) so many lines stay readable.
+    const colorAt = (i: number) => `hsl(${Math.round((i * 137.508) % 360)} 65% 45%)`;
     let pMax = 0.3;
     for (const a of labels) for (const e of entries) pMax = Math.max(pMax, probAt(e, a));
     pMax = Math.ceil(pMax * 10) / 10; // round up to a tidy 0.1
@@ -80,15 +78,15 @@ function ActionLines({ entries, actions, currentTime }: { entries: Entry[]; acti
     const y1 = PAD.t;
     const x = (t: number) => x0 + (t / tMax) * (x1 - x0);
     const y = (p: number) => y0 + (1 - p / pMax) * (y1 - y0);
-    const lines = labels.map((a) => ({
+    const lines = labels.map((a, i) => ({
       label: a,
-      color: strokeColor(a, actions),
+      color: colorAt(i),
       points: entries.map((e) => `${x(e.t).toFixed(1)},${y(probAt(e, a)).toFixed(1)}`).join(" "),
     }));
     const yTicks = [0, pMax / 2, pMax];
     const xTicks = [0, tMax / 2, tMax];
     return { tMax, pMax, x, y, x0, x1, y0, y1, lines, yTicks, xTicks };
-  }, [entries, actions]);
+  }, [entries]);
 
   if (!plot) return null;
   const px = plot.x(Math.min(currentTime, plot.tMax));
@@ -235,7 +233,7 @@ function PersonPanel({
           );
         })}
       </div>
-      <ActionLines entries={entries} actions={actions} currentTime={currentTime} />
+      <ActionLines entries={entries} currentTime={currentTime} />
     </div>
   );
 }

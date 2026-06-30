@@ -112,7 +112,7 @@ PARTIAL = "not fully in frame"
 KP_CONF = float(os.environ.get("SMARTROOM_ACTION_KP_CONF", "0.3"))
 MIN_KEYPOINTS = int(os.environ.get("SMARTROOM_ACTION_MIN_KEYPOINTS", "10"))
 # How many top classes to record per window for the live per-person bar graph.
-TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "5"))
+TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "12"))
 SCHEMA_VERSION = 2
 # Per-variant class whitelist, written by the dashboard's Classes tab. A JSON map
 # of variant key -> {"disabled": [class name, ...]}; disabled classes are masked
