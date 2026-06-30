@@ -55,7 +55,21 @@ export type SavedVideo = {
   relPath: string; // full path relative to the recordings root
   size: number;
   mtime: number;
-  detections?: Record<string, DetectionSummary>; // keyed by model (yolo26n/s/m)
+  detections?: Record<string, DetectionSummary>; // slot 1 / in-place: shared detection + original action keys
+  analyses?: Record<number, SlotAnalysis>; // extra action-analysis slots (>=2), keyed by slot number
+};
+
+// One saved analysis slot (>=2): its settings snapshot + the action sidecars it produced.
+export type SlotConfig = {
+  settings?: { stride?: number; samplesPerClassify?: number };
+  variants?: string[];
+  createdAt?: string;
+  [key: string]: unknown; // per-variant { disabled: string[] }
+};
+export type SlotAnalysis = {
+  slot: number;
+  config?: SlotConfig;
+  detections: Record<string, DetectionSummary>;
 };
 
 export type DetectionStatus = "analyzing" | "done" | "error" | "none";
@@ -72,6 +86,7 @@ export type DetectionSummary = {
   timeline?: DetectionTimelinePoint[];
   hasAnnotated: boolean;
   annotatedRelPath?: string; // recordings-relative, for /api/saved/file
+  actionsRelPath?: string; // action models: recordings-relative path to .actions.<model>.json
   error?: string;
   // action model only:
   tracks?: number;
