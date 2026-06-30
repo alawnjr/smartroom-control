@@ -360,6 +360,23 @@ def _atomic_write_json(path: Path, data: dict):
     os.replace(tmp, path)
 
 
+def write_run_stats(root: Path, kind: str, label: str, started, processed: int, errors: int, skipped: int):
+    # Record the just-finished batch so the dashboard can show "last run" stats
+    # (elapsed, clip count) in the sidebar. One file per kind (.last_run.<kind>.json).
+    finished = dt.datetime.now(dt.timezone.utc)
+    elapsed = (finished - started).total_seconds()
+    try:
+        _atomic_write_json(root / f".last_run.{kind}.json", {
+            "kind": kind, "label": label,
+            "startedAt": started.isoformat(), "finishedAt": finished.isoformat(),
+            "elapsedSec": round(elapsed, 1), "processed": processed,
+            "skipped": skipped, "errors": errors,
+            "perClipSec": round(elapsed / processed, 1) if processed else None,
+        })
+    except Exception:
+        pass
+
+
 def needs_action(mp4: Path, force: bool, key: str) -> bool:
     if force:
         return True
@@ -675,11 +692,16 @@ def main():
         model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
         pose = YOLO(str(pose_weights()))
 
+        label = f"Actions ({'HMDB' if args.variant == 'hmdb' else 'NTU'})"
+        started = dt.datetime.now(dt.timezone.utc)
+        processed = errors = 0
         for mp4 in todo:
             try:
                 print(f"action[{args.variant}]: processing {mp4.relative_to(root)}", file=sys.stderr)
                 process_clip(model, inference_skeleton, pose, mp4, variant)
+                processed += 1
             except Exception as error:  # noqa: BLE001
+                errors += 1
                 print(f"  action error: {error}", file=sys.stderr)
                 jp, _, _ = sidecars(mp4, key)
                 try:
@@ -693,6 +715,7 @@ def main():
                 # holds onto allocations, so without this a long batch grows until
                 # the OOM killer stops it a couple of clips in.
                 gc.collect()
+        write_run_stats(root, key, label, started, processed, errors, len(clips) - len(todo))
         return 0
     finally:
         try:

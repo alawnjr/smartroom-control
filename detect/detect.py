@@ -308,6 +308,8 @@ def _run(root: Path, args) -> int:
 
     specs = model_specs()
     from ultralytics import YOLO
+    started = dt.datetime.now(dt.timezone.utc)
+    processed = errors = 0
     for key, md in specs:
         if not md.exists():
             print(f"skip model {key}: OpenVINO dir missing ({md}) — export it first", file=sys.stderr)
@@ -320,10 +322,34 @@ def _run(root: Path, args) -> int:
         for mp4 in todo:
             try:
                 process_clip(model, key, mp4)
+                processed += 1
             except Exception as error:  # noqa: BLE001
+                errors += 1
                 print(f"  [{key}] error: {error}", file=sys.stderr)
                 mark_error(mp4, key, str(error))
+    if processed or errors:
+        write_run_stats("detect", "Object detection", started, processed, errors)
     return 0
+
+
+def write_run_stats(kind: str, label: str, started, processed: int, errors: int):
+    # Record the just-finished batch so the dashboard sidebar can show "last run"
+    # stats (elapsed, count). processed counts (clip x model) inferences done.
+    root = saved_root()
+    finished = dt.datetime.now(dt.timezone.utc)
+    elapsed = (finished - started).total_seconds()
+    data = {
+        "kind": kind, "label": label,
+        "startedAt": started.isoformat(), "finishedAt": finished.isoformat(),
+        "elapsedSec": round(elapsed, 1), "processed": processed, "errors": errors,
+        "perClipSec": round(elapsed / processed, 1) if processed else None,
+    }
+    try:
+        tmp = root / f".last_run.{kind}.json.tmp"
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, root / f".last_run.{kind}.json")
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
