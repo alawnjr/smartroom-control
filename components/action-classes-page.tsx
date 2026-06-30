@@ -6,9 +6,10 @@ import { RefreshCw, Search } from "lucide-react";
 
 import { DATASETS } from "@/lib/action-classes";
 
-type Config = Record<string, { disabled?: string[]; stride?: number }>;
+type Config = Record<string, { disabled?: string[]; stride?: number; samplesPerClassify?: number }>;
 
 const STRIDE_OPTS = [0, 1, 2, 3, 4]; // 0 = auto (fps-adaptive)
+const SPC_OPTS = [0, 1, 2, 4, 6]; // new samples between classifications; 0 = variant default
 
 // Browse the full label set each action model can emit, and toggle classes on/off.
 // Disabled classes are masked at inference (detect/action.py) so the model can
@@ -49,6 +50,24 @@ export function ActionClassesPage() {
     onError: () => qc.invalidateQueries({ queryKey: ["action-classes"] }),
   });
 
+  const spc = config?.settings?.samplesPerClassify ?? 0;
+  const saveSpc = useMutation({
+    mutationFn: async (n: number) => {
+      const res = await fetch("/api/action-classes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ samplesPerClassify: n }),
+      });
+      if (!res.ok) throw new Error("save failed");
+    },
+    onMutate: (n: number) =>
+      qc.setQueryData<Config>(["action-classes"], (old) => ({
+        ...(old ?? {}),
+        settings: { ...old?.settings, samplesPerClassify: n },
+      })),
+    onError: () => qc.invalidateQueries({ queryKey: ["action-classes"] }),
+  });
+
   return (
     <div>
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
@@ -68,6 +87,20 @@ export function ActionClassesPage() {
                   key={n}
                   onClick={() => saveStride.mutate(n)}
                   className={`px-2 py-1 ${n === stride ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}
+                >
+                  {n === 0 ? "auto" : n}
+                </button>
+              ))}
+            </div>
+          </div>
+          <div className="flex items-center gap-2" title="How many new samples enter the window between classifications. 1 = classify on every new sample (max overlap, slowest). auto = the model's default frame cadence.">
+            <span className="text-xs font-bold text-muted">samples / classify</span>
+            <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
+              {SPC_OPTS.map((n) => (
+                <button
+                  key={n}
+                  onClick={() => saveSpc.mutate(n)}
+                  className={`px-2 py-1 ${n === spc ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}
                 >
                   {n === 0 ? "auto" : n}
                 </button>
