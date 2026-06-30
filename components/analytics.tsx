@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, LineChart, Loader2, Plus, RefreshCw, ScanEye, Trash2, Video, X } from "lucide-react";
 
@@ -158,44 +158,26 @@ function Opt({ on, label, val, set }: { on: number; label: string; val: number[]
   );
 }
 
-// Per-session numbered analysis tabs with an inline settings bar. Tabs render as
-// sequential ordinals (1,2,3…) regardless of folder numbers so they never skip.
-// The settings bar is bound to the SELECTED tab — it reflects that analysis's
-// settings and "New analysis" spawns a fresh tab from them, so editing here only
-// affects the current tab (until you create a new one).
+// Per-session numbered analysis tabs (sequential ordinals so they never skip) + a
+// "New analysis" button that uses the shared settings bar (see Analytics controls)
+// and a Download. Creating only affects this session's tabs.
 function SlotTabs({
-  session, selected, onSelect, model,
+  session, selected, onSelect, model, stride, spc, disabled,
 }: {
   session: Session;
   selected: number;
   onSelect: (slot: number) => void;
   model: string;
+  stride: number;
+  spc: number;
+  disabled: Record<string, string[]>;
 }) {
   const qc = useQueryClient();
   const { day, rec } = session.clips[0];
 
   const realSlots = [...new Set([1, ...session.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])]
     .sort((a, b) => a - b);
-  const selectedCfg = selected > 1
-    ? session.clips.map((c) => c.analyses?.[selected]?.config).find(Boolean)
-    : undefined;
   const variant = model === "action-hmdb" ? "hmdb" : "ntu";
-
-  const { data: globalCfg } = useQuery({
-    queryKey: ["action-classes"],
-    queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
-    staleTime: Infinity,
-  });
-
-  // The bar reflects the selected tab's settings; switching tabs resets it.
-  const [stride, setStride] = useState(0);
-  const [spc, setSpc] = useState(0);
-  const cfgStride = selectedCfg?.settings?.stride ?? 0;
-  const cfgSpc = selectedCfg?.settings?.samplesPerClassify ?? 0;
-  useEffect(() => {
-    setStride(cfgStride);
-    setSpc(cfgSpc);
-  }, [selected, cfgStride, cfgSpc]);
 
   const del = useMutation({
     mutationFn: (slot: number) =>
@@ -211,15 +193,7 @@ function SlotTabs({
       const res = await fetch("/api/analysis-slots", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          day, rec,
-          settings: { stride, samplesPerClassify: spc },
-          variants: [variant],
-          disabled: {
-            action: globalCfg?.action?.disabled ?? [],
-            "action-hmdb": globalCfg?.["action-hmdb"]?.disabled ?? [],
-          },
-        }),
+        body: JSON.stringify({ day, rec, settings: { stride, samplesPerClassify: spc }, variants: [variant], disabled }),
       });
       return res.ok ? ((await res.json())?.slot as number | undefined) : undefined;
     },
@@ -256,19 +230,14 @@ function SlotTabs({
           <Trash2 className="size-3.5" />
         </button>
       )}
-
-      {/* inline settings bar — bound to the selected tab */}
-      <Opt on={stride} label="stride" val={STRIDE_OPTS} set={setStride} />
-      <Opt on={spc} label="samples / classify" val={SPC_OPTS} set={setSpc} />
       <button
         onClick={() => create.mutate()}
         disabled={create.isPending}
-        title={`Run a new ${variant.toUpperCase()} analysis with these settings (creates a new tab)`}
+        title={`Run a new ${variant.toUpperCase()} analysis with the chosen settings (creates a new tab)`}
         className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"
       >
         {create.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />} New analysis ({variant.toUpperCase()})
       </button>
-
       <a
         href={`/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`}
         title="Download this whole recording folder (both cameras + all analyses) as a .zip"
@@ -297,6 +266,19 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const model = sel && available.includes(sel) ? sel : (available[0] ?? "yolo26n");
   const [view, setView] = useState<"models" | "geometric">("models");
   const [slotBySession, setSlotBySession] = useState<Record<string, number>>({});
+  // Settings for the next "New analysis" — one shared bar (not per session).
+  const [newStride, setNewStride] = useState(0);
+  const [newSpc, setNewSpc] = useState(0);
+  // New slots inherit the current global class whitelist.
+  const { data: globalCfg } = useQuery({
+    queryKey: ["action-classes"],
+    queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
+    staleTime: Infinity,
+  });
+  const newDisabled = {
+    action: globalCfg?.action?.disabled ?? [],
+    "action-hmdb": globalCfg?.["action-hmdb"]?.disabled ?? [],
+  };
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
   const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
@@ -340,6 +322,9 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             </div>
           </div>
         )}
+        {/* shared 'new analysis' settings — used by each session's New-analysis button */}
+        <Opt on={newStride} label="stride" val={STRIDE_OPTS} set={setNewStride} />
+        <Opt on={newSpc} label="samples / classify" val={SPC_OPTS} set={setNewSpc} />
         <div className="ml-auto flex items-center gap-2">
           <button
             onClick={() => detectAll.mutate()}
@@ -385,7 +370,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             const slot = slotBySession[s.key] ?? 1;
             return (
               <div key={s.key}>
-                <SlotTabs session={s} selected={slot} model={model} onSelect={(n) => setSlotBySession((m) => ({ ...m, [s.key]: n }))} />
+                <SlotTabs session={s} selected={slot} model={model} stride={newStride} spc={newSpc} disabled={newDisabled} onSelect={(n) => setSlotBySession((m) => ({ ...m, [s.key]: n }))} />
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                   {s.clips.map((v) => (
                     <AnalysisCard key={v.relPath} v={v} model={model} slot={slot} roomName={nameByNode.get(v.node) ?? v.node} />
