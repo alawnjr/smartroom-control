@@ -90,9 +90,19 @@ async function readOne(jsonPath: string, absMp4: string, model: string, outDir: 
       const stem = path.basename(absMp4, path.extname(absMp4));
       actionsRelPath = path.relative(savedRoot(), path.join(outDir, `${stem}.actions.${model}.json`));
     }
+    // Cache-buster: the sidecar's own mtime. Changes on every re-run, so URLs
+    // stamped with it (annotated video, actions json) become fresh after a re-run
+    // instead of serving the browser's cached copy from the identical old URL.
+    let version: number | undefined;
+    try {
+      version = Math.round(statSync(jsonPath).mtimeMs);
+    } catch {
+      version = undefined;
+    }
     return {
       model,
       status: "done",
+      version,
       maxPersons: raw.maxPersons,
       avgPersons: raw.avgPersons,
       framesAnalyzed: raw.framesAnalyzed,

@@ -142,20 +142,23 @@ export function ActionBars({
   relPath,
   model,
   actionsRelPath,
+  version,
   currentTime,
   actions,
 }: {
   relPath: string;
   model: string;
   actionsRelPath?: string; // server-computed (slot-aware); falls back to the in-place sibling
+  version?: number; // sidecar mtime — cache-buster so a re-run refetches instead of serving the cached copy
   currentTime: number;
   actions: string[];
 }) {
   const path = actionsRelPath ?? actionsPath(relPath, model);
   const { data } = useQuery({
-    queryKey: ["action-timeline", path],
+    queryKey: ["action-timeline", path, version],
     queryFn: async (): Promise<Timeline | null> => {
-      const res = await fetch(`/api/saved/file?path=${encodeURIComponent(path)}`, { cache: "force-cache" });
+      const url = `/api/saved/file?path=${encodeURIComponent(path)}${version ? `&v=${version}` : ""}`;
+      const res = await fetch(url, { cache: "force-cache" });
       if (!res.ok) return null;
       try {
         return await res.json();

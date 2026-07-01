@@ -87,6 +87,7 @@ export type DetectionSummary = {
   hasAnnotated: boolean;
   annotatedRelPath?: string; // recordings-relative, for /api/saved/file
   actionsRelPath?: string; // action models: recordings-relative path to .actions.<model>.json
+  version?: number; // sidecar mtime (ms) — cache-buster so a re-run yields fresh URLs
   error?: string;
   // action model only:
   tracks?: number;
