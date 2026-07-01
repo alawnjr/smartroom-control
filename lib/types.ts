@@ -61,7 +61,7 @@ export type SavedVideo = {
 
 // One saved analysis slot (>=2): its settings snapshot + the action sidecars it produced.
 export type SlotConfig = {
-  settings?: { stride?: number; samplesPerClassify?: number };
+  settings?: { stride?: number; samplesPerClassify?: number; poseSource?: "yolo" | "rtmpose" };
   variants?: string[];
   createdAt?: string;
   [key: string]: unknown; // per-variant { disabled: string[] }

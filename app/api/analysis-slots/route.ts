@@ -52,7 +52,7 @@ export async function POST(req: NextRequest) {
     day?: string;
     rec?: string;
     slot?: number;
-    settings?: { stride?: number; samplesPerClassify?: number };
+    settings?: { stride?: number; samplesPerClassify?: number; poseSource?: string };
     variants?: string[];
     disabled?: Record<string, string[]>;
   };
@@ -111,6 +111,7 @@ export async function POST(req: NextRequest) {
     settings: {
       stride: Math.max(0, Math.round(body.settings?.stride ?? 0)),
       samplesPerClassify: Math.max(0, Math.round(body.settings?.samplesPerClassify ?? 0)),
+      poseSource: body.settings?.poseSource === "rtmpose" ? "rtmpose" : "yolo",
     },
     variants,
     createdAt: new Date().toISOString(),
