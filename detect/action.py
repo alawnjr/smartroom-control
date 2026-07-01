@@ -394,23 +394,12 @@ def _true_fps(mp4: Path) -> float | None:
     return None
 
 
-def slot_dir(mp4: Path, slot: int) -> Path:
-    # Slot 1 = the original, in-place next to the clip. Slots >=2 live in a
-    # per-clip analysis_<N>/ subfolder so re-analyses with different settings are
-    # saved alongside (not over) the original.
-    if slot <= 1:
-        return mp4.parent
-    d = mp4.parent / f"analysis_{slot}"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-
-def sidecars(mp4: Path, key: str, slot: int = 1):
-    d = slot_dir(mp4, slot)
+def sidecars(mp4: Path, key: str):
+    # All results live in-place next to the clip.
     s = mp4.stem
-    return (d / f"{s}.detections.{key}.json",
-            d / f"{s}.actions.{key}.json",
-            d / f"{s}.annotated.{key}.mp4")
+    return (mp4.with_name(f"{s}.detections.{key}.json"),
+            mp4.with_name(f"{s}.actions.{key}.json"),
+            mp4.with_name(f"{s}.annotated.{key}.mp4"))
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -437,10 +426,10 @@ def write_run_stats(root: Path, kind: str, label: str, started, processed: int, 
         pass
 
 
-def needs_action(mp4: Path, force: bool, key: str, slot: int = 1) -> bool:
+def needs_action(mp4: Path, force: bool, key: str) -> bool:
     if force:
         return True
-    json_path, _, annotated = sidecars(mp4, key, slot)
+    json_path, _, annotated = sidecars(mp4, key)
     if not json_path.exists() or not annotated.exists():
         return True
     try:
@@ -452,7 +441,7 @@ def needs_action(mp4: Path, force: bool, key: str, slot: int = 1) -> bool:
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
 
 
-def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1,
+def process_clip(model, infer, pose, mp4: Path, variant: dict,
                  rtm=None, pose_source: str = "yolo"):
     import cv2
     import numpy as np
@@ -468,8 +457,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1,
     key, class_names = variant["key"], variant["labels"]
     temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
     disabled_idx = load_disabled(key, class_names)
-    json_path, actions_path, annotated_path = sidecars(mp4, key, slot)
-    out_dir = slot_dir(mp4, slot)
+    json_path, actions_path, annotated_path = sidecars(mp4, key)
+    out_dir = mp4.parent
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
                                    "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
@@ -729,11 +718,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1,
 def main():
     ap = argparse.ArgumentParser(description="Per-person skeleton action recognition over saved clips.")
     ap.add_argument("--path", help="single clip, relative to the recordings root")
-    ap.add_argument("--session", help="a recording dir (e.g. day_X/rec_Y) — process every clip under it")
     ap.add_argument("--variant", default="ntu",
                     help="action model(s), comma-separated: ntu (ST-GCN++/NTU-60), hmdb (PoseC3D/HMDB51)")
-    ap.add_argument("--slot", type=int, default=1,
-                    help="analysis slot: 1 = in-place original, >=2 = analysis_<N>/ subfolder")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -741,7 +727,6 @@ def main():
     if not variant_keys:
         print(f"no valid --variant in {args.variant!r}", file=sys.stderr)
         return 2
-    slot = max(1, args.slot)
     root = saved_root()
     if not root.exists():
         print(f"no recordings dir: {root}", file=sys.stderr)
@@ -766,8 +751,6 @@ def main():
     try:
         if args.path:
             clips = [root / args.path]
-        elif args.session:
-            clips = sorted((root / args.session).rglob("camera_main.mp4"), key=lambda p: str(p))
         else:
             clips = sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         clips = [c for c in clips if c.exists()]
@@ -784,32 +767,30 @@ def main():
         print(f"pose source: {pose_source}", file=sys.stderr)
 
         # One process handles every requested variant (the global lock serializes
-        # action runs, so a slot must do all its variants here rather than spawn each).
+        # action runs, so all variants run here rather than spawning one process each).
         for vkey in variant_keys:
             variant = VARIANTS[vkey]
             key = variant["key"]
-            todo = [c for c in clips if needs_action(c, args.force, key, slot)]
-            tag = f"action[{vkey}{'' if slot == 1 else f' slot{slot}'}]"
+            todo = [c for c in clips if needs_action(c, args.force, key)]
+            tag = f"action[{vkey}]"
             print(f"{tag}: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
             if not todo:
                 continue
             model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
             label = (f"Actions ({'HMDB' if vkey == 'hmdb' else 'NTU'})"
-                     + ("" if slot == 1 else f" · slot {slot}")
                      + (" · RTMPose" if pose_source == "rtmpose" else ""))
-            stat_kind = key if slot == 1 else f"{key}.slot{slot}"
             started = dt.datetime.now(dt.timezone.utc)
             processed = errors = 0
             for mp4 in todo:
                 try:
                     print(f"{tag}: processing {mp4.relative_to(root)}", file=sys.stderr)
-                    process_clip(model, inference_skeleton, pose, mp4, variant, slot,
+                    process_clip(model, inference_skeleton, pose, mp4, variant,
                                  rtm=rtm, pose_source=pose_source)
                     processed += 1
                 except Exception as error:  # noqa: BLE001
                     errors += 1
                     print(f"  action error: {error}", file=sys.stderr)
-                    jp, _, _ = sidecars(mp4, key, slot)
+                    jp, _, _ = sidecars(mp4, key)
                     try:
                         _atomic_write_json(jp, {"schemaVersion": SCHEMA_VERSION, "status": "error",
                                                 "model": key, "error": str(error), "source": mp4.name,
@@ -821,7 +802,7 @@ def main():
                     # holds onto allocations, so without this a long batch grows until
                     # the OOM killer stops it a couple of clips in.
                     gc.collect()
-            write_run_stats(root, stat_kind, label, started, processed, errors, len(clips) - len(todo))
+            write_run_stats(root, key, label, started, processed, errors, len(clips) - len(todo))
         return 0
     finally:
         try:
