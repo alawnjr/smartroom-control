@@ -20,12 +20,14 @@ function actionPython() {
 // holds its own flock, so concurrent triggers are safe. Optional { relPath }
 // runs one clip; { force } reprocesses.
 export async function POST(req: NextRequest) {
-  let relPath: string | undefined;
+  let relPaths: string[] = [];
   let force = false;
   let variant = "ntu";
   try {
     const body = await req.json();
-    relPath = body?.relPath;
+    const single = typeof body?.relPath === "string" ? [body.relPath] : [];
+    const many = Array.isArray(body?.relPaths) ? body.relPaths.filter((x: unknown) => typeof x === "string") : [];
+    relPaths = [...single, ...many];
     force = Boolean(body?.force);
     if (body?.variant === "hmdb") variant = "hmdb";
   } catch {
@@ -33,8 +35,8 @@ export async function POST(req: NextRequest) {
   }
   const projectRoot = process.cwd();
   const args = [path.join(projectRoot, "detect", "action.py"), "--variant", variant];
-  if (relPath) args.push("--path", relPath);
-  if (force || relPath) args.push("--force");
+  for (const p of relPaths) args.push("--path", p); // one run for the whole selection
+  if (force || relPaths.length) args.push("--force");
 
   try {
     // Launched in its own cgroup (systemd-run) so a control-panel restart does

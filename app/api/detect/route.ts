@@ -17,13 +17,16 @@ function detectPython() {
 
 // Kick off detection (detached, non-blocking). The Python script holds a global
 // flock, so concurrent triggers (watcher / Save All / this button) are safe —
-// extra runs exit immediately. Optional { relPath } re-analyzes a single clip.
+// extra runs exit immediately. Optional { relPath } re-analyzes a single clip;
+// { relPaths: [...] } re-analyzes a selected subset in one run (neither = all).
 export async function POST(req: NextRequest) {
-  let relPath: string | undefined;
+  let relPaths: string[] = [];
   let force = false;
   try {
     const body = await req.json();
-    relPath = body?.relPath;
+    const single = typeof body?.relPath === "string" ? [body.relPath] : [];
+    const many = Array.isArray(body?.relPaths) ? body.relPaths.filter((x: unknown) => typeof x === "string") : [];
+    relPaths = [...single, ...many];
     force = Boolean(body?.force);
   } catch {
     // no body
@@ -32,8 +35,8 @@ export async function POST(req: NextRequest) {
   const projectRoot = process.cwd();
   const script = path.join(projectRoot, "detect", "detect.py");
   const args = [script];
-  if (relPath) args.push("--path", relPath);
-  if (force || relPath) args.push("--force"); // re-analyze forces a reprocess
+  for (const p of relPaths) args.push("--path", p); // one run for the whole selection
+  if (force || relPaths.length) args.push("--force"); // re-analyze forces a reprocess
 
   try {
     // Own cgroup via systemd-run so a control-panel restart can't kill an

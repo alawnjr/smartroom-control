@@ -40,7 +40,7 @@ function post(url: string, body?: unknown) {
 // One clip's card for the selected model. Object-detection and action results all
 // live in-place next to the clip (v.detections[model]); re-analysis reruns the
 // current model on this clip with the global settings shown in the bar above.
-function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; roomName: string }) {
+function AnalysisCard({ v, model, roomName, selected, onToggleSelect }: { v: SavedVideo; model: string; roomName: string; selected: boolean; onToggleSelect: () => void }) {
   const qc = useQueryClient();
   const d = v.detections?.[model];
   const isPose = model.includes("pose");
@@ -64,9 +64,15 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   return (
     <div className="overflow-hidden rounded-[22px] border border-line bg-card p-3 shadow-sm">
       <div className="mb-2 flex items-center justify-between">
-        <div className="text-sm font-extrabold">
+        <label className="flex cursor-pointer items-center gap-2 text-sm font-extrabold" title="Select for re-analysis">
+          <input
+            type="checkbox"
+            checked={selected}
+            onChange={onToggleSelect}
+            className="size-4 cursor-pointer accent-emerald-500"
+          />
           {roomName} <span className="font-mono text-xs font-normal text-muted">· {v.rec.split("_").pop()}</span>
-        </div>
+        </label>
         <div className="flex items-center gap-2">
           {isAction && d?.status === "done" && (
             <button
@@ -165,11 +171,19 @@ function PoseOpt({ on, set }: { on: PoseSource; set: (p: PoseSource) => void }) 
   );
 }
 
-// One recording's header: label, camera count, and a download-folder link.
-function SessionHeader({ session }: { session: Session }) {
+// One recording's header: a select-all checkbox, label, camera count, and a
+// download-folder link.
+function SessionHeader({ session, allSelected, onToggle }: { session: Session; allSelected: boolean; onToggle: () => void }) {
   const { day, rec } = session.clips[0];
   return (
     <div className="mb-2 flex flex-wrap items-center gap-3">
+      <input
+        type="checkbox"
+        checked={allSelected}
+        onChange={onToggle}
+        title="Select all cameras in this recording"
+        className="size-4 cursor-pointer accent-emerald-500"
+      />
       <span className="font-mono text-sm font-bold text-muted">{session.label}</span>
       <span className="rounded-full bg-card px-2 py-0.5 text-xs font-bold text-muted">
         {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
@@ -220,9 +234,22 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
     post("/api/action-classes", patch);
   };
 
-  const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
-  const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
-  const actionAllHmdb = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "hmdb" }), onSuccess: () => pingSavedSoon(qc) });
+  // Checklist: which clips a batch re-analysis applies to. Empty = all clips.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const toggleSelect = (relPath: string) =>
+    setSelected((s) => {
+      const next = new Set(s);
+      next.has(relPath) ? next.delete(relPath) : next.add(relPath);
+      return next;
+    });
+  const allRelPaths = videos.map((v) => v.relPath);
+  const selectedCount = allRelPaths.filter((r) => selected.has(r)).length; // ignores stale entries
+  // Body for a batch run: the selected clips, or all when nothing is checked.
+  const batchBody = () => (selectedCount > 0 ? { relPaths: allRelPaths.filter((r) => selected.has(r)), force: true } : { force: true });
+
+  const detectAll = useMutation({ mutationFn: () => post("/api/detect", batchBody()), onSuccess: () => pingSavedSoon(qc) });
+  const actionAll = useMutation({ mutationFn: () => post("/api/action", { ...batchBody(), variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
+  const actionAllHmdb = useMutation({ mutationFn: () => post("/api/action", { ...batchBody(), variant: "hmdb" }), onSuccess: () => pingSavedSoon(qc) });
   const cancel = useMutation({ mutationFn: () => post("/api/detect/cancel"), onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }) });
 
   return (
@@ -268,18 +295,36 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             <Opt on={cur.spc} label="samples / classify" val={SPC_OPTS} set={(n) => setSetting({ samplesPerClassify: n })} />
             <PoseOpt on={cur.poseSource} set={(p) => setSetting({ poseSource: p })} />
             <div className="ml-auto flex items-center gap-2">
+              {/* checklist scope: which clips the batch buttons act on */}
+              <span className="text-xs font-bold text-muted">
+                {selectedCount > 0 ? `${selectedCount} selected` : "all clips"}
+              </span>
+              <button
+                onClick={() => setSelected(new Set(allRelPaths))}
+                className="rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-background"
+              >
+                Select all
+              </button>
+              <button
+                onClick={() => setSelected(new Set())}
+                disabled={selectedCount === 0}
+                className="rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-background disabled:opacity-40"
+              >
+                Clear
+              </button>
               <button
                 onClick={() => detectAll.mutate()}
                 disabled={analyzing > 0}
+                title="Object detection on the selected clips (or all if none selected)"
                 className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50"
               >
                 {analyzing > 0 ? <Loader2 className="size-4 animate-spin" /> : <ScanEye className="size-4" />}
-                {analyzing > 0 ? `Analyzing ${analyzing}…` : "Re-analyze all"}
+                {analyzing > 0 ? `Analyzing ${analyzing}…` : selectedCount > 0 ? `Re-analyze ${selectedCount}` : "Re-analyze all"}
               </button>
-              <button onClick={() => actionAll.mutate()} disabled={analyzing > 0 || actionAll.isPending} title="Per-person actions on all clips (ST-GCN++ / NTU-RGB+D 60)" className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50">
+              <button onClick={() => actionAll.mutate()} disabled={analyzing > 0 || actionAll.isPending} title="Per-person actions on the selected clips, or all if none selected (ST-GCN++ / NTU-RGB+D 60)" className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50">
                 <Video className="size-4" /> Actions (NTU)
               </button>
-              <button onClick={() => actionAllHmdb.mutate()} disabled={analyzing > 0 || actionAllHmdb.isPending} title="Per-person actions on all clips (PoseC3D / HMDB51)" className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50">
+              <button onClick={() => actionAllHmdb.mutate()} disabled={analyzing > 0 || actionAllHmdb.isPending} title="Per-person actions on the selected clips, or all if none selected (PoseC3D / HMDB51)" className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50">
                 <Video className="size-4" /> Actions (HMDB)
               </button>
               {analyzing > 0 && (
@@ -291,16 +336,34 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
           </div>
 
           <div className="flex flex-col gap-7">
-            {sessions.map((s) => (
-              <div key={s.key}>
-                <SessionHeader session={s} />
-                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                  {s.clips.map((v) => (
-                    <AnalysisCard key={v.relPath} v={v} model={model} roomName={nameByNode.get(v.node) ?? v.node} />
-                  ))}
+            {sessions.map((s) => {
+              const clipPaths = s.clips.map((c) => c.relPath);
+              const allSel = clipPaths.every((r) => selected.has(r));
+              const toggleSession = () =>
+                setSelected((cur) => {
+                  const next = new Set(cur);
+                  if (allSel) clipPaths.forEach((r) => next.delete(r));
+                  else clipPaths.forEach((r) => next.add(r));
+                  return next;
+                });
+              return (
+                <div key={s.key}>
+                  <SessionHeader session={s} allSelected={allSel} onToggle={toggleSession} />
+                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                    {s.clips.map((v) => (
+                      <AnalysisCard
+                        key={v.relPath}
+                        v={v}
+                        model={model}
+                        roomName={nameByNode.get(v.node) ?? v.node}
+                        selected={selected.has(v.relPath)}
+                        onToggleSelect={() => toggleSelect(v.relPath)}
+                      />
+                    ))}
+                  </div>
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </>
       )}

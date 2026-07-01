@@ -257,7 +257,8 @@ def mark_error(mp4: Path, key: str, message: str):
 
 def main():
     ap = argparse.ArgumentParser(description="YOLO26 person-detection over saved recordings.")
-    ap.add_argument("--path", help="single clip, relative to the recordings root")
+    ap.add_argument("--path", action="append", metavar="REL",
+                    help="clip to analyze, relative to the recordings root; repeatable for a subset")
     ap.add_argument("--force", action="store_true", help="reprocess even if results are current")
     args = ap.parse_args()
 
@@ -297,7 +298,7 @@ def main():
 
 def _run(root: Path, args) -> int:
     if args.path:
-        clips = [root / args.path]
+        clips = [root / p for p in args.path]
     else:
         clips = sorted((p for p in root.rglob("camera_main.mp4")),
                        key=lambda p: p.stat().st_mtime, reverse=True)
