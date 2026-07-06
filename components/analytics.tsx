@@ -18,6 +18,12 @@ const MODEL_LABEL: Record<string, string> = {
 };
 const STRIDE_OPTS = [0, 1, 2, 3, 4];
 const SPC_OPTS = [0, 1, 2, 4, 6, 12, 24];
+const POSE_OPTS = [
+  { val: "yolo", label: "YOLO" },
+  { val: "rtmpose", label: "RTM" },
+] as const;
+type PoseSource = (typeof POSE_OPTS)[number]["val"];
+type TabSettings = { stride: number; spc: number; poseSource: PoseSource };
 const isActionKey = (m: string) => m.startsWith("action");
 
 function fileUrl(relPath: string, version?: number) {
@@ -39,7 +45,7 @@ function detForModel(v: SavedVideo, model: string, slot: number) {
   return slot <= 1 ? v.detections?.[model] : v.analyses?.[slot]?.detections?.[model];
 }
 
-function AnalysisCard({ v, model, slot, settings, roomName }: { v: SavedVideo; model: string; slot: number; settings: { stride: number; spc: number }; roomName: string }) {
+function AnalysisCard({ v, model, slot, settings, roomName }: { v: SavedVideo; model: string; slot: number; settings: TabSettings; roomName: string }) {
   const qc = useQueryClient();
   const d = detForModel(v, model, slot);
   const isPose = model.includes("pose");
@@ -63,7 +69,7 @@ function AnalysisCard({ v, model, slot, settings, roomName }: { v: SavedVideo; m
         const cfg = v.analyses?.[slot]?.config;
         return post("/api/analysis-slots", {
           day: v.day, rec: v.rec, slot,
-          settings: { stride: settings.stride, samplesPerClassify: settings.spc },
+          settings: { stride: settings.stride, samplesPerClassify: settings.spc, poseSource: settings.poseSource },
           variants: cfg?.variants ?? [actionVariant],
           disabled: {
             action: (cfg?.action as { disabled?: string[] })?.disabled ?? [],
@@ -166,6 +172,22 @@ function Opt({ on, label, val, set }: { on: number; label: string; val: number[]
   );
 }
 
+// String-valued sibling of Opt: the skeleton source feeding the action classifier.
+function PoseOpt({ on, set }: { on: PoseSource; set: (p: PoseSource) => void }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs font-bold text-muted">pose</span>
+      <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
+        {POSE_OPTS.map((o) => (
+          <button key={o.val} onClick={() => set(o.val)} className={`px-2 py-1 ${o.val === on ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}>
+            {o.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // One recording's row: numbered slot tabs (sequential ordinals) + New analysis +
 // Download. Presentational — selection/create/delete are handled by Analytics so
 // the top settings bar can bind to whichever tab is active.
@@ -250,7 +272,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   // the active tab (last selected); editing updates that tab's settings and they
   // persist when you switch away and back. New analysis uses its recording's tab.
   const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [tabSettings, setTabSettings] = useState<Record<string, { stride: number; spc: number }>>({});
+  const [tabSettings, setTabSettings] = useState<Record<string, TabSettings>>({});
   const { data: globalCfg } = useQuery({
     queryKey: ["action-classes"],
     queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
@@ -262,16 +284,20 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   };
 
   // A tab's settings: explicit edits if any, else the slot's saved config, else auto.
-  const savedSettings = (s: Session, slot: number) => {
+  const savedSettings = (s: Session, slot: number): TabSettings => {
     const cfg = slot > 1 ? s.clips.map((c) => c.analyses?.[slot]?.config).find(Boolean) : undefined;
-    return { stride: cfg?.settings?.stride ?? 0, spc: cfg?.settings?.samplesPerClassify ?? 0 };
+    return {
+      stride: cfg?.settings?.stride ?? 0,
+      spc: cfg?.settings?.samplesPerClassify ?? 0,
+      poseSource: cfg?.settings?.poseSource === "rtmpose" ? "rtmpose" : "yolo",
+    };
   };
-  const settingsFor = (s: Session, slot: number) => tabSettings[`${s.key}:${slot}`] ?? savedSettings(s, slot);
+  const settingsFor = (s: Session, slot: number): TabSettings => tabSettings[`${s.key}:${slot}`] ?? savedSettings(s, slot);
 
   const activeSession = sessions.find((s) => s.key === activeKey) ?? sessions[0];
   const activeSlot = activeSession ? slotBySession[activeSession.key] ?? 1 : 1;
-  const cur = activeSession ? settingsFor(activeSession, activeSlot) : { stride: 0, spc: 0 };
-  const setCur = (patch: Partial<{ stride: number; spc: number }>) => {
+  const cur: TabSettings = activeSession ? settingsFor(activeSession, activeSlot) : { stride: 0, spc: 0, poseSource: "yolo" };
+  const setCur = (patch: Partial<TabSettings>) => {
     if (!activeSession) return;
     const id = `${activeSession.key}:${activeSlot}`;
     setTabSettings((t) => ({ ...t, [id]: { ...settingsFor(activeSession, activeSlot), ...patch } }));
@@ -306,7 +332,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
       const res = await fetch("/api/analysis-slots", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ day, rec, settings: { stride: st.stride, samplesPerClassify: st.spc }, variants: [variant], disabled: newDisabled }),
+        body: JSON.stringify({ day, rec, settings: { stride: st.stride, samplesPerClassify: st.spc, poseSource: st.poseSource }, variants: [variant], disabled: newDisabled }),
       });
       const newSlot = res.ok ? ((await res.json())?.slot as number | undefined) : undefined;
       return { key: s.key, slot: newSlot };
@@ -372,6 +398,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             )}
             <Opt on={cur.stride} label="stride" val={STRIDE_OPTS} set={(n) => setCur({ stride: n })} />
             <Opt on={cur.spc} label="samples / classify" val={SPC_OPTS} set={(n) => setCur({ spc: n })} />
+            <PoseOpt on={cur.poseSource} set={(p) => setCur({ poseSource: p })} />
             <div className="ml-auto flex items-center gap-2">
               <button
                 onClick={() => detectAll.mutate()}

@@ -110,6 +110,7 @@ PARTIAL = "not fully in frame"
 # "partial" if fewer than MIN_KEYPOINTS of the 17 COCO joints clear KP_CONF — which
 # leaves desk-occluded sitting people (legs missing but torso present) alone.
 KP_CONF = float(os.environ.get("SMARTROOM_ACTION_KP_CONF", "0.3"))
+KP_CONF_SET = os.environ.get("SMARTROOM_ACTION_KP_CONF") is not None  # explicit override?
 MIN_KEYPOINTS = int(os.environ.get("SMARTROOM_ACTION_MIN_KEYPOINTS", "10"))
 # How many top classes to record per window for the live per-person bar graph.
 TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "12"))
@@ -153,6 +154,25 @@ def load_samples_per_classify():
         return None
 
 
+def load_pose_source_setting():
+    # Dashboard-set settings.poseSource ("yolo"/"rtmpose"); None if absent/invalid.
+    try:
+        cfg = json.loads(CLASSES_CONFIG.read_text())
+        s = cfg.get("settings", {}).get("poseSource")
+        return s if s in ("yolo", "rtmpose") else None
+    except Exception:
+        return None
+
+
+def resolve_pose_source() -> str:
+    # Which skeleton source feeds the classifier. Priority: env > dashboard config >
+    # "yolo" (the original, unchanged behaviour).
+    env = os.environ.get("SMARTROOM_POSE_SOURCE")
+    if env in ("yolo", "rtmpose"):
+        return env
+    return load_pose_source_setting() or "yolo"
+
+
 def pick_classify_every(stride: int, default_ce: int) -> int:
     # How often to classify, in *frames*. We expose the knob as "new samples per
     # classify" (more intuitive than a frame count): with N samples/classify and a
@@ -165,7 +185,7 @@ def pick_classify_every(stride: int, default_ce: int) -> int:
     return default_ce
 
 
-def detect_jumps(traj, fps):
+def detect_jumps(traj, fps, kp_conf=KP_CONF):
     # Geometric jump detector — independent of the skeleton classifier (which is
     # near-chance on brief, OOD jumps and may even skip the window via the
     # partial-frame gate). traj: list of (frame_idx, kpts(17,2), conf(17,)) for one
@@ -188,7 +208,7 @@ def detect_jumps(traj, fps):
     comy = np.full(n, np.nan)        # hip-midpoint y per frame (image coords)
     heights = []                     # body pixel height samples, for normalization
     for i, (_, kp, cf) in enumerate(traj):
-        vis = cf >= KP_CONF
+        vis = cf >= kp_conf
         if vis[11] and vis[12]:
             comy[i] = (kp[11][1] + kp[12][1]) / 2.0
         elif vis[11] or vis[12]:
@@ -272,6 +292,34 @@ def saved_root() -> Path:
 def pose_weights() -> Path:
     base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
     return base / "yolo26n-pose.pt"
+
+
+# RTMPose (rtmlib) — an optional alternative skeleton source for the action
+# classifiers, selectable per analysis (settings.poseSource / SMARTROOM_POSE_SOURCE).
+# It's top-down: given YOLO's tracked person boxes it returns COCO-17 keypoints, so
+# tracking stays YOLO's job and only the keypoint values change. Pure onnxruntime —
+# no mmpose/mmcv, so it doesn't disturb the pinned action env. Models auto-download
+# to ~/.cache/rtmlib on first use.
+RTMPOSE_ONNX = os.environ.get(
+    "SMARTROOM_RTMPOSE_ONNX",
+    "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/"
+    "rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip")
+RTMPOSE_BACKEND = os.environ.get("SMARTROOM_RTMPOSE_BACKEND", "onnxruntime")
+RTMPOSE_DEVICE = os.environ.get("SMARTROOM_RTMPOSE_DEVICE", "cpu")
+
+
+def _rtmpose_input_size():
+    try:
+        w, h = (int(x) for x in os.environ.get("SMARTROOM_RTMPOSE_INPUT", "192,256").split(","))
+        return (w, h)
+    except Exception:
+        return (192, 256)
+
+
+def load_rtmpose():
+    from rtmlib import RTMPose  # lazy — only imported when rtmpose is selected
+    return RTMPose(onnx_model=RTMPOSE_ONNX, model_input_size=_rtmpose_input_size(),
+                   backend=RTMPOSE_BACKEND, device=RTMPOSE_DEVICE)
 
 
 def _mm_skeleton_config(*parts) -> str:
@@ -404,9 +452,18 @@ def needs_action(mp4: Path, force: bool, key: str, slot: int = 1) -> bool:
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
 
 
-def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
+def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1,
+                 rtm=None, pose_source: str = "yolo"):
     import cv2
     import numpy as np
+
+    # RTMPose confidences aren't distributed like YOLO's, so the 0.3 visibility gate
+    # (used for the "not fully in frame" check, jump detection, and skeleton drawing)
+    # can over-fire on RTM keypoints. Relax it for RTM runs unless the user set an
+    # explicit SMARTROOM_ACTION_KP_CONF.
+    kp_conf = KP_CONF
+    if pose_source == "rtmpose" and not KP_CONF_SET:
+        kp_conf = float(os.environ.get("SMARTROOM_RTMPOSE_KP_CONF", "0.2"))
 
     key, class_names = variant["key"], variant["labels"]
     temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
@@ -488,8 +545,16 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
         if boxes is not None and boxes.id is not None and kpts is not None:
             ids = boxes.id.int().tolist()
             xyxy = boxes.xyxy.int().tolist()
-            xy = kpts.xy.cpu().numpy()
-            conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
+            if pose_source == "rtmpose" and rtm is not None and len(xyxy):
+                # Keep YOLO's tracked boxes + IDs; take keypoints from RTMPose instead.
+                # rtmlib returns (N,17,2) pixel keypoints + (N,17) scores in the SAME
+                # order as the input boxes, so row n still maps to ids[n].
+                xy, conf = rtm(r.orig_img, bboxes=np.asarray(xyxy, dtype="float32"))
+                xy = np.asarray(xy, dtype="float32")
+                conf = np.asarray(conf, dtype="float32")
+            else:
+                xy = kpts.xy.cpu().numpy()
+                conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
             for n, tid in enumerate(ids):
                 traj[tid].append((idx, xy[n], conf[n]))  # every frame (full vertical resolution)
                 centroids[tid].append({"t": round(idx / native_fps, 3),
@@ -497,7 +562,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
                                        "y": round((xyxy[n][1] + xyxy[n][3]) / 2.0, 1)})
                 if idx % stride == 0:
                     tubes[tid].append((xy[n], conf[n]))
-                    n_vis = int((conf[n] >= KP_CONF).sum())
+                    n_vis = int((conf[n] >= kp_conf).sum())
                     trunc[tid].append(n_vis < MIN_KEYPOINTS)
                 if len(tubes[tid]) >= MIN_WINDOW and idx % classify_every == 0:
                     # Judge truncation on the recent samples (around the moment the
@@ -540,7 +605,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
 
     # Geometric jump detection over each track's full trajectory (classifier-
     # independent). Surface "jumping" as a chip when any track jumps.
-    jumps = {tid: ev for tid in traj if (ev := detect_jumps(traj[tid], native_fps))}
+    jumps = {tid: ev for tid in traj if (ev := detect_jumps(traj[tid], native_fps, kp_conf))}
     if jumps and "jumping" not in seen:
         seen.append("jumping")
 
@@ -556,7 +621,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
         fh, fw = frame.shape[:2]
         for tid, (x1, y1), pts, cs in perframe:
             for a, b in COCO_SKELETON:
-                if cs[a] > 0.3 and cs[b] > 0.3:
+                if cs[a] > kp_conf and cs[b] > kp_conf:
                     cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
             # Only the classifier's labels go on this video; geometric jump events
             # are kept separate (sidecar + the Analytics "Geometric" sub-view).
@@ -605,6 +670,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
     _atomic_write_json(actions_path, {"schemaVersion": SCHEMA_VERSION, "model": key,
                                       "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
                                       "nativeFps": round(native_fps, 3), "window": WINDOW, "stride": stride,
+                                      "poseSource": pose_source,
                                       "tracks": {str(t): timeline[t] for t in timeline},
                                       "jumps": jumps_sec})
 
@@ -638,7 +704,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
     _atomic_write_json(persons_path, {
         "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
-        "window": WINDOW, "stride": stride, "persons": persons})
+        "window": WINDOW, "stride": stride, "poseSource": pose_source, "persons": persons})
 
     # Location/centroid tracking — its own file (per-frame bbox centroid per person).
     centroids_path = out_dir / f"{mp4.stem}.centroids.{key}.json"
@@ -649,7 +715,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
-        "device": "cpu", "classifier": variant["classifier"],
+        "device": "cpu", "classifier": variant["classifier"], "poseSource": pose_source,
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "durationSec": round(total / native_fps, 3) if total else None,
         "temp": temp, "minConf": min_conf,
@@ -708,7 +774,14 @@ def main():
 
         from mmaction.apis import inference_skeleton, init_recognizer
         from ultralytics import YOLO
-        pose = YOLO(str(pose_weights()))  # shared across variants
+        pose = YOLO(str(pose_weights()))  # tracked boxes + IDs (and keypoints, for yolo source)
+
+        # Optional alternative skeleton source (see resolve_pose_source). Built once,
+        # shared across variants/clips; the import stays lazy so yolo-source runs never
+        # touch rtmlib/onnxruntime.
+        pose_source = resolve_pose_source()
+        rtm = load_rtmpose() if pose_source == "rtmpose" else None
+        print(f"pose source: {pose_source}", file=sys.stderr)
 
         # One process handles every requested variant (the global lock serializes
         # action runs, so a slot must do all its variants here rather than spawn each).
@@ -721,14 +794,17 @@ def main():
             if not todo:
                 continue
             model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
-            label = f"Actions ({'HMDB' if vkey == 'hmdb' else 'NTU'})" + ("" if slot == 1 else f" · slot {slot}")
+            label = (f"Actions ({'HMDB' if vkey == 'hmdb' else 'NTU'})"
+                     + ("" if slot == 1 else f" · slot {slot}")
+                     + (" · RTMPose" if pose_source == "rtmpose" else ""))
             stat_kind = key if slot == 1 else f"{key}.slot{slot}"
             started = dt.datetime.now(dt.timezone.utc)
             processed = errors = 0
             for mp4 in todo:
                 try:
                     print(f"{tag}: processing {mp4.relative_to(root)}", file=sys.stderr)
-                    process_clip(model, inference_skeleton, pose, mp4, variant, slot)
+                    process_clip(model, inference_skeleton, pose, mp4, variant, slot,
+                                 rtm=rtm, pose_source=pose_source)
                     processed += 1
                 except Exception as error:  # noqa: BLE001
                     errors += 1

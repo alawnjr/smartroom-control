@@ -18,6 +18,12 @@ uv pip install --python "$V" "mmcv==2.0.1" \
   -f https://download.openmmlab.com/mmcv/dist/cpu/torch2.0.0/index.html
 uv pip install --python "$V" "mmaction2==1.2.0"
 
+# RTMPose — an optional alternative skeleton source for the action classifiers
+# (selectable per analysis). Pure onnxruntime wheels, no mmpose/mmcv, so they don't
+# touch the pinned matrix above. CPU by default; for an RTX GPU swap onnxruntime ->
+# onnxruntime-gpu (NEVER install both — they clash on the CUDA provider).
+uv pip install --python "$V" rtmlib onnxruntime
+
 # The mmaction2 1.2.0 wheel is missing localizers/drn; stub it (we only use the
 # skeleton recognizer, never the DRN localizer).
 LOC=$("$V/bin/python" -c "import mmaction,os;print(os.path.join(os.path.dirname(mmaction.__file__),'models','localizers'))")
@@ -40,6 +46,12 @@ if [ ! -f "$HMDB_CKPT" ]; then
   curl -sL -o "$HMDB_CKPT" "https://download.openmmlab.com/mmaction/v1.0/skeleton/posec3d/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint_20220815-17eaa484.pth"
 fi
 
-"$V/bin/python" -c "import torch,mmcv,mmaction,ultralytics;print('action env OK: torch',torch.__version__,'mmcv',mmcv.__version__,'mmaction',mmaction.__version__)"
+# Pre-seed the RTMPose COCO-17 body model so the first analysis run needs no network
+# (rtmlib lazily downloads/unzips into ~/.cache/rtmlib/hub/checkpoints on first use).
+RTM_ONNX="${SMARTROOM_RTMPOSE_ONNX:-https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/onnx_sdk/rtmpose-m_simcc-body7_pt-body7_420e-256x192-e48f03d0_20230504.zip}"
+"$V/bin/python" -c "from rtmlib import RTMPose; RTMPose(onnx_model='$RTM_ONNX', model_input_size=(192,256), backend='onnxruntime', device='cpu'); print('rtmpose model cached')" || echo "warning: RTMPose pre-download failed (will download on first use)"
+
+"$V/bin/python" -c "import torch,mmcv,mmaction,ultralytics,rtmlib,onnxruntime;print('action env OK: torch',torch.__version__,'mmcv',mmcv.__version__,'mmaction',mmaction.__version__,'onnxruntime',onnxruntime.__version__)"
 echo "ntu checkpoint:  $CKPT"
 echo "hmdb checkpoint: $HMDB_CKPT"
+echo "rtmpose cache:   $HOME/.cache/rtmlib"
