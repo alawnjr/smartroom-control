@@ -271,6 +271,29 @@ def main():
         print("another detection run is in progress; exiting", file=sys.stderr)
         return 0
 
+    # Become a process-group leader and publish our PID so the dashboard's Cancel
+    # button can kill this run (and its ffmpeg/forkserver children) regardless of
+    # whether it was started by the API, the timer, or the path watcher.
+    try:
+        os.setpgrp()
+    except OSError:
+        pass
+    pid_path = root / ".detect.pid"
+    try:
+        pid_path.write_text(str(os.getpid()))
+    except OSError:
+        pass
+
+    try:
+        return _run(root, args)
+    finally:
+        try:
+            pid_path.unlink()
+        except OSError:
+            pass
+
+
+def _run(root: Path, args) -> int:
     if args.path:
         clips = [root / args.path]
     else:
