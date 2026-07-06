@@ -1,0 +1,20 @@
+[Unit]
+Description=Smartroom Control Panel (Next.js)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/alawn/Code/smartroom-control
+Environment=NODE_ENV=production
+Environment=PORT=4000
+# User services don't inherit the interactive shell PATH; nvm node is not on the
+# default PATH, so pin it explicitly. Update this if you `nvm install` a newer node.
+Environment=PATH=/home/alawn/.config/nvm/versions/node/v24.16.0/bin:/usr/bin:/bin
+EnvironmentFile=-/home/alawn/Code/smartroom-control/.env.local
+ExecStart=/home/alawn/.config/nvm/versions/node/v24.16.0/bin/npm run start
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
