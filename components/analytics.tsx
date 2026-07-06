@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { LineChart, Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
+import { Download, LineChart, Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
 import { ClipAnalyticsDrawer } from "@/components/clip-analytics-drawer";
 import { GeometricPanel } from "@/components/geometric-page";
@@ -224,6 +224,13 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
                 <span className="rounded-full bg-card px-2 py-0.5 text-xs">
                   {s.clips.length} cam{s.clips.length > 1 ? "s" : ""}
                 </span>
+                <a
+                  href={`/api/saved/archive?path=${encodeURIComponent(`${s.clips[0].day}/${s.clips[0].rec}`)}`}
+                  title="Download this whole recording folder (both cameras + analysis) as a .zip"
+                  className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-card"
+                >
+                  <Download className="size-3.5" /> Download folder
+                </a>
               </div>
               <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 {s.clips.map((v) => (
