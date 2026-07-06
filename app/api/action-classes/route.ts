@@ -16,8 +16,8 @@ function configPath() {
   );
 }
 
-// Per-variant whitelist plus a `settings` block (e.g. stride override).
-type Config = Record<string, { disabled?: string[]; stride?: number }>;
+// Per-variant whitelist plus a `settings` block (e.g. stride / samples-per-classify).
+type Config = Record<string, { disabled?: string[]; stride?: number; samplesPerClassify?: number }>;
 
 async function read(): Promise<Config> {
   try {
@@ -46,6 +46,10 @@ export async function POST(req: NextRequest) {
     // { stride: N } — pin the analysis stride; 0 (or falsy) means auto.
     const n = Number((body as { stride: unknown }).stride);
     cfg.settings = { ...cfg.settings, stride: Number.isFinite(n) && n > 0 ? Math.round(n) : 0 };
+  } else if (body && typeof body === "object" && "samplesPerClassify" in body) {
+    // { samplesPerClassify: N } — classify every N new samples; 0 = variant default.
+    const n = Number((body as { samplesPerClassify: unknown }).samplesPerClassify);
+    cfg.settings = { ...cfg.settings, samplesPerClassify: Number.isFinite(n) && n > 0 ? Math.round(n) : 0 };
   } else if (body && typeof body === "object" && "variant" in body) {
     const { variant, disabled } = body as { variant: string; disabled: string[] };
     if (typeof variant !== "string" || !Array.isArray(disabled)) {

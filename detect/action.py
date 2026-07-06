@@ -143,6 +143,28 @@ def load_stride_setting():
         return None
 
 
+def load_samples_per_classify():
+    # Dashboard-set settings.samplesPerClassify (0/absent = use the variant default).
+    try:
+        cfg = json.loads(CLASSES_CONFIG.read_text())
+        s = cfg.get("settings", {}).get("samplesPerClassify")
+        return int(s) if s else None
+    except Exception:
+        return None
+
+
+def pick_classify_every(stride: int, default_ce: int) -> int:
+    # How often to classify, in *frames*. We expose the knob as "new samples per
+    # classify" (more intuitive than a frame count): with N samples/classify and a
+    # given stride, classify_every = N * stride. N=1 -> classify on every new sample
+    # (maximum overlap, heaviest). 0/absent -> the variant's frame-based default.
+    env = os.environ.get("SMARTROOM_ACTION_SAMPLES_PER_CLASSIFY")
+    spc = int(env) if env else load_samples_per_classify()
+    if spc and spc > 0:
+        return max(1, spc * stride)
+    return default_ce
+
+
 def detect_jumps(traj, fps):
     # Geometric jump detector — independent of the skeleton classifier (which is
     # near-chance on brief, OOD jumps and may even skip the window via the
@@ -358,7 +380,6 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     import numpy as np
 
     key, class_names = variant["key"], variant["labels"]
-    classify_every = variant["classify_every"]
     temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
     disabled_idx = load_disabled(key, class_names)
     json_path, actions_path, annotated_path = sidecars(mp4, key)
@@ -379,6 +400,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     # timeline lines up with the playing video and warm-up reflects real time.
     native_fps = _true_fps(mp4) or reported_fps
     stride = pick_stride(native_fps)  # samples per the clip's true fps (see pick_stride)
+    classify_every = pick_classify_every(stride, variant["classify_every"])  # frames between classifications
 
     def classify(window):
         # window: list of (kpts (17,2), conf (17,)) -> (label|None, conf, top)
