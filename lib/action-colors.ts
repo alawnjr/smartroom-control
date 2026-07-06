@@ -21,6 +21,10 @@ export const ACTION_BAR = [
   "bg-rose-400",
 ];
 
+// Hex equivalents of ACTION_BAR (tailwind *-400) for SVG strokes in the line graph.
+export const ACTION_HEX = ["#fbbf24", "#38bdf8", "#a78bfa", "#34d399", "#fb7185"];
+export const NEUTRAL_HEX = "#d4d4d4";
+
 // Runner-up classes that never became a chip (not in `actions`).
 export const NEUTRAL_BAR = "bg-neutral-300";
 
@@ -32,4 +36,10 @@ export function tagClass(i: number) {
 export function barClass(label: string, actions: string[]) {
   const i = actions.indexOf(label);
   return i >= 0 ? ACTION_BAR[i % ACTION_BAR.length] : NEUTRAL_BAR;
+}
+
+// Same mapping as a hex stroke color (for the line graph).
+export function strokeColor(label: string, actions: string[]) {
+  const i = actions.indexOf(label);
+  return i >= 0 ? ACTION_HEX[i % ACTION_HEX.length] : NEUTRAL_HEX;
 }
