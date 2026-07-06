@@ -155,8 +155,12 @@ def detect_jumps(traj, fps):
     import numpy as np
     if len(traj) < 4:
         return []
-    frac = _env_float("SMARTROOM_ACTION_JUMP_FRAC") or 0.12
+    frac = _env_float("SMARTROOM_ACTION_JUMP_FRAC") or 0.20
     max_sec = _env_float("SMARTROOM_ACTION_JUMP_MAX_SEC") or 1.2
+    # A real jump's airborne phase lasts at least a beat; requiring a minimum
+    # duration rejects single-frame hip-keypoint jitter spikes that briefly clear
+    # the threshold (the main false-positive source).
+    min_sec = _env_float("SMARTROOM_ACTION_JUMP_MIN_SEC") or 0.13
     n = len(traj)
     idxs = np.array([t[0] for t in traj])
     comy = np.full(n, np.nan)        # hip-midpoint y per frame (image coords)
@@ -186,13 +190,14 @@ def detect_jumps(traj, fps):
             baseline[i] = np.median(seg)
     rise = (baseline - comy) / body_h         # >0 = CoM higher than its baseline
     above = np.nan_to_num(rise, nan=-1.0) >= frac
-    events, i, maxlen = [], 0, int(max_sec * fps)
+    events, i = [], 0
+    maxlen, minlen = int(max_sec * fps), max(2, int(min_sec * fps))
     while i < n:
         if above[i]:
             j = i
             while j < n and above[j]:
                 j += 1
-            if (j - i) <= maxlen:                 # brief = ballistic = a jump
+            if minlen <= (j - i) <= maxlen:       # sustained but brief = ballistic = a jump
                 events.append({"start": int(idxs[i]), "end": int(idxs[j - 1]),
                                "peak": round(float(np.nanmax(rise[i:j])), 3)})
             i = j
