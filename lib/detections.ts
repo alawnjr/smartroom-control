@@ -24,8 +24,12 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
     if (status === "error") return { model, status: "error", error: raw.error ?? "analysis failed", hasAnnotated: false };
     if (status === "analyzing") return { model, status: "analyzing", hasAnnotated: false };
 
-    // done: stale (→ none) if the source mp4 is newer
-    if ((raw.sourceMtimeMs ?? 0) < statSync(absMp4).mtimeMs) {
+    // done: stale (→ none) only if the source mp4 is meaningfully newer. The 2s
+    // tolerance absorbs float rounding between Python's st_mtime*1000 (written
+    // by detect.py) and Node's mtimeMs, which differ by ~1e-4 ms for the same
+    // file; recordings are never modified after saving, so real staleness is
+    // always many seconds.
+    if ((raw.sourceMtimeMs ?? 0) + 2000 < statSync(absMp4).mtimeMs) {
       return { model, status: "none", hasAnnotated: false };
     }
     let hasAnnotated = false;
