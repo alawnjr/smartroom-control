@@ -1,0 +1,15 @@
+[Unit]
+Description=Smartroom public tunnel (ngrok -> localhost:4000)
+After=network-online.target smartroom-control.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit --domain to your free ngrok static domain (ngrok dashboard -> Domains).
+# Auth comes from ~/.config/ngrok/ngrok.yml (set once: ngrok config add-authtoken <token>).
+ExecStart=%h/.local/bin/ngrok http --domain=REPLACE-ME.ngrok-free.app 4000 --log=stdout
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
