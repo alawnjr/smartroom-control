@@ -94,6 +94,7 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
       tracks: raw.tracks,
       actions: raw.actions,
       trackActions: raw.trackActions,
+      jumps: raw.jumps,
     };
   } catch {
     return { model, status: "none", hasAnnotated: false };
