@@ -68,6 +68,8 @@ OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.0"))
 #     absolute override is also accepted (SMARTROOM_ACTION_MIN_CONF).
 # Both are per-variant; the env vars, when set, override both variants.
 IDLE = "idle"
+# How many top classes to record per window for the live per-person bar graph.
+TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "5"))
 SCHEMA_VERSION = 2
 
 
@@ -217,7 +219,9 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     cap.release()
 
     def classify(window):
-        # window: list of (kpts (17,2) float, conf (17,) float) -> (label|None, conf)
+        # window: list of (kpts (17,2), conf (17,)) -> (label|None, conf, top)
+        # where top is the K most-confident [label, prob] pairs (for the live
+        # per-person bar graph); label is None when below the abstention threshold.
         pose_results = [{"keypoints": kp[None].astype("float32"),
                          "keypoint_scores": sc[None].astype("float32")} for kp, sc in window]
         res = infer(model, pose_results, (height, width))
@@ -227,10 +231,15 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         # that made the old confidence numbers meaningless.
         score = res.pred_score
         probs = (score.clamp_min(1e-8).log() / temp).softmax(-1)
-        c, i = float(probs.max()), int(probs.argmax())
+        k = min(TOPK, int(probs.numel()))
+        vals, idxs = probs.topk(k)
+        vals, idxs = [float(v) for v in vals.tolist()], [int(i) for i in idxs.tolist()]
+        name = lambda i: class_names[i] if i < len(class_names) else str(i)
+        top = [[name(i), round(v, 3)] for v, i in zip(vals, idxs)]
+        c, i = vals[0], idxs[0]
         if c < min_conf:
-            return None, c  # abstain — too uncertain to name a class
-        return (class_names[i] if i < len(class_names) else str(i)), c
+            return None, c, top  # abstain — too uncertain to name a class
+        return name(i), c, top
 
     # The label from a trailing window best describes motion at the window's
     # center, ~half a window before the frame where it's computed. We have the
@@ -261,17 +270,18 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
                 if idx % STRIDE == 0:
                     tubes[tid].append((xy[n], conf[n]))
                 if len(tubes[tid]) >= WINDOW and idx % classify_every == 0:
-                    label, cf = classify(list(tubes[tid]))
+                    label, cf, top = classify(list(tubes[tid]))
                     ev_idx[tid].append(idx)
                     # overlay shows "idle" on abstention rather than a stale/guessed
                     # label; the summary vote + chips only count confident windows.
                     ev_lab[tid].append(label or IDLE)
-                    if label is not None:
-                        # center the timeline timestamp on the window, not its end
-                        t = max(0.0, (idx - offset_frames) / native_fps)
-                        timeline[tid].append({"t": round(t, 3), "action": label, "conf": round(cf, 3)})
-                        if label not in seen:
-                            seen.append(label)
+                    # Every window goes in the timeline (with its top-K for the live
+                    # bar graph); `kept` marks the confident ones that vote + chip.
+                    t = max(0.0, (idx - offset_frames) / native_fps)
+                    timeline[tid].append({"t": round(t, 3), "action": label or IDLE,
+                                          "conf": round(cf, 3), "kept": label is not None, "top": top})
+                    if label is not None and label not in seen:
+                        seen.append(label)
                 x1, y1 = max(0, xyxy[n][0]), max(0, xyxy[n][1])
                 perframe.append((tid, (x1, y1), xy[n], conf[n]))
         framedata.append(perframe)
@@ -325,7 +335,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     for tid, tl in timeline.items():
         counts = {}
         for p in tl:
-            counts[p["action"]] = counts.get(p["action"], 0) + 1
+            if p.get("kept"):  # idle/abstained windows don't vote
+                counts[p["action"]] = counts.get(p["action"], 0) + 1
         if counts:
             track_actions[str(tid)] = max(counts, key=counts.get)
 

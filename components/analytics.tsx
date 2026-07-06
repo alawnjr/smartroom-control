@@ -4,6 +4,7 @@ import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
+import { ActionBars } from "@/components/action-bars";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { NodeConfig, SavedVideo } from "@/lib/types";
@@ -34,6 +35,7 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   const actionVariant = model === "action-hmdb" ? "hmdb" : "ntu";
   const hasOverlay = Boolean(d?.hasAnnotated && d.annotatedRelPath);
   const [overlay, setOverlay] = useState(true);
+  const [currentTime, setCurrentTime] = useState(0);
   const showOverlay = overlay && hasOverlay;
   const src = showOverlay ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
   const analyzing = clipAnalyzing(v);
@@ -65,7 +67,14 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
       <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-black">
         {d?.status === "done" ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <video key={src} controls preload="none" className="h-full w-full object-contain" src={src} />
+          <video
+            key={src}
+            controls
+            preload="none"
+            className="h-full w-full object-contain"
+            src={src}
+            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
+          />
         ) : (
           <div className="flex h-full items-center justify-center text-xs text-neutral-400">
             {d?.status === "analyzing" ? "analyzing…" : d?.status === "error" ? "analysis failed" : "not analyzed"}
@@ -100,6 +109,9 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
             ))
           )}
         </div>
+      )}
+      {d?.status === "done" && isAction && (
+        <ActionBars relPath={v.relPath} model={model} currentTime={currentTime} />
       )}
     </div>
   );
