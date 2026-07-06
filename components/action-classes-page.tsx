@@ -1,15 +1,28 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Search } from "lucide-react";
 
 import { DATASETS } from "@/lib/action-classes";
 
-// Browse the full label set each action model can emit. The lists are
-// index-aligned with the model heads (the number shown is the class index).
+type Config = Record<string, { disabled: string[] }>;
+
+// Browse the full label set each action model can emit, and toggle classes on/off.
+// Disabled classes are masked at inference (detect/action.py) so the model can
+// never predict them — useful for killing domain-mismatched labels (HMDB's
+// dive/dribble, NTU's medical classes) that misfire on room footage.
 export function ActionClassesPage() {
   const [q, setQ] = useState("");
   const query = q.trim().toLowerCase();
+
+  const { data: config } = useQuery({
+    queryKey: ["action-classes"],
+    queryFn: async (): Promise<Config> => {
+      const res = await fetch("/api/action-classes", { cache: "no-store" });
+      return res.ok ? res.json() : {};
+    },
+  });
 
   return (
     <div>
@@ -17,7 +30,8 @@ export function ActionClassesPage() {
         <div>
           <h2 className="text-lg font-extrabold">Action classes</h2>
           <p className="text-sm text-muted">
-            Every label each model can predict — these are the only actions it can ever output.
+            Toggle classes off to mask them at inference — the model picks the best{" "}
+            <em>enabled</em> class or falls back to idle. Re-analyze clips to apply.
           </p>
         </div>
         <label className="flex items-center gap-2 rounded-xl border border-line bg-card px-3 py-1.5">
@@ -33,14 +47,50 @@ export function ActionClassesPage() {
 
       <div className="flex flex-col gap-6">
         {DATASETS.map((ds) => (
-          <DatasetCard key={ds.key} ds={ds} query={query} />
+          <DatasetCard key={ds.key} ds={ds} query={query} disabled={config?.[ds.key]?.disabled ?? []} />
         ))}
       </div>
     </div>
   );
 }
 
-function DatasetCard({ ds, query }: { ds: (typeof DATASETS)[number]; query: string }) {
+function DatasetCard({
+  ds,
+  query,
+  disabled,
+}: {
+  ds: (typeof DATASETS)[number];
+  query: string;
+  disabled: string[];
+}) {
+  const qc = useQueryClient();
+  const disabledSet = useMemo(() => new Set(disabled), [disabled]);
+
+  // Persist the new disabled list for this variant, optimistically updating cache.
+  const save = useMutation({
+    mutationFn: (next: string[]) =>
+      fetch("/api/action-classes", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ variant: ds.key, disabled: next }),
+      }),
+    onMutate: (next: string[]) => {
+      qc.setQueryData<Config>(["action-classes"], (old) => ({
+        ...(old ?? {}),
+        [ds.key]: { disabled: next },
+      }));
+    },
+    onSettled: () => qc.invalidateQueries({ queryKey: ["action-classes"] }),
+  });
+
+  const toggle = (name: string) => {
+    const next = new Set(disabledSet);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    save.mutate([...next]);
+  };
+  const setAll = (off: boolean) => save.mutate(off ? [...ds.classes] : []);
+
   // Keep original indices so the chip numbers stay aligned with the model head.
   const rows = useMemo(
     () =>
@@ -49,6 +99,7 @@ function DatasetCard({ ds, query }: { ds: (typeof DATASETS)[number]; query: stri
         .filter(({ name }) => !query || name.toLowerCase().includes(query)),
     [ds.classes, query],
   );
+  const enabledCount = ds.classes.length - disabledSet.size;
 
   return (
     <div className="overflow-hidden rounded-[22px] border border-line bg-card p-4 shadow-sm">
@@ -59,9 +110,23 @@ function DatasetCard({ ds, query }: { ds: (typeof DATASETS)[number]; query: stri
             <span className="font-mono">{ds.model}</span> · {ds.dataset}
           </div>
         </div>
-        <span className="rounded-full bg-background px-2.5 py-1 text-xs font-bold text-muted">
-          {query ? `${rows.length} / ${ds.classes.length}` : `${ds.classes.length} classes`}
-        </span>
+        <div className="flex items-center gap-2">
+          <span className="rounded-full bg-background px-2.5 py-1 text-xs font-bold text-muted">
+            {enabledCount} / {ds.classes.length} on
+          </span>
+          <button
+            onClick={() => setAll(false)}
+            className="rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-background"
+          >
+            all on
+          </button>
+          <button
+            onClick={() => setAll(true)}
+            className="rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-background"
+          >
+            all off
+          </button>
+        </div>
       </div>
       <p className="mb-3 text-sm text-muted">{ds.blurb}</p>
 
@@ -69,17 +134,33 @@ function DatasetCard({ ds, query }: { ds: (typeof DATASETS)[number]; query: stri
         <div className="text-sm text-muted">No classes match “{query}”.</div>
       ) : (
         <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3 lg:grid-cols-4">
-          {rows.map(({ name, i }) => (
-            <div
-              key={i}
-              className="flex items-center gap-2 rounded-lg border border-line bg-background px-2 py-1.5 text-sm"
-            >
-              <span className="w-6 shrink-0 text-right font-mono text-[11px] text-muted">{i}</span>
-              <span className="truncate" title={name}>
-                {name}
-              </span>
-            </div>
-          ))}
+          {rows.map(({ name, i }) => {
+            const on = !disabledSet.has(name);
+            return (
+              <button
+                key={i}
+                onClick={() => toggle(name)}
+                title={on ? "enabled — click to disable" : "disabled — click to enable"}
+                className={`flex items-center gap-2 rounded-lg border px-2 py-1.5 text-left text-sm transition-colors ${
+                  on
+                    ? "border-line bg-background hover:bg-card"
+                    : "border-dashed border-line bg-transparent text-muted line-through opacity-60"
+                }`}
+              >
+                <span
+                  className={`flex h-3.5 w-6 shrink-0 items-center rounded-full px-0.5 transition-colors ${
+                    on ? "justify-end bg-emerald-400" : "justify-start bg-neutral-300"
+                  }`}
+                >
+                  <span className="size-2.5 rounded-full bg-white" />
+                </span>
+                <span className="w-5 shrink-0 text-right font-mono text-[11px] text-muted">{i}</span>
+                <span className="truncate" title={name}>
+                  {name}
+                </span>
+              </button>
+            );
+          })}
         </div>
       )}
     </div>
