@@ -6,10 +6,12 @@ import { NextRequest, NextResponse } from "next/server";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-function detectPython() {
+// The action pipeline needs the mmcv/mmaction2 stack, which lives in the
+// dedicated Python 3.10 venv (.venv-action), not the py3.14 detection venv.
+function actionPython() {
   return (
-    process.env.SMARTROOM_DETECT_PYTHON ||
-    path.join(process.env.HOME || "", "Code", "yolo-bench", ".venv", "bin", "python")
+    process.env.SMARTROOM_ACTION_PYTHON ||
+    path.join(process.cwd(), ".venv-action", "bin", "python")
   );
 }
 
@@ -32,7 +34,7 @@ export async function POST(req: NextRequest) {
   if (force || relPath) args.push("--force");
 
   try {
-    const child = spawn(detectPython(), args, {
+    const child = spawn(actionPython(), args, {
       cwd: projectRoot,
       detached: true,
       stdio: "ignore",

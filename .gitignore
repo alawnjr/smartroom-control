@@ -43,3 +43,6 @@ next-env.d.ts
 
 # Saved recordings pulled from the nodes (Save All) — not version-controlled
 /recordings/
+
+# action recognition venv (mmcv/mmaction2, py3.10) — rebuilt via detect/setup-action-env.sh
+.venv-action/
