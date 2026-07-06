@@ -60,8 +60,15 @@ function ActionLines({ entries, actions, currentTime }: { entries: Entry[]; acti
     if (entries.length < 2) return null;
     const tMax = entries[entries.length - 1].t || 1;
     const probAt = (e: Entry, label: string) => entryTop(e).find(([l]) => l === label)?.[1] ?? 0;
-    // Only plot labels that meaningfully show up (keeps it to a few lines).
-    const labels = actions.filter((a) => entries.some((e) => probAt(e, a) > 0.08)).slice(0, 5);
+    // Prefer the chip-actions that meaningfully show up (keeps it to a few lines).
+    let labels = actions.filter((a) => entries.some((e) => probAt(e, a) > 0.08)).slice(0, 5);
+    // Fall back to this person's most prominent classes so every panel still gets
+    // a line graph (not just the ones whose top labels happen to be chip-actions).
+    if (labels.length === 0) {
+      const peak = new Map<string, number>();
+      for (const e of entries) for (const [l, p] of entryTop(e)) peak.set(l, Math.max(peak.get(l) ?? 0, p));
+      labels = [...peak.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([l]) => l);
+    }
     if (labels.length === 0) return null;
     let pMax = 0.3;
     for (const a of labels) for (const e of entries) pMax = Math.max(pMax, probAt(e, a));
