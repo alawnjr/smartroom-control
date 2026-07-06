@@ -80,6 +80,10 @@ export type DetectionSummary = {
   actions?: string[]; // distinct action labels seen
   trackActions?: Record<string, string>; // track id -> dominant action
   jumps?: number; // geometric jump events detected (count)
+  // settings that produced the run (action models), for the header summary:
+  stride?: number;
+  samplesPerClassify?: number;
+  poseSource?: "yolo" | "rtmpose";
 };
 
 export type SavedListing = { root: string; videos: SavedVideo[] };

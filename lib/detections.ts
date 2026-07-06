@@ -115,6 +115,10 @@ async function readOne(jsonPath: string, absMp4: string, model: string, outDir: 
       actions: raw.actions,
       trackActions: raw.trackActions,
       jumps: raw.jumps,
+      // Settings that produced this run (action models), for the header summary.
+      stride: raw.stride,
+      samplesPerClassify: raw.samplesPerClassify,
+      poseSource: raw.poseSource,
     };
   } catch {
     return { model, status: "none", hasAnnotated: false };

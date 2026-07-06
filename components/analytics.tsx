@@ -9,7 +9,7 @@ import { GeometricPanel } from "@/components/geometric-page";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { tagClass } from "@/lib/action-colors";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved, type Session } from "@/lib/use-saved";
-import type { NodeConfig, SavedVideo } from "@/lib/types";
+import type { DetectionSummary, NodeConfig, SavedVideo } from "@/lib/types";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action", "action-hmdb"];
 const MODEL_LABEL: Record<string, string> = {
@@ -171,10 +171,27 @@ function PoseOpt({ on, set }: { on: PoseSource; set: (p: PoseSource) => void }) 
   );
 }
 
-// One recording's header: a select-all checkbox, label, camera count, and a
-// download-folder link.
-function SessionHeader({ session, allSelected, onToggle }: { session: Session; allSelected: boolean; onToggle: () => void }) {
+// The settings that produced the current model's analysis for this recording, read
+// back from the sidecar (both cameras run with the same settings). Action models
+// only — detection models have no stride/pose knobs.
+function runSettingsText(model: string, d?: DetectionSummary): string | null {
+  if (!isActionKey(model) || !d || d.status !== "done" || d.stride == null) return null;
+  const pose = d.poseSource === "rtmpose" ? "RTMPose" : "YOLO pose";
+  const spc = d.samplesPerClassify != null ? `${d.samplesPerClassify} samples/classify` : null;
+  return [`stride ${d.stride}`, spc, pose].filter(Boolean).join(" · ");
+}
+
+// One recording's header: a select-all checkbox, label, camera count, the settings
+// the current model ran with, and a download-folder link.
+function SessionHeader({ session, allSelected, onToggle, model, summary }: {
+  session: Session;
+  allSelected: boolean;
+  onToggle: () => void;
+  model: string;
+  summary?: DetectionSummary;
+}) {
   const { day, rec } = session.clips[0];
+  const settings = runSettingsText(model, summary);
   return (
     <div className="mb-2 flex flex-wrap items-center gap-3">
       <input
@@ -188,6 +205,14 @@ function SessionHeader({ session, allSelected, onToggle }: { session: Session; a
       <span className="rounded-full bg-card px-2 py-0.5 text-xs font-bold text-muted">
         {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
       </span>
+      {settings && (
+        <span
+          title={`Settings used for ${MODEL_LABEL[model] ?? model} on this recording`}
+          className="rounded-full border border-emerald-300 bg-emerald-50 px-2 py-0.5 text-xs font-bold text-emerald-700"
+        >
+          {settings}
+        </span>
+      )}
       <a
         href={`/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`}
         title="Download this whole recording folder (both cameras) as a .zip"
@@ -346,9 +371,10 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
                   else clipPaths.forEach((r) => next.add(r));
                   return next;
                 });
+              const summary = s.clips.map((c) => c.detections?.[model]).find((d) => d?.status === "done");
               return (
                 <div key={s.key}>
-                  <SessionHeader session={s} allSelected={allSel} onToggle={toggleSession} />
+                  <SessionHeader session={s} allSelected={allSel} onToggle={toggleSession} model={model} summary={summary} />
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     {s.clips.map((v) => (
                       <AnalysisCard
