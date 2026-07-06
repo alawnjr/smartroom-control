@@ -143,6 +143,64 @@ def load_stride_setting():
         return None
 
 
+def detect_jumps(traj, fps):
+    # Geometric jump detector — independent of the skeleton classifier (which is
+    # near-chance on brief, OOD jumps and may even skip the window via the
+    # partial-frame gate). traj: list of (frame_idx, kpts(17,2), conf(17,)) for one
+    # track, every frame. A jump = the center of mass (hip midpoint) rises briefly
+    # ABOVE its rolling "standing" baseline by > JUMP_FRAC of the person's body
+    # height, then returns. Rising above the standing baseline only happens when
+    # airborne (crouch/stand stays at-or-below it), and normalizing by body height
+    # in pixels makes it distance/zoom invariant. Returns frame-index intervals.
+    import numpy as np
+    if len(traj) < 4:
+        return []
+    frac = _env_float("SMARTROOM_ACTION_JUMP_FRAC") or 0.12
+    max_sec = _env_float("SMARTROOM_ACTION_JUMP_MAX_SEC") or 1.2
+    n = len(traj)
+    idxs = np.array([t[0] for t in traj])
+    comy = np.full(n, np.nan)        # hip-midpoint y per frame (image coords)
+    heights = []                     # body pixel height samples, for normalization
+    for i, (_, kp, cf) in enumerate(traj):
+        vis = cf >= KP_CONF
+        if vis[11] and vis[12]:
+            comy[i] = (kp[11][1] + kp[12][1]) / 2.0
+        elif vis[11] or vis[12]:
+            comy[i] = kp[11][1] if vis[11] else kp[12][1]
+        if vis.any():
+            ys = kp[vis][:, 1]
+            if ys.size >= 2:
+                heights.append(float(ys.max() - ys.min()))
+    if not heights or np.isnan(comy).all():
+        return []
+    body_h = float(np.median(heights)) or 1.0
+    # Rolling-median baseline (~1.5s) tracks the standing CoM as the person moves
+    # around; a brief jump can't shift a median, so it stands out as an excursion.
+    bw = max(3, int(1.5 * fps))
+    baseline = np.full(n, np.nan)
+    for i in range(n):
+        lo, hi = max(0, i - bw // 2), min(n, i + bw // 2 + 1)
+        seg = comy[lo:hi]
+        seg = seg[~np.isnan(seg)]
+        if seg.size:
+            baseline[i] = np.median(seg)
+    rise = (baseline - comy) / body_h         # >0 = CoM higher than its baseline
+    above = np.nan_to_num(rise, nan=-1.0) >= frac
+    events, i, maxlen = [], 0, int(max_sec * fps)
+    while i < n:
+        if above[i]:
+            j = i
+            while j < n and above[j]:
+                j += 1
+            if (j - i) <= maxlen:                 # brief = ballistic = a jump
+                events.append({"start": int(idxs[i]), "end": int(idxs[j - 1]),
+                               "peak": round(float(np.nanmax(rise[i:j])), 3)})
+            i = j
+        else:
+            i += 1
+    return events
+
+
 def _env_float(name):
     v = os.environ.get(name)
     return float(v) if v not in (None, "") else None
@@ -360,6 +418,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     ev_lab = defaultdict(list)      # per track: predicted label at each event
     tubes = defaultdict(lambda: deque(maxlen=WINDOW))
     trunc = defaultdict(lambda: deque(maxlen=WINDOW))  # per sample: too few keypoints visible?
+    traj = defaultdict(list)        # per track: (idx, kpts, conf) every frame, for jump detection
     timeline = defaultdict(list)
     seen = []
     idx = 0
@@ -373,6 +432,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             xy = kpts.xy.cpu().numpy()
             conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
             for n, tid in enumerate(ids):
+                traj[tid].append((idx, xy[n], conf[n]))  # every frame (full vertical resolution)
                 if idx % stride == 0:
                     tubes[tid].append((xy[n], conf[n]))
                     n_vis = int((conf[n] >= KP_CONF).sum())
@@ -412,6 +472,12 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         framedata.append(perframe)
         idx += 1
 
+    # Geometric jump detection over each track's full trajectory (classifier-
+    # independent). Surface "jumping" as a chip when any track jumps.
+    jumps = {tid: ev for tid in traj if (ev := detect_jumps(traj[tid], native_fps))}
+    if jumps and "jumping" not in seen:
+        seen.append("jumping")
+
     # Pass 2 — re-decode and draw; frame g shows the label whose window was
     # centered on g, i.e. the latest classification computed at or before g+offset.
     tmp_raw = annotated_path.with_suffix(".raw.mp4")
@@ -426,8 +492,13 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             for a, b in COCO_SKELETON:
                 if cs[a] > 0.3 and cs[b] > 0.3:
                     cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
-            pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
-            text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
+            in_jump = any(e["start"] <= g <= e["end"] for e in jumps.get(tid, ()))
+            if in_jump:
+                text = f"#{tid} JUMP"
+            else:
+                pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
+                text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
+            box_color = (0, 140, 255) if in_jump else (0, 200, 0)  # orange while airborne
             font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
             (tw, th), base = cv2.getTextSize(text, font, scale, thick)
             box_w, box_h = tw + 6, th + base + 4
@@ -437,7 +508,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             bx = max(0, min(x1, fw - box_w)) if fw >= box_w else 0
             by = y1 - box_h if y1 - box_h >= 0 else y1
             by = max(0, min(by, fh - box_h))
-            cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), (0, 200, 0), -1)
+            cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), box_color, -1)
             cv2.putText(frame, text, (bx + 3, by + th + 2), font, scale, (0, 0, 0), thick)
         writer.write(frame)
     cap.release()
@@ -465,10 +536,14 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         if counts:
             track_actions[str(tid)] = max(counts, key=counts.get)
 
+    jumps_sec = {str(t): [{"start": round(e["start"] / native_fps, 3),
+                           "end": round(e["end"] / native_fps, 3), "peak": e["peak"]}
+                          for e in ev] for t, ev in jumps.items()}
     _atomic_write_json(actions_path, {"schemaVersion": SCHEMA_VERSION, "model": key,
                                       "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
                                       "nativeFps": round(native_fps, 3), "window": WINDOW, "stride": stride,
-                                      "tracks": {str(t): timeline[t] for t in timeline}})
+                                      "tracks": {str(t): timeline[t] for t in timeline},
+                                      "jumps": jumps_sec})
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
@@ -477,6 +552,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         "durationSec": round(total / native_fps, 3) if total else None,
         "temp": temp, "minConf": min_conf,
         "tracks": len(ev_idx), "trackActions": track_actions, "actions": seen,
+        "jumps": sum(len(ev) for ev in jumps.values()),
         "annotated": annotated_path.name if has_annotated else None, "hasAnnotated": has_annotated,
     })
     print(f"  action done: {mp4.relative_to(saved_root())} tracks={len(timeline)} {seen}", file=sys.stderr)
