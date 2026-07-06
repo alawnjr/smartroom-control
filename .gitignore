@@ -46,3 +46,7 @@ next-env.d.ts
 
 # action recognition venv (mmcv/mmaction2, py3.10) — rebuilt via detect/setup-action-env.sh
 .venv-action/
+
+# Python bytecode
+__pycache__/
+*.pyc

@@ -25,12 +25,21 @@ mkdir -p "$LOC/drn"
 : > "$LOC/drn/__init__.py"
 printf 'class DRN:\n    def __init__(self, *a, **k):\n        raise NotImplementedError("DRN localizer stubbed; unused")\n' > "$LOC/drn/drn.py"
 
-# NTU-RGB+D 60 2D ST-GCN++ checkpoint (COCO-17 keypoints).
+# NTU-RGB+D 60 2D ST-GCN++ checkpoint (COCO-17 keypoints) — the "ntu" action variant.
 CKPT="${SMARTROOM_STGCN_CKPT:-$HOME/Code/yolo-bench/stgcnpp_ntu60_2d.pth}"
 if [ ! -f "$CKPT" ]; then
   mkdir -p "$(dirname "$CKPT")"
   curl -sL -o "$CKPT" "https://download.openmmlab.com/mmaction/v1.0/skeleton/stgcnpp/stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d/stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d_20221228-86e1e77a.pth"
 fi
 
+# HMDB51 PoseC3D skeleton checkpoint (COCO-17 keypoints) — the "hmdb" action
+# variant (adds walk/run; heavier 3D-CNN). Same per-track loop, so multi-person.
+HMDB_CKPT="${SMARTROOM_HMDB_CKPT:-$HOME/Code/yolo-bench/posec3d_hmdb51.pth}"
+if [ ! -f "$HMDB_CKPT" ]; then
+  mkdir -p "$(dirname "$HMDB_CKPT")"
+  curl -sL -o "$HMDB_CKPT" "https://download.openmmlab.com/mmaction/v1.0/skeleton/posec3d/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint_20220815-17eaa484.pth"
+fi
+
 "$V/bin/python" -c "import torch,mmcv,mmaction,ultralytics;print('action env OK: torch',torch.__version__,'mmcv',mmcv.__version__,'mmaction',mmaction.__version__)"
-echo "checkpoint: $CKPT"
+echo "ntu checkpoint:  $CKPT"
+echo "hmdb checkpoint: $HMDB_CKPT"

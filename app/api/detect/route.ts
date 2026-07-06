@@ -1,7 +1,8 @@
-import { spawn } from "node:child_process";
 import path from "node:path";
 
 import { NextRequest, NextResponse } from "next/server";
+
+import { spawnBatch } from "@/lib/spawn-batch";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -35,14 +36,13 @@ export async function POST(req: NextRequest) {
   if (force || relPath) args.push("--force"); // re-analyze forces a reprocess
 
   try {
-    const child = spawn(detectPython(), args, {
+    // Own cgroup via systemd-run so a control-panel restart can't kill an
+    // in-flight batch — it runs start-to-finish. Logs to .detect.log.
+    const { isolated, unit } = spawnBatch(detectPython(), args, {
       cwd: projectRoot,
-      detached: true,
-      stdio: "ignore",
-      env: process.env,
+      logName: ".detect.log",
     });
-    child.unref();
-    return NextResponse.json({ started: true });
+    return NextResponse.json({ started: true, isolated, unit });
   } catch (e) {
     return NextResponse.json(
       { started: false, error: e instanceof Error ? e.message : "spawn failed" },
