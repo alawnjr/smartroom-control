@@ -9,8 +9,9 @@ import type { DetectionSummary, SavedVideo } from "@/lib/types";
 
 const SPEEDS = [0.25, 0.5, 1, 2];
 
-function fileUrl(relPath: string) {
-  return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
+function fileUrl(relPath: string, version?: number) {
+  const base = `/api/saved/file?path=${encodeURIComponent(relPath)}`;
+  return version ? `${base}&v=${version}` : base;
 }
 
 // Right slide-over showing one clip's per-person action analysis: the video (with
@@ -36,7 +37,7 @@ export function ClipAnalyticsDrawer({
   const [rate, setRate] = useState(1);
   const videoRef = useRef<HTMLVideoElement>(null);
   const showOverlay = overlay && hasOverlay;
-  const src = showOverlay ? fileUrl(d.annotatedRelPath!) : fileUrl(v.relPath);
+  const src = showOverlay ? fileUrl(d.annotatedRelPath!, d.version) : fileUrl(v.relPath);
 
   // Close on Escape.
   useEffect(() => {
@@ -140,7 +141,7 @@ export function ClipAnalyticsDrawer({
           </div>
         )}
 
-        <ActionBars relPath={v.relPath} model={model} actionsRelPath={d.actionsRelPath} currentTime={currentTime} actions={d.actions ?? []} />
+        <ActionBars relPath={v.relPath} model={model} actionsRelPath={d.actionsRelPath} version={d.version} currentTime={currentTime} actions={d.actions ?? []} />
       </div>
     </div>
   );

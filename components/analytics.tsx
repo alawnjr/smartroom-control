@@ -20,8 +20,9 @@ const STRIDE_OPTS = [0, 1, 2, 3, 4];
 const SPC_OPTS = [0, 1, 2, 4, 6, 12, 24];
 const isActionKey = (m: string) => m.startsWith("action");
 
-function fileUrl(relPath: string) {
-  return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
+function fileUrl(relPath: string, version?: number) {
+  const base = `/api/saved/file?path=${encodeURIComponent(relPath)}`;
+  return version ? `${base}&v=${version}` : base;
 }
 function post(url: string, body?: unknown) {
   return fetch(url, {
@@ -38,7 +39,7 @@ function detForModel(v: SavedVideo, model: string, slot: number) {
   return slot <= 1 ? v.detections?.[model] : v.analyses?.[slot]?.detections?.[model];
 }
 
-function AnalysisCard({ v, model, slot, roomName }: { v: SavedVideo; model: string; slot: number; roomName: string }) {
+function AnalysisCard({ v, model, slot, settings, roomName }: { v: SavedVideo; model: string; slot: number; settings: { stride: number; spc: number }; roomName: string }) {
   const qc = useQueryClient();
   const d = detForModel(v, model, slot);
   const isPose = model.includes("pose");
@@ -48,7 +49,7 @@ function AnalysisCard({ v, model, slot, roomName }: { v: SavedVideo; model: stri
   const [overlay, setOverlay] = useState(true);
   const [drawer, setDrawer] = useState(false);
   const showOverlay = overlay && hasOverlay;
-  const src = showOverlay ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
+  const src = showOverlay ? fileUrl(d!.annotatedRelPath!, d!.version) : fileUrl(v.relPath);
   const analyzing = clipAnalyzing(v);
 
   const reanalyze = useMutation({
@@ -56,11 +57,13 @@ function AnalysisCard({ v, model, slot, roomName }: { v: SavedVideo; model: stri
       // Re-run THIS tab. Slots >=2 always re-run that slot's action analysis
       // (even when viewing the shared detection model), so ↻ never falls back to
       // slot 1 / shared detection just because a detection model is selected.
+      // Use the settings CURRENTLY shown in the bar (not the slot's stale saved
+      // config) so editing stride/spc then hitting ↻ actually takes effect.
       if (slot >= 2) {
         const cfg = v.analyses?.[slot]?.config;
         return post("/api/analysis-slots", {
           day: v.day, rec: v.rec, slot,
-          settings: cfg?.settings ?? {},
+          settings: { stride: settings.stride, samplesPerClassify: settings.spc },
           variants: cfg?.variants ?? [actionVariant],
           disabled: {
             action: (cfg?.action as { disabled?: string[] })?.disabled ?? [],
@@ -395,7 +398,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
                   />
                   <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                     {s.clips.map((v) => (
-                      <AnalysisCard key={v.relPath} v={v} model={model} slot={slot} roomName={nameByNode.get(v.node) ?? v.node} />
+                      <AnalysisCard key={v.relPath} v={v} model={model} slot={slot} settings={settingsFor(s, slot)} roomName={nameByNode.get(v.node) ?? v.node} />
                     ))}
                   </div>
                 </div>
