@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, LineChart, Loader2, Plus, RefreshCw, ScanEye, Trash2, Video, X } from "lucide-react";
 
@@ -9,7 +9,7 @@ import { GeometricPanel } from "@/components/geometric-page";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { tagClass } from "@/lib/action-colors";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved, type Session } from "@/lib/use-saved";
-import type { NodeConfig, SavedVideo, SlotConfig } from "@/lib/types";
+import type { NodeConfig, SavedVideo } from "@/lib/types";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action", "action-hmdb"];
 const MODEL_LABEL: Record<string, string> = {
@@ -143,21 +143,26 @@ function AnalysisCard({ v, model, slot, roomName }: { v: SavedVideo; model: stri
   );
 }
 
-// Settings badge for a slot (from its config snapshot).
-function slotBadge(cfg?: SlotConfig): string | null {
-  if (!cfg) return null;
-  const parts: string[] = [];
-  const st = cfg.settings?.stride ?? 0;
-  const spc = cfg.settings?.samplesPerClassify ?? 0;
-  parts.push(`stride ${st === 0 ? "auto" : st}`);
-  parts.push(`spc ${spc === 0 ? "auto" : spc}`);
-  if (cfg.variants?.length) parts.push(cfg.variants.map((v) => v.toUpperCase()).join("+"));
-  return parts.join(" · ");
+function Opt({ on, label, val, set }: { on: number; label: string; val: number[]; set: (n: number) => void }) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs font-bold text-muted">{label}</span>
+      <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
+        {val.map((n) => (
+          <button key={n} onClick={() => set(n)} className={`px-2 py-1 ${n === on ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}>
+            {n === 0 ? "auto" : n}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
 }
 
-// Per-session numbered analysis tabs + an always-visible settings bar that runs a
-// new analysis. Slot 1 = the original. Tabs are shown as sequential ordinals
-// (1,2,3…) regardless of the underlying folder numbers, so they never skip.
+// Per-session numbered analysis tabs with an inline settings bar. Tabs render as
+// sequential ordinals (1,2,3…) regardless of folder numbers so they never skip.
+// The settings bar is bound to the SELECTED tab — it reflects that analysis's
+// settings and "New analysis" spawns a fresh tab from them, so editing here only
+// affects the current tab (until you create a new one).
 function SlotTabs({
   session, selected, onSelect, model,
 }: {
@@ -171,10 +176,26 @@ function SlotTabs({
 
   const realSlots = [...new Set([1, ...session.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])]
     .sort((a, b) => a - b);
-  const activeCfg = selected > 1
+  const selectedCfg = selected > 1
     ? session.clips.map((c) => c.analyses?.[selected]?.config).find(Boolean)
     : undefined;
   const variant = model === "action-hmdb" ? "hmdb" : "ntu";
+
+  const { data: globalCfg } = useQuery({
+    queryKey: ["action-classes"],
+    queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
+    staleTime: Infinity,
+  });
+
+  // The bar reflects the selected tab's settings; switching tabs resets it.
+  const [stride, setStride] = useState(0);
+  const [spc, setSpc] = useState(0);
+  const cfgStride = selectedCfg?.settings?.stride ?? 0;
+  const cfgSpc = selectedCfg?.settings?.samplesPerClassify ?? 0;
+  useEffect(() => {
+    setStride(cfgStride);
+    setSpc(cfgSpc);
+  }, [selected, cfgStride, cfgSpc]);
 
   const del = useMutation({
     mutationFn: (slot: number) =>
@@ -184,64 +205,6 @@ function SlotTabs({
       qc.invalidateQueries({ queryKey: ["saved"] });
     },
   });
-
-  return (
-    <div className="mb-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <span className="font-mono text-sm font-bold text-muted">{session.label}</span>
-        <span className="rounded-full bg-card px-2 py-0.5 text-xs font-bold text-muted">
-          {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
-        </span>
-        <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
-          {realSlots.map((real, i) => (
-            <button
-              key={real}
-              onClick={() => onSelect(real)}
-              className={`px-2.5 py-1 ${real === selected ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
-            >
-              {i === 0 ? "1 · original" : i + 1}
-            </button>
-          ))}
-        </div>
-        {selected > 1 && (
-          <button
-            onClick={() => del.mutate(selected)}
-            disabled={del.isPending}
-            title="Delete this analysis"
-            className="rounded-lg border border-line p-1.5 text-rose-500 hover:bg-rose-50 disabled:opacity-50"
-          >
-            <Trash2 className="size-3.5" />
-          </button>
-        )}
-        <a
-          href={`/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`}
-          title="Download this whole recording folder (both cameras + all analyses) as a .zip"
-          className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-card"
-        >
-          <Download className="size-3.5" /> Download folder
-        </a>
-      </div>
-      {selected > 1 && slotBadge(activeCfg) && (
-        <div className="mt-1 text-[11px] font-bold text-muted">⚙ {slotBadge(activeCfg)}</div>
-      )}
-      <NewSlotForm day={day} rec={rec} variant={variant} onCreated={(slot) => slot && onSelect(slot)} />
-    </div>
-  );
-}
-
-// Always-visible settings bar: stride + samples/classify + "Analyze" creates a new
-// numbered analysis. Variant follows the model picker (NTU unless the HMDB model is selected).
-function NewSlotForm({ day, rec, variant, onCreated }: { day: string; rec: string; variant: string; onCreated: (slot?: number) => void }) {
-  const qc = useQueryClient();
-  // Default the whitelist to the current global config so a new slot starts from
-  // the same enabled classes; the user can still re-toggle on the Classes page.
-  const { data: globalCfg } = useQuery({
-    queryKey: ["action-classes"],
-    queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
-    staleTime: Infinity,
-  });
-  const [stride, setStride] = useState(0);
-  const [spc, setSpc] = useState(0);
 
   const create = useMutation({
     mutationFn: async () => {
@@ -262,25 +225,39 @@ function NewSlotForm({ day, rec, variant, onCreated }: { day: string; rec: strin
     },
     onSuccess: (slot) => {
       pingSavedSoon(qc);
-      onCreated(slot);
+      if (slot) onSelect(slot);
     },
   });
 
-  const Opt = ({ on, label, val, set }: { on: number; label: string; val: number[]; set: (n: number) => void }) => (
-    <div className="flex items-center gap-2">
-      <span className="text-xs font-bold text-muted">{label}</span>
+  return (
+    <div className="mb-2 flex flex-wrap items-center gap-3">
+      <span className="font-mono text-sm font-bold text-muted">{session.label}</span>
+      <span className="rounded-full bg-card px-2 py-0.5 text-xs font-bold text-muted">
+        {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
+      </span>
       <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
-        {val.map((n) => (
-          <button key={n} onClick={() => set(n)} className={`px-2 py-1 ${n === on ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}>
-            {n === 0 ? "auto" : n}
+        {realSlots.map((real, i) => (
+          <button
+            key={real}
+            onClick={() => onSelect(real)}
+            className={`px-2.5 py-1 ${real === selected ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
+          >
+            {i === 0 ? "1 · original" : i + 1}
           </button>
         ))}
       </div>
-    </div>
-  );
+      {selected > 1 && (
+        <button
+          onClick={() => del.mutate(selected)}
+          disabled={del.isPending}
+          title="Delete this analysis"
+          className="rounded-lg border border-line p-1.5 text-rose-500 hover:bg-rose-50 disabled:opacity-50"
+        >
+          <Trash2 className="size-3.5" />
+        </button>
+      )}
 
-  return (
-    <div className="mt-2 flex flex-wrap items-center gap-3 rounded-xl border border-line bg-card p-3">
+      {/* inline settings bar — bound to the selected tab */}
       <Opt on={stride} label="stride" val={STRIDE_OPTS} set={setStride} />
       <Opt on={spc} label="samples / classify" val={SPC_OPTS} set={setSpc} />
       <button
@@ -291,6 +268,14 @@ function NewSlotForm({ day, rec, variant, onCreated }: { day: string; rec: strin
       >
         {create.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />} New analysis ({variant.toUpperCase()})
       </button>
+
+      <a
+        href={`/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`}
+        title="Download this whole recording folder (both cameras + all analyses) as a .zip"
+        className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-card"
+      >
+        <Download className="size-3.5" /> Download folder
+      </a>
     </div>
   );
 }
