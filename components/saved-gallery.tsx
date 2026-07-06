@@ -8,13 +8,14 @@ import { OccupancySparkline } from "@/components/occupancy-sparkline";
 import { analyzingCount, clipAnalyzing, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { DetectionSummary, SavedVideo } from "@/lib/types";
 
-const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose"];
+const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action"];
 const MODEL_LABEL: Record<string, string> = {
   yolo26n: "nano",
   yolo26s: "small",
   yolo26m: "medium",
   yolo26l: "large",
   "yolo26n-pose": "pose",
+  action: "actions",
 };
 
 function mb(b: number) {
@@ -40,6 +41,16 @@ function OccupancyBadge({ d }: { d?: DetectionSummary }) {
     return (
       <span className="rounded bg-red-500/15 px-1.5 py-0.5 text-[10px] text-red-400" title={d.error}>
         analysis failed
+      </span>
+    );
+  }
+  if (d.actions) {
+    return (
+      <span
+        className="truncate rounded bg-sky-500/15 px-1.5 py-0.5 text-[10px] font-medium text-sky-400"
+        title={d.actions.join(", ")}
+      >
+        🎬 {d.actions.length ? d.actions.slice(0, 2).join(", ") + (d.actions.length > 2 ? "…" : "") : "no action"}
       </span>
     );
   }
@@ -118,8 +129,8 @@ export function SavedGallery() {
   // models present across all clips, in nano→small→medium order
   const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
   const [sel, setSel] = useState<string | null>(null);
-  // default to the largest available *detection* model (not pose)
-  const detection = available.filter((m) => !m.includes("pose"));
+  // default to the largest available *detection* model (not pose/action)
+  const detection = available.filter((m) => !m.includes("pose") && m !== "action");
   const fallback = detection[detection.length - 1] ?? available[available.length - 1] ?? null;
   const model = sel && available.includes(sel) ? sel : fallback;
 

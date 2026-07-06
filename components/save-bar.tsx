@@ -1,7 +1,7 @@
 "use client";
 
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Download, Loader2, ScanEye, X } from "lucide-react";
+import { Download, Film, Loader2, ScanEye, X } from "lucide-react";
 
 import { Button } from "@/components/ui/button";
 import { analyzingCount, pingSavedSoon, useSaved } from "@/lib/use-saved";
@@ -35,6 +35,15 @@ export function SaveBar() {
   });
   const analyze = useMutation({
     mutationFn: () => triggerDetect({ force: true }), // re-run all clips
+    onSuccess: () => pingSavedSoon(qc),
+  });
+  const actions = useMutation({
+    mutationFn: () =>
+      fetch("/api/action", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ force: true }),
+      }).catch(() => {}),
     onSuccess: () => pingSavedSoon(qc),
   });
   const cancel = useMutation({
@@ -71,6 +80,16 @@ export function SaveBar() {
             : analyze.isPending
               ? "Starting…"
               : "Re-analyze"}
+        </Button>
+        <Button
+          variant="outline"
+          size="lg"
+          disabled={busy || actions.isPending}
+          onClick={() => actions.mutate()}
+          title="Per-person action recognition (pose tracking + Kinetics video model; slower)"
+        >
+          <Film />
+          {actions.isPending ? "Starting…" : "Actions"}
         </Button>
         {analyzing > 0 && (
           <Button

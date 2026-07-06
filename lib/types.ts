@@ -72,6 +72,10 @@ export type DetectionSummary = {
   hasAnnotated: boolean;
   annotatedRelPath?: string; // recordings-relative, for /api/saved/file
   error?: string;
+  // action model only:
+  tracks?: number;
+  actions?: string[]; // distinct action labels seen
+  trackActions?: Record<string, string>; // track id -> dominant action
 };
 
 export type SavedListing = { root: string; videos: SavedVideo[] };

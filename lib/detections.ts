@@ -90,6 +90,9 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
       timeline: raw.timeline,
       hasAnnotated,
       annotatedRelPath,
+      tracks: raw.tracks,
+      actions: raw.actions,
+      trackActions: raw.trackActions,
     };
   } catch {
     return { model, status: "none", hasAnnotated: false };
