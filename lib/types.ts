@@ -32,3 +32,16 @@ export type RecordResult = {
 };
 
 export type RecordResponse = { results: RecordResult[]; allOk: boolean };
+
+// One node's outcome from "Save All to Laptop".
+export type SaveResult = {
+  id: string;
+  name: string;
+  downloaded: number;
+  skipped: number;
+  failed: number;
+  bytes: number;
+  error?: string;
+};
+
+export type SaveResponse = { saveRoot: string; nodes: SaveResult[] };

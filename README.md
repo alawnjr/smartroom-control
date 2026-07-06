@@ -7,6 +7,12 @@ It talks to each Pi's `smartroom_video_page.py` server (`:8000`): control calls
 (`/record`, `/record/cancel`, `/record/status`) are proxied through this app's
 own `app/api/*` routes server-side (the Pi sets no CORS headers).
 
+**Save All to Laptop** mirrors every recording from both nodes to disk. It reads
+each node's `/recordings` listing and streams the videos into
+`<SMARTROOM_SAVE_DIR>/<nodeId>/<day>/<rec>/streams/...` (default
+`~/Videos/Smartroom Recordings`), skipping files already present at the same
+size — so re-running only fetches new recordings.
+
 > "Record All" fires both POSTs in one tick to minimize start skew, but the
 > clap-at-t0 marker is still the fine-sync mechanism — don't treat the two
 > streams as frame-locked.
