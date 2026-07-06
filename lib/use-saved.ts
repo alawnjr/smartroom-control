@@ -1,6 +1,17 @@
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, type QueryClient } from "@tanstack/react-query";
 
 import type { SavedListing, SavedVideo } from "@/lib/types";
+
+// After triggering/cancelling detection, re-check ["saved"] a few times over the
+// next several seconds. detect.py needs a moment to write its first "analyzing"
+// marker, so a single immediate invalidate would miss it and polling (which only
+// runs while something is analyzing) would never start. Once a ping catches the
+// analyzing state, useSaved's refetchInterval self-sustains.
+export function pingSavedSoon(qc: QueryClient) {
+  for (const ms of [300, 1000, 2000, 4000, 7000, 11000]) {
+    setTimeout(() => qc.invalidateQueries({ queryKey: ["saved"] }), ms);
+  }
+}
 
 // True while any model on a clip is still being analyzed.
 export function clipAnalyzing(v: SavedVideo) {
