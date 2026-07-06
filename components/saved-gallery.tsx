@@ -4,7 +4,14 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { OccupancySparkline } from "@/components/occupancy-sparkline";
-import type { SavedListing, SavedVideo } from "@/lib/types";
+import type { DetectionSummary, SavedListing, SavedVideo } from "@/lib/types";
+
+const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m"];
+const MODEL_LABEL: Record<string, string> = {
+  yolo26n: "nano",
+  yolo26s: "small",
+  yolo26m: "medium",
+};
 
 function mb(b: number) {
   return `${(b / 1e6).toFixed(b >= 1e7 ? 0 : 1)} MB`;
@@ -14,8 +21,7 @@ function fileUrl(relPath: string) {
   return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
 }
 
-function OccupancyBadge({ v }: { v: SavedVideo }) {
-  const d = v.detection;
+function OccupancyBadge({ d }: { d?: DetectionSummary }) {
   if (!d || d.status === "none") {
     return <span className="rounded bg-neutral-800 px-1.5 py-0.5 text-[10px] text-neutral-500">not analyzed</span>;
   }
@@ -40,8 +46,8 @@ function OccupancyBadge({ v }: { v: SavedVideo }) {
   );
 }
 
-function ClipCard({ v }: { v: SavedVideo }) {
-  const d = v.detection;
+function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
+  const d = model ? v.detections?.[model] : undefined;
   const hasAnnotated = Boolean(d?.hasAnnotated && d.annotatedRelPath);
   const [annotated, setAnnotated] = useState(false);
   const showAnnotated = annotated && hasAnnotated;
@@ -49,18 +55,10 @@ function ClipCard({ v }: { v: SavedVideo }) {
 
   return (
     <div className="flex flex-col gap-1 rounded-lg border border-neutral-800 bg-black/30 p-2">
-      <video
-        key={src}
-        controls
-        preload="none"
-        className="aspect-video w-full rounded bg-black"
-        src={src}
-      />
-      {d?.status === "done" && d.timeline && (
-        <OccupancySparkline timeline={d.timeline} max={d.maxPersons ?? 0} />
-      )}
+      <video key={src} controls preload="none" className="aspect-video w-full rounded bg-black" src={src} />
+      {d?.status === "done" && d.timeline && <OccupancySparkline timeline={d.timeline} max={d.maxPersons ?? 0} />}
       <div className="flex items-center justify-between gap-2">
-        <OccupancyBadge v={v} />
+        <OccupancyBadge d={d} />
         {hasAnnotated && (
           <button
             onClick={() => setAnnotated((a) => !a)}
@@ -71,20 +69,12 @@ function ClipCard({ v }: { v: SavedVideo }) {
         )}
       </div>
       <div className="flex items-center justify-between gap-2 text-xs text-neutral-400">
-        <span className="truncate" title={`${v.day}/${v.rec}/${v.file}`}>
-          {v.rec || v.file}
-        </span>
-        <a
-          className="shrink-0 text-emerald-400 hover:underline"
-          href={fileUrl(v.relPath)}
-          download={`${v.node}_${v.rec}_${v.file}`}
-        >
+        <span className="truncate" title={`${v.day}/${v.rec}/${v.file}`}>{v.rec || v.file}</span>
+        <a className="shrink-0 text-emerald-400 hover:underline" href={fileUrl(v.relPath)} download={`${v.node}_${v.rec}_${v.file}`}>
           download
         </a>
       </div>
-      <span className="text-[10px] text-neutral-600">
-        {v.day} · {mb(v.size)}
-      </span>
+      <span className="text-[10px] text-neutral-600">{v.day} · {mb(v.size)}</span>
     </div>
   );
 }
@@ -97,12 +87,21 @@ export function SavedGallery() {
       return res.json();
     },
     refetchOnWindowFocus: false,
-    // Live-update while any clip is being analyzed.
     refetchInterval: (q) =>
-      q.state.data?.videos?.some((v) => v.detection?.status === "analyzing") ? 3000 : false,
+      q.state.data?.videos?.some((v) =>
+        Object.values(v.detections ?? {}).some((d) => d.status === "analyzing")
+      )
+        ? 3000
+        : false,
   });
 
   const videos = data?.videos ?? [];
+
+  // models present across all clips, in nano→small→medium order
+  const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
+  const [sel, setSel] = useState<string | null>(null);
+  const model = sel && available.includes(sel) ? sel : (available[available.length - 1] ?? null); // default: largest available
+
   const byNode = new Map<string, SavedVideo[]>();
   for (const v of videos) {
     const arr = byNode.get(v.node);
@@ -113,24 +112,40 @@ export function SavedGallery() {
 
   return (
     <div className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-4">
-      <h2 className="mb-3 text-sm font-medium text-neutral-300">Saved Recordings</h2>
+      <div className="mb-3 flex items-center justify-between gap-3">
+        <h2 className="text-sm font-medium text-neutral-300">Saved Recordings</h2>
+        {available.length > 0 && (
+          <div className="flex items-center gap-1 text-xs">
+            <span className="text-neutral-500">model</span>
+            <div className="flex overflow-hidden rounded-md border border-neutral-700">
+              {available.map((m) => (
+                <button
+                  key={m}
+                  onClick={() => setSel(m)}
+                  className={`px-2 py-0.5 ${
+                    m === model ? "bg-emerald-600 text-white" : "text-neutral-300 hover:bg-neutral-800"
+                  }`}
+                >
+                  {MODEL_LABEL[m] ?? m}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+
       {videos.length === 0 ? (
-        <p className="text-xs text-neutral-500">
-          No saved recordings yet — hit “Save All to Laptop”.
-        </p>
+        <p className="text-xs text-neutral-500">No saved recordings yet — hit “Save All to Laptop”.</p>
       ) : (
         <div className="flex flex-col gap-5">
           {nodes.map((node) => (
             <div key={node} className="flex flex-col gap-2">
               <div className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
-                {node}{" "}
-                <span className="font-normal lowercase text-neutral-600">
-                  ({byNode.get(node)!.length})
-                </span>
+                {node} <span className="font-normal lowercase text-neutral-600">({byNode.get(node)!.length})</span>
               </div>
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
                 {byNode.get(node)!.map((v) => (
-                  <ClipCard key={v.relPath} v={v} />
+                  <ClipCard key={v.relPath} v={v} model={model} />
                 ))}
               </div>
             </div>

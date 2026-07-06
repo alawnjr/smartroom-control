@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { NextResponse } from "next/server";
 
-import { readDetectionSummary } from "@/lib/detections";
+import { readDetections } from "@/lib/detections";
 import { savedRoot } from "@/lib/recordings";
 import type { SavedVideo } from "@/lib/types";
 
@@ -24,7 +24,7 @@ export async function GET() {
         (d) =>
           d.isFile() &&
           VIDEO_EXT.has(path.extname(d.name).toLowerCase()) &&
-          !d.name.endsWith(".annotated.mp4") // outputs, not source clips
+          !d.name.includes(".annotated.") // outputs, not source clips
       )
       .map((d) => path.relative(root, path.join(d.parentPath, d.name)));
   } catch {
@@ -44,7 +44,7 @@ export async function GET() {
     } catch {
       // ignore unreadable file
     }
-    const detection = await readDetectionSummary(abs);
+    const detections = await readDetections(abs);
     videos.push({
       node: parts[0] ?? "",
       day: parts[1] ?? "",
@@ -53,7 +53,7 @@ export async function GET() {
       relPath: rel,
       size,
       mtime,
-      detection,
+      detections,
     });
   }
   videos.sort((a, b) => b.mtime - a.mtime);

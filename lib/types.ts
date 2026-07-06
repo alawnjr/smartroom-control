@@ -55,7 +55,7 @@ export type SavedVideo = {
   relPath: string; // full path relative to the recordings root
   size: number;
   mtime: number;
-  detection?: DetectionSummary;
+  detections?: Record<string, DetectionSummary>; // keyed by model (yolo26n/s/m)
 };
 
 export type DetectionStatus = "analyzing" | "done" | "error" | "none";
@@ -63,6 +63,7 @@ export type DetectionStatus = "analyzing" | "done" | "error" | "none";
 export type DetectionTimelinePoint = { t: number; count: number };
 
 export type DetectionSummary = {
+  model: string; // e.g. yolo26n / yolo26s / yolo26m
   status: DetectionStatus;
   maxPersons?: number;
   avgPersons?: number;

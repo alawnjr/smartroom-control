@@ -2,26 +2,27 @@
 """
 Person-detection over the saved recordings, for the smartroom-control dashboard.
 
-Runs a pretrained YOLO26 nano model (OpenVINO, intel:cpu) on each
+Runs one or more pretrained YOLO26 models (OpenVINO, intel:cpu) on each
 `recordings/<node>/.../streams/camera_main.mp4`, counting PEOPLE only (COCO
-class 0), and writes two siblings next to each clip:
+class 0). For each clip AND each model it writes two siblings:
 
-  camera_main.detections.json   occupancy stats + per-sampled-frame timeline
-  camera_main.annotated.mp4     boxes burned in, re-encoded H.264 (browser-playable)
+  camera_main.detections.<model>.json   occupancy stats + per-sampled-frame timeline
+  camera_main.annotated.<model>.mp4     boxes burned in, H.264 (browser-playable)
 
-Idempotent (skips clips whose results are current), safe against concurrent runs
-(a global flock), and writes a `status:"analyzing"` marker first so the dashboard
-can show progress.
+so the dashboard can toggle between models (nano / s / m). Idempotent per
+(clip, model); safe against concurrent runs (a global flock); writes a
+`status:"analyzing"` marker first so the dashboard can show progress.
 
-Config (all env-overridable):
+Config (env):
   SMARTROOM_SAVE_DIR          recordings root (default: <project>/recordings)
-  SMARTROOM_YOLO_MODEL        OpenVINO model dir (default: ~/Code/yolo-bench/yolo26n_openvino_model)
+  SMARTROOM_YOLO_MODELS       comma list of model keys (default yolo26n,yolo26s,yolo26m)
+  SMARTROOM_YOLO_DIR          dir holding <key>_openvino_model/ (default ~/Code/yolo-bench)
   SMARTROOM_DETECT_IMGSZ      inference size (default 640)
   SMARTROOM_DETECT_SAMPLE_FPS frames/sec to analyze (default 5)
   SMARTROOM_DETECT_ANNOTATE   1/0 produce annotated video (default 1)
 
 Usage:
-  python detect.py                 # process all unprocessed clips
+  python detect.py                 # all models over all unprocessed clips
   python detect.py --path <rel>    # one clip (recordings-relative), with --force
   python detect.py --force         # reprocess everything
 """
@@ -39,18 +40,18 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 PERSON_CLASS = 0
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def saved_root() -> Path:
     return Path(os.environ.get("SMARTROOM_SAVE_DIR") or (PROJECT_ROOT / "recordings"))
 
 
-def model_dir() -> Path:
-    return Path(
-        os.environ.get("SMARTROOM_YOLO_MODEL")
-        or (Path.home() / "Code" / "yolo-bench" / "yolo26n_openvino_model")
-    )
+def model_specs():
+    """(key, openvino_dir) for each configured model."""
+    keys = os.environ.get("SMARTROOM_YOLO_MODELS", "yolo26n,yolo26s,yolo26m").split(",")
+    base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
+    return [(k.strip(), base / f"{k.strip()}_openvino_model") for k in keys if k.strip()]
 
 
 IMGSZ = int(os.environ.get("SMARTROOM_DETECT_IMGSZ", "640"))
@@ -58,8 +59,11 @@ SAMPLE_FPS = float(os.environ.get("SMARTROOM_DETECT_SAMPLE_FPS", "5"))
 ANNOTATE = os.environ.get("SMARTROOM_DETECT_ANNOTATE", "1") != "0"
 
 
-def sidecar_paths(mp4: Path):
-    return mp4.with_suffix(".detections.json"), mp4.with_name(mp4.stem + ".annotated.mp4")
+def sidecar_paths(mp4: Path, key: str):
+    return (
+        mp4.with_name(f"{mp4.stem}.detections.{key}.json"),
+        mp4.with_name(f"{mp4.stem}.annotated.{key}.mp4"),
+    )
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -69,10 +73,10 @@ def _atomic_write_json(path: Path, data: dict):
     os.replace(tmp, path)
 
 
-def needs_processing(mp4: Path, force: bool) -> bool:
+def needs_processing(mp4: Path, key: str, force: bool) -> bool:
     if force:
         return True
-    json_path, annotated = sidecar_paths(mp4)
+    json_path, annotated = sidecar_paths(mp4, key)
     if not json_path.exists():
         return True
     try:
@@ -88,13 +92,13 @@ def needs_processing(mp4: Path, force: bool) -> bool:
     return False
 
 
-def process_clip(model, mp4: Path):
-    import cv2  # imported here so --help works without the venv
+def process_clip(model, key: str, mp4: Path):
+    import cv2
 
-    json_path, annotated_path = sidecar_paths(mp4)
+    json_path, annotated_path = sidecar_paths(mp4, key)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
-                                   "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
+                                   "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
 
     cap = cv2.VideoCapture(str(mp4))
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -111,7 +115,7 @@ def process_clip(model, mp4: Path):
                                  native_fps, (width, height))
 
     timeline = []
-    last_boxes = []  # carry forward between sampled frames so boxes don't flicker
+    last_boxes = []
     idx = 0
     while True:
         ok, frame = cap.read()
@@ -136,7 +140,6 @@ def process_clip(model, mp4: Path):
 
     has_annotated = False
     if tmp_annotated is not None and tmp_annotated.exists():
-        # OpenCV's mp4v isn't browser-playable; transcode to H.264/yuv420p.
         final_tmp = annotated_path.with_suffix(".enc.mp4")
         proc = subprocess.run(
             ["ffmpeg", "-y", "-i", str(tmp_annotated), "-c:v", "libx264",
@@ -155,9 +158,9 @@ def process_clip(model, mp4: Path):
         "schemaVersion": SCHEMA_VERSION,
         "status": "done",
         "error": None,
+        "model": key,
         "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms,
-        "model": "yolo26n_openvino",
         "device": "intel:cpu",
         "class": "person",
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -171,22 +174,21 @@ def process_clip(model, mp4: Path):
         "annotated": annotated_path.name if has_annotated else None,
         "hasAnnotated": has_annotated,
     })
-    print(f"  done: {mp4.relative_to(saved_root())}  max={max(counts) if counts else 0}", file=sys.stderr)
+    print(f"  [{key}] done: {mp4.relative_to(saved_root())}  max={max(counts) if counts else 0}", file=sys.stderr)
 
 
-def mark_error(mp4: Path, message: str):
-    json_path, _ = sidecar_paths(mp4)
+def mark_error(mp4: Path, key: str, message: str):
+    json_path, _ = sidecar_paths(mp4, key)
     try:
-        _atomic_write_json(json_path, {
-            "schemaVersion": SCHEMA_VERSION, "status": "error", "error": message,
-            "source": mp4.name, "sourceMtimeMs": mp4.stat().st_mtime * 1000,
-        })
+        _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "error",
+                                       "model": key, "error": message, "source": mp4.name,
+                                       "sourceMtimeMs": mp4.stat().st_mtime * 1000})
     except Exception:
         pass
 
 
 def main():
-    ap = argparse.ArgumentParser(description="YOLO26n person-detection over saved recordings.")
+    ap = argparse.ArgumentParser(description="YOLO26 person-detection over saved recordings.")
     ap.add_argument("--path", help="single clip, relative to the recordings root")
     ap.add_argument("--force", action="store_true", help="reprocess even if results are current")
     args = ap.parse_args()
@@ -196,8 +198,7 @@ def main():
         print(f"no recordings dir: {root}", file=sys.stderr)
         return 0
 
-    lock_path = root / ".detect.lock"
-    lock_file = open(lock_path, "w")
+    lock_file = open(root / ".detect.lock", "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -207,33 +208,30 @@ def main():
     if args.path:
         clips = [root / args.path]
     else:
-        clips = sorted(
-            (p for p in root.rglob("camera_main.mp4") if not p.name.endswith(".annotated.mp4")),
-            key=lambda p: p.stat().st_mtime, reverse=True,
-        )
-    todo = [c for c in clips if c.exists() and needs_processing(c, args.force)]
-    print(f"{len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
-    if not todo:
-        return 0
+        clips = sorted((p for p in root.rglob("camera_main.mp4")),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    clips = [c for c in clips if c.exists()]
 
     if shutil.which("ffmpeg") is None and ANNOTATE:
         print("warning: ffmpeg not found; annotated videos will be skipped", file=sys.stderr)
 
-    md = model_dir()
-    if not md.exists():
-        print(f"ERROR: OpenVINO model not found at {md}. Export it once with "
-              "`YOLO('yolo26n.pt').export(format='openvino')`.", file=sys.stderr)
-        return 1
+    specs = model_specs()
     from ultralytics import YOLO
-    model = YOLO(str(md))
-
-    for mp4 in todo:
-        try:
-            print(f"processing {mp4.relative_to(root)}", file=sys.stderr)
-            process_clip(model, mp4)
-        except Exception as error:  # noqa: BLE001
-            print(f"  error: {error}", file=sys.stderr)
-            mark_error(mp4, str(error))
+    for key, md in specs:
+        if not md.exists():
+            print(f"skip model {key}: OpenVINO dir missing ({md}) — export it first", file=sys.stderr)
+            continue
+        todo = [c for c in clips if needs_processing(c, key, args.force)]
+        print(f"[{key}] {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
+        if not todo:
+            continue
+        model = YOLO(str(md))
+        for mp4 in todo:
+            try:
+                process_clip(model, key, mp4)
+            except Exception as error:  # noqa: BLE001
+                print(f"  [{key}] error: {error}", file=sys.stderr)
+                mark_error(mp4, key, str(error))
     return 0
 
 
