@@ -15,7 +15,7 @@ so the dashboard can toggle between models (nano / s / m). Idempotent per
 
 Config (env):
   SMARTROOM_SAVE_DIR          recordings root (default: <project>/recordings)
-  SMARTROOM_YOLO_MODELS       comma list of model keys (default yolo26n,yolo26s,yolo26m)
+  SMARTROOM_YOLO_MODELS       comma list of model keys (default yolo26l,yolo26n-pose)
   SMARTROOM_YOLO_DIR          dir holding <key>_openvino_model/ (default ~/Code/yolo-bench)
   SMARTROOM_DETECT_IMGSZ      inference size (default 640)
   SMARTROOM_DETECT_SAMPLE_FPS frames/sec to analyze (default 5)
@@ -50,7 +50,9 @@ def saved_root() -> Path:
 def model_specs():
     """(key, openvino_dir) for each configured model."""
     keys = os.environ.get(
-        "SMARTROOM_YOLO_MODELS", "yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose"
+        # Only the large detector for object detection (nano/small/medium dropped);
+        # the pose model stays (it's a separate skeleton task, not box detection).
+        "SMARTROOM_YOLO_MODELS", "yolo26l,yolo26n-pose"
     ).split(",")
     base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
     return [(k.strip(), base / f"{k.strip()}_openvino_model") for k in keys if k.strip()]
