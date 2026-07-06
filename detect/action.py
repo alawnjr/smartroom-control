@@ -75,6 +75,20 @@ OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.15"))
 #     absolute override is also accepted (SMARTROOM_ACTION_MIN_CONF).
 # Both are per-variant; the env vars, when set, override both variants.
 IDLE = "idle"
+# A person whose bounding box is flush against the frame edge is cut off, so their
+# skeleton is partial and the classifier would just guess. Label such windows
+# "not fully in frame" (not kept — no vote, no chip, no classifier call) instead.
+# A window is partial if the majority of its frames are truncated; a frame is
+# truncated if the box comes within EDGE_MARGIN px of any image border.
+PARTIAL = "not fully in frame"
+# Detected via keypoint visibility, NOT the bounding box: a box touching the frame
+# edge is too camera-dependent (this footage frames heads near the top, so 78% of
+# boxes touch a border even when the person is fully visible). When a person is
+# truly cut off, the off-frame joints come back with low confidence. So a frame is
+# "partial" if fewer than MIN_KEYPOINTS of the 17 COCO joints clear KP_CONF — which
+# leaves desk-occluded sitting people (legs missing but torso present) alone.
+KP_CONF = float(os.environ.get("SMARTROOM_ACTION_KP_CONF", "0.3"))
+MIN_KEYPOINTS = int(os.environ.get("SMARTROOM_ACTION_MIN_KEYPOINTS", "10"))
 # How many top classes to record per window for the live per-person bar graph.
 TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "5"))
 SCHEMA_VERSION = 2
@@ -288,6 +302,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     ev_idx = defaultdict(list)      # per track: classify frame indices (ascending)
     ev_lab = defaultdict(list)      # per track: predicted label at each event
     tubes = defaultdict(lambda: deque(maxlen=WINDOW))
+    trunc = defaultdict(lambda: deque(maxlen=WINDOW))  # per sample: too few keypoints visible?
     timeline = defaultdict(list)
     seen = []
     idx = 0
@@ -303,22 +318,35 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             for n, tid in enumerate(ids):
                 if idx % STRIDE == 0:
                     tubes[tid].append((xy[n], conf[n]))
+                    n_vis = int((conf[n] >= KP_CONF).sum())
+                    trunc[tid].append(n_vis < MIN_KEYPOINTS)
                 if len(tubes[tid]) >= MIN_WINDOW and idx % classify_every == 0:
-                    # Front-pad partial windows (repeat the earliest pose) so the
-                    # classifier always gets WINDOW frames and predictions can begin
-                    # before the window is naturally full.
-                    win = list(tubes[tid])
-                    if len(win) < WINDOW:
-                        win = [win[0]] * (WINDOW - len(win)) + win
-                    label, cf, top = classify(win)
+                    # Judge truncation on the recent samples (around the moment the
+                    # label describes), not the whole trailing window — scattered
+                    # single-frame keypoint dropouts shouldn't count, but a person
+                    # who's currently cut off should.
+                    recent = list(trunc[tid])[-MIN_WINDOW:]
+                    if recent and sum(recent) * 2 > len(recent):
+                        # Currently cut off — skeleton is partial, so don't classify;
+                        # mark the window "not fully in frame".
+                        label, cf, top, action_lab = None, 0.0, [], PARTIAL
+                    else:
+                        # Front-pad partial windows (repeat the earliest pose) so the
+                        # classifier always gets WINDOW frames and predictions can begin
+                        # before the window is naturally full.
+                        win = list(tubes[tid])
+                        if len(win) < WINDOW:
+                            win = [win[0]] * (WINDOW - len(win)) + win
+                        label, cf, top = classify(win)
+                        action_lab = label or IDLE
                     ev_idx[tid].append(idx)
-                    # overlay shows "idle" on abstention rather than a stale/guessed
-                    # label; the summary vote + chips only count confident windows.
-                    ev_lab[tid].append(label or IDLE)
+                    # overlay shows "idle"/"not fully in frame" rather than a stale or
+                    # guessed label; the summary vote + chips only count confident windows.
+                    ev_lab[tid].append(action_lab)
                     # Every window goes in the timeline (with its top-K for the live
                     # bar graph); `kept` marks the confident ones that vote + chip.
                     t = max(0.0, (idx - offset_frames) / native_fps)
-                    timeline[tid].append({"t": round(t, 3), "action": label or IDLE,
+                    timeline[tid].append({"t": round(t, 3), "action": action_lab,
                                           "conf": round(cf, 3), "kept": label is not None, "top": top})
                     if label is not None and label not in seen:
                         seen.append(label)
