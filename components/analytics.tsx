@@ -5,6 +5,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { LineChart, Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
 import { ClipAnalyticsDrawer } from "@/components/clip-analytics-drawer";
+import { GeometricPanel } from "@/components/geometric-page";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { tagClass } from "@/lib/action-colors";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
@@ -131,6 +132,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
   const [sel, setSel] = useState<string | null>(null);
   const model = sel && available.includes(sel) ? sel : (available[0] ?? "yolo26n");
+  const [view, setView] = useState<"models" | "geometric">("models");
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
   const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
@@ -139,6 +141,23 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
 
   return (
     <div>
+      {/* sub-view: model analysis vs. geometric (classifier-independent) events */}
+      <div className="mb-4 flex overflow-hidden rounded-xl border border-line w-fit">
+        {(["models", "geometric"] as const).map((vw) => (
+          <button
+            key={vw}
+            onClick={() => setView(vw)}
+            className={`px-3.5 py-1.5 text-sm font-bold ${view === vw ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
+          >
+            {vw === "models" ? "Models" : "Geometric"}
+          </button>
+        ))}
+      </div>
+
+      {view === "geometric" ? (
+        <GeometricPanel nodes={config} />
+      ) : (
+        <>
       {/* controls */}
       <div className="mb-4 flex flex-wrap items-center gap-3">
         {available.length > 0 && (
@@ -214,6 +233,8 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             </div>
           ))}
         </div>
+      )}
+        </>
       )}
     </div>
   );

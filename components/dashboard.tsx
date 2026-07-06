@@ -6,7 +6,6 @@ import { Download, Minus, Plus } from "lucide-react";
 
 import { ActionClassesPage } from "@/components/action-classes-page";
 import { Analytics } from "@/components/analytics";
-import { GeometricPage } from "@/components/geometric-page";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { CombinedStatus, DetectionSummary, NodeConfig, NodeStatus, SavedVideo } from "@/lib/types";
 
@@ -266,7 +265,7 @@ function roomName(idx: number) {
 export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
   const qc = useQueryClient();
   const [duration, setDuration] = useState(30);
-  const [tab, setTab] = useState<"live" | "analytics" | "classes" | "geometric">("live");
+  const [tab, setTab] = useState<"live" | "analytics" | "classes">("live");
   const [clock, setClock] = useState("");
   useEffect(() => {
     const tick = () => setClock(new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }));
@@ -326,7 +325,7 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
           </span>
           <span className="text-xl font-extrabold">Smartroom</span>
           <div className="ml-2 flex overflow-hidden rounded-full border border-line">
-            {(["live", "analytics", "classes", "geometric"] as const).map((t) => (
+            {(["live", "analytics", "classes"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
@@ -352,8 +351,6 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
         <Analytics nodes={config} />
       ) : tab === "classes" ? (
         <ActionClassesPage />
-      ) : tab === "geometric" ? (
-        <GeometricPage nodes={config} />
       ) : (
         <>
       {/* rooms + ready to roll */}

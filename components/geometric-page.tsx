@@ -19,7 +19,7 @@ function actionsPath(relPath: string, model: string) {
 
 // Geometric, classifier-independent motion events (currently jumps) detected from
 // the pose trajectory in detect/action.py. One card per clip that has any event.
-export function GeometricPage({ nodes: config }: { nodes: NodeConfig[] }) {
+export function GeometricPanel({ nodes: config }: { nodes: NodeConfig[] }) {
   const saved = useSaved();
   const videos = saved.data?.videos ?? [];
   const nameByNode = new Map(config.map((n) => [n.id, n.name]));
