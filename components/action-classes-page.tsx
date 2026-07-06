@@ -9,7 +9,7 @@ import { DATASETS } from "@/lib/action-classes";
 type Config = Record<string, { disabled?: string[]; stride?: number; samplesPerClassify?: number }>;
 
 const STRIDE_OPTS = [0, 1, 2, 3, 4]; // 0 = auto (fps-adaptive)
-const SPC_OPTS = [0, 1, 2, 4, 6]; // new samples between classifications; 0 = variant default
+const SPC_OPTS = [0, 1, 2, 4, 6, 12, 24]; // new samples between classifications; 0 = variant default
 
 // Browse the full label set each action model can emit, and toggle classes on/off.
 // Disabled classes are masked at inference (detect/action.py) so the model can
