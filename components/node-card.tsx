@@ -58,7 +58,9 @@ export function NodeCard({ node }: { node: NodeStatus }) {
           // eslint-disable-next-line @next/next/no-img-element
           <img
             key={streamKey}
-            src={`${base}/stream.mjpg`}
+            // cache-buster so an error-retry is a genuinely fresh request (a
+            // remount with an identical URL can stick on Chrome's cached error)
+            src={`${base}/stream.mjpg?k=${streamKey}`}
             alt={`${node.name} live`}
             className="h-full w-full object-contain"
             onError={() => setTimeout(() => setStreamKey((k) => k + 1), 1500)}
