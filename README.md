@@ -20,8 +20,10 @@ size — so re-running only fetches new recordings.
 ## Configure
 
 Nodes come from `SMARTROOM_NODES` in `.env.local` — comma-separated `id|name|host`
-triples (host = bare host or IP). Defaults to the two nodes by **IP** because
-`.local` mDNS from this laptop is intermittently flaky. See `.env.example`.
+triples (host = bare host or IP). Prefer **`.local` hostnames** so DHCP IP changes
+don't break the panel; this needs working IPv4 mDNS on the laptop (avahi-daemon
+running + `mdns4_minimal [NOTFOUND=return]` in `/etc/nsswitch.conf`'s `hosts:`
+line). Fall back to raw IPs if mDNS isn't set up. See `.env.example`.
 
 ## Run (dev)
 
