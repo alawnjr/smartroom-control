@@ -1,10 +1,10 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
+import { LineChart, Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
-import { ActionBars } from "@/components/action-bars";
+import { ClipAnalyticsDrawer } from "@/components/clip-analytics-drawer";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { tagClass } from "@/lib/action-colors";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
@@ -15,8 +15,6 @@ const MODEL_LABEL: Record<string, string> = {
   yolo26n: "nano", yolo26s: "small", yolo26m: "medium", yolo26l: "large",
   "yolo26n-pose": "pose", action: "actions (NTU)", "action-hmdb": "actions (HMDB)",
 };
-const SPEEDS = [0.25, 0.5, 1, 2];
-
 function fileUrl(relPath: string) {
   return `/api/saved/file?path=${encodeURIComponent(relPath)}`;
 }
@@ -36,49 +34,10 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
   const actionVariant = model === "action-hmdb" ? "hmdb" : "ntu";
   const hasOverlay = Boolean(d?.hasAnnotated && d.annotatedRelPath);
   const [overlay, setOverlay] = useState(true);
-  const [currentTime, setCurrentTime] = useState(0);
-  const [rate, setRate] = useState(1);
-  const videoRef = useRef<HTMLVideoElement>(null);
+  const [drawer, setDrawer] = useState(false);
   const showOverlay = overlay && hasOverlay;
   const src = showOverlay ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
   const analyzing = clipAnalyzing(v);
-
-  // While the clip plays, sample currentTime every animation frame so the live
-  // pie interpolates smoothly between windows (onTimeUpdate alone fires ~4x/sec).
-  useEffect(() => {
-    const v = videoRef.current;
-    if (!v || !isAction) return;
-    let raf = 0;
-    const tick = () => {
-      setCurrentTime(v.currentTime);
-      raf = requestAnimationFrame(tick);
-    };
-    const start = () => {
-      cancelAnimationFrame(raf);
-      raf = requestAnimationFrame(tick);
-    };
-    const stop = () => {
-      cancelAnimationFrame(raf);
-      setCurrentTime(v.currentTime);
-    };
-    v.addEventListener("playing", start);
-    v.addEventListener("pause", stop);
-    v.addEventListener("ended", stop);
-    v.addEventListener("seeked", stop);
-    if (!v.paused) start();
-    return () => {
-      cancelAnimationFrame(raf);
-      v.removeEventListener("playing", start);
-      v.removeEventListener("pause", stop);
-      v.removeEventListener("ended", stop);
-      v.removeEventListener("seeked", stop);
-    };
-  }, [isAction, src]);
-
-  // Apply the chosen playback speed (a fresh <video> on src change resets to 1x).
-  useEffect(() => {
-    if (videoRef.current) videoRef.current.playbackRate = rate;
-  }, [rate, src]);
 
   const reanalyze = useMutation({
     mutationFn: () =>
@@ -95,18 +54,14 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
           {roomName} <span className="font-mono text-xs font-normal text-muted">· {v.rec.split("_").pop()}</span>
         </div>
         <div className="flex items-center gap-2">
-          {d?.status === "done" && (
-            <div className="flex overflow-hidden rounded-lg border border-line text-[10px] font-bold" title="Playback speed">
-              {SPEEDS.map((r) => (
-                <button
-                  key={r}
-                  onClick={() => setRate(r)}
-                  className={`px-1.5 py-1 ${r === rate ? "bg-emerald-500 text-white" : "text-muted hover:bg-background"}`}
-                >
-                  {r}×
-                </button>
-              ))}
-            </div>
+          {isAction && d?.status === "done" && (
+            <button
+              onClick={() => setDrawer(true)}
+              title="Open live graphs"
+              className="flex items-center gap-1 rounded-lg border border-line px-2 py-1.5 text-[11px] font-bold text-muted hover:bg-background"
+            >
+              <LineChart className="size-3.5" /> Graphs
+            </button>
           )}
           <button
             onClick={() => reanalyze.mutate()}
@@ -122,15 +77,7 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
       <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-black">
         {d?.status === "done" ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <video
-            key={src}
-            ref={videoRef}
-            controls
-            preload="none"
-            className="h-full w-full object-contain"
-            src={src}
-            onTimeUpdate={(e) => setCurrentTime(e.currentTarget.currentTime)}
-          />
+          <video key={src} controls preload="none" className="h-full w-full object-contain" src={src} />
         ) : (
           <div className="flex h-full items-center justify-center text-xs text-neutral-400">
             {d?.status === "analyzing" ? "analyzing…" : d?.status === "error" ? "analysis failed" : "not analyzed"}
@@ -166,8 +113,8 @@ function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; ro
           )}
         </div>
       )}
-      {d?.status === "done" && isAction && (
-        <ActionBars relPath={v.relPath} model={model} currentTime={currentTime} actions={d.actions ?? []} />
+      {drawer && d && (
+        <ClipAnalyticsDrawer v={v} model={model} d={d} roomName={roomName} onClose={() => setDrawer(false)} />
       )}
     </div>
   );
