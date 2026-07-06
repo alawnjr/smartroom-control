@@ -9,8 +9,19 @@ type Timeline = { tracks: Record<string, Entry[]> };
 
 // Top-N classes get their own slice; everything else collapses into "other".
 const TOP_N = 3;
-const COLORS = ["#10b981", "#0ea5e9", "#a855f7"]; // emerald / sky / violet
 const OTHER_COLOR = "#d1d5db";
+// Stable palette — a category is hashed to a fixed color so the same action keeps
+// the same color across people, pies, and time (not reassigned by rank).
+const PALETTE = [
+  "#10b981", "#0ea5e9", "#a855f7", "#f59e0b", "#f43f5e", "#14b8a6",
+  "#6366f1", "#84cc16", "#d946ef", "#fb923c", "#06b6d4", "#ec4899",
+];
+function colorFor(label: string): string {
+  if (label === "other") return OTHER_COLOR;
+  let h = 0;
+  for (let i = 0; i < label.length; i++) h = (h * 31 + label.charCodeAt(i)) | 0;
+  return PALETTE[Math.abs(h) % PALETTE.length];
+}
 
 function actionsPath(relPath: string, model: string) {
   return relPath.replace(/\.mp4$/, `.actions.${model}.json`);
@@ -121,7 +132,7 @@ export function ActionBars({ relPath, model, currentTime }: { relPath: string; m
         const sumHead = head.reduce((s, [, p]) => s + p, 0);
         const other = Math.max(0, 1 - sumHead);
         const slices: Slice[] = [
-          ...head.map(([label, value], i) => ({ label, value, color: COLORS[i % COLORS.length] })),
+          ...head.map(([label, value]) => ({ label, value, color: colorFor(label) })),
           ...(other > 0.005 ? [{ label: "other", value: other, color: OTHER_COLOR }] : []),
         ];
 
