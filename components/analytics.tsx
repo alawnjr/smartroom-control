@@ -276,9 +276,21 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
     const id = `${activeSession.key}:${activeSlot}`;
     setTabSettings((t) => ({ ...t, [id]: { ...settingsFor(activeSession, activeSlot), ...patch } }));
   };
+  // Which action model a slot actually produced (prefer NTU). Slots >=2 hold ONLY
+  // action sidecars — detection models are shared/slot-1 — so viewing a slot means
+  // viewing its action result.
+  const slotActionModel = (s: Session, slot: number): string | undefined => {
+    const det = s.clips.map((c) => c.analyses?.[slot]?.detections).find(Boolean) ?? {};
+    return ["action", "action-hmdb"].find((m) => det[m]);
+  };
   const selectTab = (s: Session, slot: number) => {
     setSlotBySession((m) => ({ ...m, [s.key]: slot }));
     setActiveKey(s.key);
+    // A slot >=2 has no detection sidecars of its own, so if a shared detection
+    // model is selected the tab would show the (identical) shared result and the
+    // slot's action analysis would be invisible. Switch to its action model so the
+    // tab actually reflects what makes it distinct.
+    if (slot >= 2 && !isActionKey(model)) setSel(slotActionModel(s, slot) ?? "action");
   };
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
@@ -303,6 +315,9 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
       pingSavedSoon(qc);
       if (r.slot) setSlotBySession((m) => ({ ...m, [r.key]: r.slot! }));
       setActiveKey(r.key);
+      // Show the action model we're generating (slots produce action results only),
+      // so the new tab reflects the analysis instead of the shared detection view.
+      if (!isActionKey(model)) setSel(variant === "hmdb" ? "action-hmdb" : "action");
     },
   });
   const del = useMutation({
