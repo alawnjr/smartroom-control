@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef } from "react";
+import { useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ArrowUp, PersonStanding } from "lucide-react";
 
@@ -96,7 +96,10 @@ function JumpCard({
   roomName: string;
 }) {
   const videoRef = useRef<HTMLVideoElement>(null);
-  const src = d.hasAnnotated && d.annotatedRelPath ? fileUrl(d.annotatedRelPath) : fileUrl(v.relPath);
+  const [now, setNow] = useState(0);
+  // Always the RAW clip — geometric events are independent of the classifier, so
+  // we don't show the action-model's annotated video here.
+  const src = fileUrl(v.relPath);
 
   const { data } = useQuery({
     queryKey: ["jumps", v.relPath, model],
@@ -113,6 +116,8 @@ function JumpCard({
   const events = Object.entries(data?.jumps ?? {})
     .flatMap(([id, evs]) => evs.map((e) => ({ id, ...e })))
     .sort((a, b) => a.start - b.start);
+
+  const airborne = events.find((e) => now >= e.start && now <= e.end);
 
   const seek = (t: number) => {
     const el = videoRef.current;
@@ -132,9 +137,21 @@ function JumpCard({
         </span>
       </div>
 
-      <div className="aspect-video w-full overflow-hidden rounded-xl bg-black">
+      <div className="relative aspect-video w-full overflow-hidden rounded-xl bg-black">
         {/* eslint-disable-next-line @next/next/no-img-element */}
-        <video ref={videoRef} controls preload="metadata" className="h-full w-full object-contain" src={src} />
+        <video
+          ref={videoRef}
+          controls
+          preload="metadata"
+          className="h-full w-full object-contain"
+          src={src}
+          onTimeUpdate={(e) => setNow(e.currentTarget.currentTime)}
+        />
+        {airborne && (
+          <span className="absolute left-2 top-2 flex items-center gap-1 rounded-md bg-amber-400 px-1.5 py-0.5 text-[11px] font-extrabold text-amber-950">
+            <ArrowUp className="size-3" /> JUMP · #{airborne.id}
+          </span>
+        )}
       </div>
 
       <div className="mt-2 flex flex-col gap-1">
