@@ -10,9 +10,13 @@ function mb(bytes: number) {
   return (bytes / 1e6).toFixed(bytes >= 1e7 ? 0 : 1);
 }
 
-function triggerDetect() {
+function triggerDetect(body?: { force?: boolean }) {
   // fire-and-forget; the gallery's analyzing-poll surfaces progress
-  return fetch("/api/detect", { method: "POST" }).catch(() => {});
+  return fetch("/api/detect", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body ?? {}),
+  }).catch(() => {});
 }
 
 export function SaveBar() {
@@ -28,7 +32,7 @@ export function SaveBar() {
     },
   });
   const analyze = useMutation({
-    mutationFn: triggerDetect,
+    mutationFn: () => triggerDetect({ force: true }), // re-run all clips
     onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
   });
   const data = save.data;
