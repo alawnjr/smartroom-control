@@ -22,6 +22,10 @@ export function ActionClassesPage() {
       const res = await fetch("/api/action-classes", { cache: "no-store" });
       return res.ok ? res.json() : {};
     },
+    // Load once; the cache is the source of truth between saves (we update it
+    // optimistically), so we don't refetch and clobber an in-flight toggle.
+    staleTime: Infinity,
+    refetchOnWindowFocus: false,
   });
 
   return (
@@ -67,24 +71,33 @@ function DatasetCard({
   const disabledSet = useMemo(() => new Set(disabled), [disabled]);
 
   // Persist the new disabled list for this variant, optimistically updating cache.
+  // We do NOT refetch on success — the optimistic cache is authoritative and a
+  // refetch could revert an in-flight toggle. On error we roll back to the server.
   const save = useMutation({
-    mutationFn: (next: string[]) =>
-      fetch("/api/action-classes", {
+    mutationFn: async (next: string[]) => {
+      const res = await fetch("/api/action-classes", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({ variant: ds.key, disabled: next }),
-      }),
+      });
+      if (!res.ok) throw new Error(`save failed (${res.status})`);
+      return next;
+    },
     onMutate: (next: string[]) => {
       qc.setQueryData<Config>(["action-classes"], (old) => ({
         ...(old ?? {}),
         [ds.key]: { disabled: next },
       }));
     },
-    onSettled: () => qc.invalidateQueries({ queryKey: ["action-classes"] }),
+    onError: () => qc.invalidateQueries({ queryKey: ["action-classes"] }),
   });
 
+  // Read the freshest disabled list from the cache at click time (not the
+  // render-time prop) so rapid toggles don't overwrite each other.
+  const current = () =>
+    new Set(qc.getQueryData<Config>(["action-classes"])?.[ds.key]?.disabled ?? disabled);
   const toggle = (name: string) => {
-    const next = new Set(disabledSet);
+    const next = current();
     if (next.has(name)) next.delete(name);
     else next.add(name);
     save.mutate([...next]);
