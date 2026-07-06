@@ -420,6 +420,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     trunc = defaultdict(lambda: deque(maxlen=WINDOW))  # per sample: too few keypoints visible?
     traj = defaultdict(list)        # per track: (idx, kpts, conf) every frame, for jump detection
     timeline = defaultdict(list)
+    win_pose = defaultdict(list)    # per track: one [[x,y,c]*17] pose per classified window (aligned with timeline)
+    centroids = defaultdict(list)   # per track: per-frame bbox centroid {t,x,y} (location tracking sidecar)
     seen = []
     idx = 0
     for r in pose.track(str(mp4), stream=True, persist=True, classes=[0], device="cpu", verbose=False):
@@ -433,6 +435,9 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
             for n, tid in enumerate(ids):
                 traj[tid].append((idx, xy[n], conf[n]))  # every frame (full vertical resolution)
+                centroids[tid].append({"t": round(idx / native_fps, 3),
+                                       "x": round((xyxy[n][0] + xyxy[n][2]) / 2.0, 1),
+                                       "y": round((xyxy[n][1] + xyxy[n][3]) / 2.0, 1)})
                 if idx % stride == 0:
                     tubes[tid].append((xy[n], conf[n]))
                     n_vis = int((conf[n] >= KP_CONF).sum())
@@ -465,6 +470,10 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
                     t = max(0.0, (idx - offset_frames) / native_fps)
                     timeline[tid].append({"t": round(t, 3), "action": action_lab,
                                           "conf": round(cf, 3), "kept": label is not None, "top": top})
+                    # One pose per classified window (current frame's keypoints), aligned 1:1
+                    # with the timeline entry above -> feeds the per-person sidecar.
+                    win_pose[tid].append([[round(float(xy[n][j][0]), 1), round(float(xy[n][j][1]), 1),
+                                           round(float(conf[n][j]), 3)] for j in range(len(xy[n]))])
                     if label is not None and label not in seen:
                         seen.append(label)
                 x1, y1 = max(0, xyxy[n][0]), max(0, xyxy[n][1])
@@ -541,6 +550,45 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
                                       "nativeFps": round(native_fps, 3), "window": WINDOW, "stride": stride,
                                       "tracks": {str(t): timeline[t] for t in timeline},
                                       "jumps": jumps_sec})
+
+    # Per-person sidecar (real_dataset-style): for each track, the classification as
+    # both per-window rows (pose + label, one per classified window) and merged
+    # from->to segments, plus the geometric jump events. Centroid/location tracking
+    # is kept in a *separate* file (camera_main.centroids.<model>.json) below.
+    def _segments(tl):
+        # Collapse consecutive equal-label windows into {action,start,end,conf} ranges.
+        segs = []
+        for p in tl:
+            if segs and segs[-1]["action"] == p["action"]:
+                segs[-1]["end"] = p["t"]
+                segs[-1]["_c"].append(p["conf"])
+            else:
+                segs.append({"action": p["action"], "start": p["t"], "end": p["t"], "_c": [p["conf"]]})
+        for s in segs:
+            c = s.pop("_c")
+            s["conf"] = round(sum(c) / len(c), 3)
+        return segs
+
+    persons = {}
+    for tid in timeline:
+        windows = [{"t": p["t"], "action": p["action"], "conf": p["conf"],
+                    "kept": p["kept"], "keypoints": kp}
+                   for p, kp in zip(timeline[tid], win_pose[tid])]
+        persons[str(tid)] = {"segments": _segments(timeline[tid]),
+                             "jumps": jumps_sec.get(str(tid), []),
+                             "windows": windows}
+    persons_path = mp4.with_name(f"{mp4.stem}.persons.{key}.json")
+    _atomic_write_json(persons_path, {
+        "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
+        "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
+        "window": WINDOW, "stride": stride, "persons": persons})
+
+    # Location/centroid tracking — its own file (per-frame bbox centroid per person).
+    centroids_path = mp4.with_name(f"{mp4.stem}.centroids.{key}.json")
+    _atomic_write_json(centroids_path, {
+        "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
+        "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
+        "persons": {str(t): centroids[t] for t in centroids}})
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
