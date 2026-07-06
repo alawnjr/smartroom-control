@@ -127,6 +127,51 @@ function RoomCard({ node, idx, onWake }: { node: NodeStatus; idx: number; onWake
 }
 
 // ---------- ready to roll ----------
+type RunStat = {
+  kind: string;
+  label: string;
+  finishedAt: string;
+  elapsedSec: number;
+  processed: number;
+  errors?: number;
+  perClipSec?: number | null;
+};
+
+function fmtDur(s: number) {
+  if (s < 60) return `${Math.round(s)}s`;
+  const m = Math.floor(s / 60);
+  return `${m}m${Math.round(s % 60).toString().padStart(2, "0")}s`;
+}
+
+// Last-run stats for each analysis kind (detect / NTU / HMDB), shown in the sidebar.
+function AnalyzeStats() {
+  const { data } = useQuery({
+    queryKey: ["analyze-stats"],
+    queryFn: async () =>
+      (await fetch("/api/analyze-stats", { cache: "no-store" })).json() as Promise<{ runs: RunStat[] }>,
+    refetchInterval: 8000,
+  });
+  const runs = data?.runs ?? [];
+  if (runs.length === 0) return null;
+  return (
+    <div className="mt-4 border-t border-line pt-3">
+      <div className="text-xs font-bold text-muted">Last analysis runs</div>
+      <div className="mt-1.5 flex flex-col gap-1.5">
+        {runs.map((r) => (
+          <div key={r.kind} className="flex items-center justify-between gap-2 text-xs">
+            <span className="font-bold">{r.label}</span>
+            <span className="text-right font-mono text-[11px] text-muted">
+              {r.processed} clip{r.processed === 1 ? "" : "s"} · {fmtDur(r.elapsedSec)}
+              {r.perClipSec ? ` · ${fmtDur(r.perClipSec)}/clip` : ""}
+              {r.errors ? ` · ${r.errors} err` : ""}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ReadyToRoll({
   duration,
   setDuration,
@@ -184,6 +229,7 @@ function ReadyToRoll({
       >
         <Download className="size-4" /> Beam to laptop
       </button>
+      <AnalyzeStats />
     </div>
   );
 }
