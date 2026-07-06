@@ -371,7 +371,10 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
                   else clipPaths.forEach((r) => next.add(r));
                   return next;
                 });
-              const summary = s.clips.map((c) => c.detections?.[model]).find((d) => d?.status === "done");
+              // Prefer a camera whose sidecar actually carries the settings (older
+              // runs predate the fields), so a mixed old/new pair still shows the chip.
+              const dets = s.clips.map((c) => c.detections?.[model]).filter((d) => d?.status === "done");
+              const summary = dets.find((d) => d?.stride != null) ?? dets[0];
               return (
                 <div key={s.key}>
                   <SessionHeader session={s} allSelected={allSel} onToggle={toggleSession} model={model} summary={summary} />
