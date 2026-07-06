@@ -1,6 +1,5 @@
 import { createWriteStream } from "node:fs";
 import { mkdir, stat } from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -15,13 +14,11 @@ export const dynamic = "force-dynamic";
 
 type Video = { token: string; size: number; download: string };
 
-// Where downloaded videos land on this laptop. Mirrors each node's dataset tree
-// under <saveRoot>/<nodeId>/. Override with SMARTROOM_SAVE_DIR.
+// Where downloaded videos land: a gitignored `recordings/` folder inside the
+// project (process.cwd() is the project root under `next start`). Mirrors each
+// node's dataset tree under <saveRoot>/<nodeId>/. Override with SMARTROOM_SAVE_DIR.
 function saveRoot() {
-  return (
-    process.env.SMARTROOM_SAVE_DIR ||
-    path.join(os.homedir(), "Videos", "Smartroom Recordings")
-  );
+  return process.env.SMARTROOM_SAVE_DIR || path.join(process.cwd(), "recordings");
 }
 
 // Download every recording from one node into <root>/<nodeId>/<relative path>,
