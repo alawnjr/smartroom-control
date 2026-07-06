@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { NextResponse } from "next/server";
 
-import { readDetections } from "@/lib/detections";
+import { readDetections, readSlotAnalyses } from "@/lib/detections";
 import { savedRoot } from "@/lib/recordings";
 import type { SavedVideo } from "@/lib/types";
 
@@ -47,6 +47,7 @@ export async function GET() {
       // ignore unreadable file
     }
     const detections = await readDetections(abs);
+    const analyses = await readSlotAnalyses(abs);
     videos.push({
       node: (si >= 0 ? parts[si + 1] : "") ?? "",
       day: parts[0] ?? "",
@@ -56,6 +57,7 @@ export async function GET() {
       size,
       mtime,
       detections,
+      analyses,
     });
   }
   videos.sort((a, b) => b.mtime - a.mtime);

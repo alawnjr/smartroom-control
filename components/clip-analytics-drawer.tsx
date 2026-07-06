@@ -140,7 +140,7 @@ export function ClipAnalyticsDrawer({
           </div>
         )}
 
-        <ActionBars relPath={v.relPath} model={model} currentTime={currentTime} actions={d.actions ?? []} />
+        <ActionBars relPath={v.relPath} model={model} actionsRelPath={d.actionsRelPath} currentTime={currentTime} actions={d.actions ?? []} />
       </div>
     </div>
   );

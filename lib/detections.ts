@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { savedRoot } from "@/lib/recordings";
-import type { DetectionSummary } from "@/lib/types";
+import type { DetectionSummary, SlotAnalysis } from "@/lib/types";
 
 // On cancel, remove stuck "analyzing" sidecars (so the UI clears) and any leftover
 // transcode temp files. Returns how many analyzing markers were cleared.
@@ -54,7 +54,9 @@ function annotatedName(absMp4: string, model: string) {
   return `${stem}.annotated.${model}.mp4`;
 }
 
-async function readOne(jsonPath: string, absMp4: string, model: string): Promise<DetectionSummary> {
+// outDir is where the sidecars + annotated live — the clip dir for slot 1, or an
+// analysis_<N>/ subfolder for a slot. Staleness is always measured vs the source mp4.
+async function readOne(jsonPath: string, absMp4: string, model: string, outDir: string): Promise<DetectionSummary> {
   try {
     const raw = JSON.parse(await readFile(jsonPath, "utf8"));
     const status = raw.status as DetectionSummary["status"];
@@ -72,7 +74,7 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
     let hasAnnotated = false;
     let annotatedRelPath: string | undefined;
     if (raw.hasAnnotated) {
-      const annotated = path.join(path.dirname(absMp4), annotatedName(absMp4, model));
+      const annotated = path.join(outDir, annotatedName(absMp4, model));
       try {
         statSync(annotated);
         hasAnnotated = true;
@@ -80,6 +82,13 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
       } catch {
         hasAnnotated = false;
       }
+    }
+    // Action models also have an .actions.<model>.json sidecar (per-person timeline +
+    // jumps); expose its relpath so the frontend doesn't string-build slot paths.
+    let actionsRelPath: string | undefined;
+    if (model.startsWith("action")) {
+      const stem = path.basename(absMp4, path.extname(absMp4));
+      actionsRelPath = path.relative(savedRoot(), path.join(outDir, `${stem}.actions.${model}.json`));
     }
     return {
       model,
@@ -91,6 +100,7 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
       timeline: raw.timeline,
       hasAnnotated,
       annotatedRelPath,
+      actionsRelPath,
       tracks: raw.tracks,
       actions: raw.actions,
       trackActions: raw.trackActions,
@@ -101,9 +111,11 @@ async function readOne(jsonPath: string, absMp4: string, model: string): Promise
   }
 }
 
-// All models' summaries for a clip, keyed by model. Empty object if none.
-export async function readDetections(absMp4: string): Promise<Record<string, DetectionSummary>> {
-  const dir = path.dirname(absMp4);
+// Scan one directory for <stem>.detections.<model>.json sidecars, keyed by model.
+async function readDetectionsInDir(
+  dir: string,
+  absMp4: string,
+): Promise<Record<string, DetectionSummary>> {
   const prefix = detectionsPrefix(absMp4);
   let names: string[] = [];
   try {
@@ -116,7 +128,39 @@ export async function readDetections(absMp4: string): Promise<Record<string, Det
     if (!name.startsWith(prefix) || !name.endsWith(".json")) continue;
     const model = name.slice(prefix.length, -".json".length);
     if (!model) continue;
-    out[model] = await readOne(path.join(dir, name), absMp4, model);
+    out[model] = await readOne(path.join(dir, name), absMp4, model, dir);
+  }
+  return out;
+}
+
+// All models' summaries for a clip (slot 1 / in-place), keyed by model.
+export async function readDetections(absMp4: string): Promise<Record<string, DetectionSummary>> {
+  return readDetectionsInDir(path.dirname(absMp4), absMp4);
+}
+
+// Extra analysis slots for a clip: each analysis_<N>/ subfolder, keyed by slot
+// number. Holds only the action sidecars produced in that slot + its config.json.
+export async function readSlotAnalyses(absMp4: string): Promise<Record<number, SlotAnalysis>> {
+  const dir = path.dirname(absMp4);
+  let entries;
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return {};
+  }
+  const out: Record<number, SlotAnalysis> = {};
+  for (const e of entries) {
+    const m = e.isDirectory() && /^analysis_(\d+)$/.exec(e.name);
+    if (!m) continue;
+    const slot = parseInt(m[1], 10);
+    const slotDir = path.join(dir, e.name);
+    let config: SlotAnalysis["config"];
+    try {
+      config = JSON.parse(readFileSync(path.join(slotDir, "config.json"), "utf8"));
+    } catch {
+      /* no config */
+    }
+    out[slot] = { slot, config, detections: await readDetectionsInDir(slotDir, absMp4) };
   }
   return out;
 }

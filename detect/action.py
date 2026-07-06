@@ -346,11 +346,23 @@ def _true_fps(mp4: Path) -> float | None:
     return None
 
 
-def sidecars(mp4: Path, key: str):
+def slot_dir(mp4: Path, slot: int) -> Path:
+    # Slot 1 = the original, in-place next to the clip. Slots >=2 live in a
+    # per-clip analysis_<N>/ subfolder so re-analyses with different settings are
+    # saved alongside (not over) the original.
+    if slot <= 1:
+        return mp4.parent
+    d = mp4.parent / f"analysis_{slot}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def sidecars(mp4: Path, key: str, slot: int = 1):
+    d = slot_dir(mp4, slot)
     s = mp4.stem
-    return (mp4.with_name(f"{s}.detections.{key}.json"),
-            mp4.with_name(f"{s}.actions.{key}.json"),
-            mp4.with_name(f"{s}.annotated.{key}.mp4"))
+    return (d / f"{s}.detections.{key}.json",
+            d / f"{s}.actions.{key}.json",
+            d / f"{s}.annotated.{key}.mp4")
 
 
 def _atomic_write_json(path: Path, data: dict):
@@ -377,10 +389,10 @@ def write_run_stats(root: Path, kind: str, label: str, started, processed: int, 
         pass
 
 
-def needs_action(mp4: Path, force: bool, key: str) -> bool:
+def needs_action(mp4: Path, force: bool, key: str, slot: int = 1) -> bool:
     if force:
         return True
-    json_path, _, annotated = sidecars(mp4, key)
+    json_path, _, annotated = sidecars(mp4, key, slot)
     if not json_path.exists() or not annotated.exists():
         return True
     try:
@@ -392,14 +404,15 @@ def needs_action(mp4: Path, force: bool, key: str) -> bool:
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
 
 
-def process_clip(model, infer, pose, mp4: Path, variant: dict):
+def process_clip(model, infer, pose, mp4: Path, variant: dict, slot: int = 1):
     import cv2
     import numpy as np
 
     key, class_names = variant["key"], variant["labels"]
     temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
     disabled_idx = load_disabled(key, class_names)
-    json_path, actions_path, annotated_path = sidecars(mp4, key)
+    json_path, actions_path, annotated_path = sidecars(mp4, key, slot)
+    out_dir = slot_dir(mp4, slot)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
                                    "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
@@ -621,14 +634,14 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         persons[str(tid)] = {"segments": _segments(timeline[tid]),
                              "jumps": jumps_sec.get(str(tid), []),
                              "windows": windows}
-    persons_path = mp4.with_name(f"{mp4.stem}.persons.{key}.json")
+    persons_path = out_dir / f"{mp4.stem}.persons.{key}.json"
     _atomic_write_json(persons_path, {
         "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
         "window": WINDOW, "stride": stride, "persons": persons})
 
     # Location/centroid tracking — its own file (per-frame bbox centroid per person).
-    centroids_path = mp4.with_name(f"{mp4.stem}.centroids.{key}.json")
+    centroids_path = out_dir / f"{mp4.stem}.centroids.{key}.json"
     _atomic_write_json(centroids_path, {
         "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
@@ -650,13 +663,19 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
 def main():
     ap = argparse.ArgumentParser(description="Per-person skeleton action recognition over saved clips.")
     ap.add_argument("--path", help="single clip, relative to the recordings root")
-    ap.add_argument("--variant", choices=list(VARIANTS), default="ntu",
-                    help="action model: ntu (ST-GCN++/NTU-60, default) or hmdb (PoseC3D/HMDB51)")
+    ap.add_argument("--session", help="a recording dir (e.g. day_X/rec_Y) — process every clip under it")
+    ap.add_argument("--variant", default="ntu",
+                    help="action model(s), comma-separated: ntu (ST-GCN++/NTU-60), hmdb (PoseC3D/HMDB51)")
+    ap.add_argument("--slot", type=int, default=1,
+                    help="analysis slot: 1 = in-place original, >=2 = analysis_<N>/ subfolder")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
-    variant = VARIANTS[args.variant]
-    key = variant["key"]
+    variant_keys = [v.strip() for v in args.variant.split(",") if v.strip() in VARIANTS]
+    if not variant_keys:
+        print(f"no valid --variant in {args.variant!r}", file=sys.stderr)
+        return 2
+    slot = max(1, args.slot)
     root = saved_root()
     if not root.exists():
         print(f"no recordings dir: {root}", file=sys.stderr)
@@ -679,43 +698,54 @@ def main():
         pass
 
     try:
-        clips = ([root / args.path] if args.path
-                 else sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True))
+        if args.path:
+            clips = [root / args.path]
+        elif args.session:
+            clips = sorted((root / args.session).rglob("camera_main.mp4"), key=lambda p: str(p))
+        else:
+            clips = sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         clips = [c for c in clips if c.exists()]
-        todo = [c for c in clips if needs_action(c, args.force, key)]
-        print(f"action[{args.variant}]: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
-        if not todo:
-            return 0
 
         from mmaction.apis import inference_skeleton, init_recognizer
         from ultralytics import YOLO
-        model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
-        pose = YOLO(str(pose_weights()))
+        pose = YOLO(str(pose_weights()))  # shared across variants
 
-        label = f"Actions ({'HMDB' if args.variant == 'hmdb' else 'NTU'})"
-        started = dt.datetime.now(dt.timezone.utc)
-        processed = errors = 0
-        for mp4 in todo:
-            try:
-                print(f"action[{args.variant}]: processing {mp4.relative_to(root)}", file=sys.stderr)
-                process_clip(model, inference_skeleton, pose, mp4, variant)
-                processed += 1
-            except Exception as error:  # noqa: BLE001
-                errors += 1
-                print(f"  action error: {error}", file=sys.stderr)
-                jp, _, _ = sidecars(mp4, key)
+        # One process handles every requested variant (the global lock serializes
+        # action runs, so a slot must do all its variants here rather than spawn each).
+        for vkey in variant_keys:
+            variant = VARIANTS[vkey]
+            key = variant["key"]
+            todo = [c for c in clips if needs_action(c, args.force, key, slot)]
+            tag = f"action[{vkey}{'' if slot == 1 else f' slot{slot}'}]"
+            print(f"{tag}: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
+            if not todo:
+                continue
+            model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
+            label = f"Actions ({'HMDB' if vkey == 'hmdb' else 'NTU'})" + ("" if slot == 1 else f" · slot {slot}")
+            stat_kind = key if slot == 1 else f"{key}.slot{slot}"
+            started = dt.datetime.now(dt.timezone.utc)
+            processed = errors = 0
+            for mp4 in todo:
                 try:
-                    _atomic_write_json(jp, {"schemaVersion": SCHEMA_VERSION, "status": "error",
-                                            "model": key, "error": str(error), "source": mp4.name,
-                                            "sourceMtimeMs": mp4.stat().st_mtime * 1000})
-                except Exception:
-                    pass
-            finally:
-                # Release this clip's frame buffers before the next one. CPU torch
-                # holds onto allocations, so without this a long batch grows until
-                # the OOM killer stops it a couple of clips in.
-                gc.collect()
-        write_run_stats(root, key, label, started, processed, errors, len(clips) - len(todo))
+                    print(f"{tag}: processing {mp4.relative_to(root)}", file=sys.stderr)
+                    process_clip(model, inference_skeleton, pose, mp4, variant, slot)
+                    processed += 1
+                except Exception as error:  # noqa: BLE001
+                    errors += 1
+                    print(f"  action error: {error}", file=sys.stderr)
+                    jp, _, _ = sidecars(mp4, key, slot)
+                    try:
+                        _atomic_write_json(jp, {"schemaVersion": SCHEMA_VERSION, "status": "error",
+                                                "model": key, "error": str(error), "source": mp4.name,
+                                                "sourceMtimeMs": mp4.stat().st_mtime * 1000})
+                    except Exception:
+                        pass
+                finally:
+                    # Release this clip's frame buffers before the next one. CPU torch
+                    # holds onto allocations, so without this a long batch grows until
+                    # the OOM killer stops it a couple of clips in.
+                    gc.collect()
+            write_run_stats(root, stat_kind, label, started, processed, errors, len(clips) - len(todo))
         return 0
     finally:
         try:

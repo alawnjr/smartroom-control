@@ -39,8 +39,13 @@ function forwardedEnv(): string[] {
 // Launch a long-running batch (detect.py / action.py) so it survives restarts of
 // this web server. `logName` is a file under the recordings root that captures
 // the batch's stdout+stderr for diagnosis (e.g. ".action.log").
-export function spawnBatch(python: string, args: string[], opts: { logName: string; cwd: string }) {
+export function spawnBatch(
+  python: string,
+  args: string[],
+  opts: { logName: string; cwd: string; extraEnv?: Record<string, string> }
+) {
   const logPath = path.join(savedRoot(), opts.logName);
+  const extraEnv = opts.extraEnv ?? {};
 
   if (systemdRunAvailable()) {
     const unit = `smartroom-${opts.logName.replace(/[^a-z0-9]+/gi, "")}-${Date.now()}`;
@@ -52,6 +57,7 @@ export function spawnBatch(python: string, args: string[], opts: { logName: stri
       "--description=smartroom analysis batch",
       `--working-directory=${opts.cwd}`,
       ...forwardedEnv(),
+      ...Object.entries(extraEnv).flatMap(([k, v]) => ["--setenv", `${k}=${v}`]),
       `--property=StandardOutput=append:${logPath}`,
       `--property=StandardError=append:${logPath}`,
       "--",
@@ -74,7 +80,7 @@ export function spawnBatch(python: string, args: string[], opts: { logName: stri
     cwd: opts.cwd,
     detached: true,
     stdio: ["ignore", fd, fd],
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
   });
   child.unref();
   return { isolated: false as const, unit: null };

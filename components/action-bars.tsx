@@ -143,15 +143,17 @@ function ActionLines({ entries, actions, currentTime }: { entries: Entry[]; acti
 export function ActionBars({
   relPath,
   model,
+  actionsRelPath,
   currentTime,
   actions,
 }: {
   relPath: string;
   model: string;
+  actionsRelPath?: string; // server-computed (slot-aware); falls back to the in-place sibling
   currentTime: number;
   actions: string[];
 }) {
-  const path = actionsPath(relPath, model);
+  const path = actionsRelPath ?? actionsPath(relPath, model);
   const { data } = useQuery({
     queryKey: ["action-timeline", path],
     queryFn: async (): Promise<Timeline | null> => {
