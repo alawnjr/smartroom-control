@@ -1,14 +1,11 @@
 # smartroom-control
 
-A laptop control panel for the two Smartroom camera Pis. Shows both live MJPEG
-feeds and starts/stops a recording on **both nodes with one button**.
+A laptop control panel for the two Smartroom camera Pis. Starts/stops a recording
+on **both nodes with one button** and shows each node's live status.
 
 It talks to each Pi's `smartroom_video_page.py` server (`:8000`): control calls
 (`/record`, `/record/cancel`, `/record/status`) are proxied through this app's
-own `app/api/*` routes server-side (the Pi sets no CORS headers), while the live
-video loads directly via `<img>` (CORS-exempt). While a node is recording its
-`/stream.mjpg` returns 503, so each tile swaps to the recorder's `/preview.jpg`
-still until the recording ends.
+own `app/api/*` routes server-side (the Pi sets no CORS headers).
 
 > "Record All" fires both POSTs in one tick to minimize start skew, but the
 > clap-at-t0 marker is still the fine-sync mechanism — don't treat the two
