@@ -148,7 +148,7 @@ export function ActionBars({
 }: {
   relPath: string;
   model: string;
-  actionsRelPath?: string; // server-computed (slot-aware); falls back to the in-place sibling
+  actionsRelPath?: string; // server-computed; falls back to the in-place sibling
   version?: number; // sidecar mtime — cache-buster so a re-run refetches instead of serving the cached copy
   currentTime: number;
   actions: string[];

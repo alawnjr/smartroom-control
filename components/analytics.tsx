@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, LineChart, Loader2, Plus, RefreshCw, ScanEye, Trash2, Video, X } from "lucide-react";
+import { Download, LineChart, Loader2, RefreshCw, ScanEye, Video, X } from "lucide-react";
 
 import { ClipAnalyticsDrawer } from "@/components/clip-analytics-drawer";
 import { GeometricPanel } from "@/components/geometric-page";
@@ -23,7 +23,6 @@ const POSE_OPTS = [
   { val: "rtmpose", label: "RTM" },
 ] as const;
 type PoseSource = (typeof POSE_OPTS)[number]["val"];
-type TabSettings = { stride: number; spc: number; poseSource: PoseSource };
 const isActionKey = (m: string) => m.startsWith("action");
 
 function fileUrl(relPath: string, version?: number) {
@@ -38,16 +37,12 @@ function post(url: string, body?: unknown) {
   }).catch(() => {});
 }
 
-// The detections map for a given slot: shared object-detection lives in v.detections
-// always; action keys come from v.detections (slot 1) or the slot's analysis bundle.
-function detForModel(v: SavedVideo, model: string, slot: number) {
-  if (!isActionKey(model)) return v.detections?.[model];
-  return slot <= 1 ? v.detections?.[model] : v.analyses?.[slot]?.detections?.[model];
-}
-
-function AnalysisCard({ v, model, slot, settings, roomName }: { v: SavedVideo; model: string; slot: number; settings: TabSettings; roomName: string }) {
+// One clip's card for the selected model. Object-detection and action results all
+// live in-place next to the clip (v.detections[model]); re-analysis reruns the
+// current model on this clip with the global settings shown in the bar above.
+function AnalysisCard({ v, model, roomName }: { v: SavedVideo; model: string; roomName: string }) {
   const qc = useQueryClient();
-  const d = detForModel(v, model, slot);
+  const d = v.detections?.[model];
   const isPose = model.includes("pose");
   const isAction = isActionKey(model);
   const actionVariant = model === "action-hmdb" ? "hmdb" : "ntu";
@@ -59,28 +54,10 @@ function AnalysisCard({ v, model, slot, settings, roomName }: { v: SavedVideo; m
   const analyzing = clipAnalyzing(v);
 
   const reanalyze = useMutation({
-    mutationFn: () => {
-      // Re-run THIS tab. Slots >=2 always re-run that slot's action analysis
-      // (even when viewing the shared detection model), so ↻ never falls back to
-      // slot 1 / shared detection just because a detection model is selected.
-      // Use the settings CURRENTLY shown in the bar (not the slot's stale saved
-      // config) so editing stride/spc then hitting ↻ actually takes effect.
-      if (slot >= 2) {
-        const cfg = v.analyses?.[slot]?.config;
-        return post("/api/analysis-slots", {
-          day: v.day, rec: v.rec, slot,
-          settings: { stride: settings.stride, samplesPerClassify: settings.spc, poseSource: settings.poseSource },
-          variants: cfg?.variants ?? [actionVariant],
-          disabled: {
-            action: (cfg?.action as { disabled?: string[] })?.disabled ?? [],
-            "action-hmdb": (cfg?.["action-hmdb"] as { disabled?: string[] })?.disabled ?? [],
-          },
-        });
-      }
-      // Slot 1 (original / shared): re-run the current model in place.
-      if (!isAction) return post("/api/detect", { relPath: v.relPath, force: true });
-      return post("/api/action", { relPath: v.relPath, force: true, variant: actionVariant });
-    },
+    mutationFn: () =>
+      isAction
+        ? post("/api/action", { relPath: v.relPath, force: true, variant: actionVariant })
+        : post("/api/detect", { relPath: v.relPath, force: true }),
     onSuccess: () => pingSavedSoon(qc),
   });
 
@@ -188,59 +165,18 @@ function PoseOpt({ on, set }: { on: PoseSource; set: (p: PoseSource) => void }) 
   );
 }
 
-// One recording's row: numbered slot tabs (sequential ordinals) + New analysis +
-// Download. Presentational — selection/create/delete are handled by Analytics so
-// the top settings bar can bind to whichever tab is active.
-function SlotTabs({
-  session, selected, active, variant, onSelect, onCreate, onDelete, creating, deleting,
-}: {
-  session: Session;
-  selected: number;
-  active: boolean;
-  variant: string;
-  onSelect: (slot: number) => void;
-  onCreate: () => void;
-  onDelete: () => void;
-  creating: boolean;
-  deleting: boolean;
-}) {
+// One recording's header: label, camera count, and a download-folder link.
+function SessionHeader({ session }: { session: Session }) {
   const { day, rec } = session.clips[0];
-  const realSlots = [...new Set([1, ...session.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])]
-    .sort((a, b) => a - b);
-
   return (
-    <div className={`mb-2 flex flex-wrap items-center gap-3 rounded-lg ${active ? "ring-1 ring-emerald-300" : ""}`}>
+    <div className="mb-2 flex flex-wrap items-center gap-3">
       <span className="font-mono text-sm font-bold text-muted">{session.label}</span>
       <span className="rounded-full bg-card px-2 py-0.5 text-xs font-bold text-muted">
         {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
       </span>
-      <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
-        {realSlots.map((real, i) => (
-          <button
-            key={real}
-            onClick={() => onSelect(real)}
-            className={`px-2.5 py-1 ${real === selected ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
-          >
-            {i === 0 ? "1 · original" : i + 1}
-          </button>
-        ))}
-      </div>
-      {selected > 1 && (
-        <button onClick={onDelete} disabled={deleting} title="Delete this analysis" className="rounded-lg border border-line p-1.5 text-rose-500 hover:bg-rose-50 disabled:opacity-50">
-          <Trash2 className="size-3.5" />
-        </button>
-      )}
-      <button
-        onClick={onCreate}
-        disabled={creating}
-        title={`Run a new ${variant.toUpperCase()} analysis on this recording with the settings shown above (creates a new tab)`}
-        className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"
-      >
-        {creating ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />} New analysis ({variant.toUpperCase()})
-      </button>
       <a
         href={`/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`}
-        title="Download this whole recording folder (both cameras + all analyses) as a .zip"
+        title="Download this whole recording folder (both cameras) as a .zip"
         className="ml-auto flex items-center gap-1 rounded-lg border border-line px-2 py-1 text-[11px] font-bold text-muted hover:bg-card"
       >
         <Download className="size-3.5" /> Download folder
@@ -257,105 +193,37 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const nameByNode = new Map(config.map((n) => [n.id, n.name]));
   const sessions = groupSessions(videos);
 
-  // Model toggle availability = union of shared-detection + action keys across all
-  // slots, so an action model appears whenever any slot produced it.
-  const available = MODEL_ORDER.filter((m) =>
-    videos.some((v) => v.detections?.[m] || Object.values(v.analyses ?? {}).some((a) => a.detections?.[m])),
-  );
+  const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
   const [sel, setSel] = useState<string | null>(null);
   const model = sel && available.includes(sel) ? sel : (available[0] ?? "yolo26n");
   const [view, setView] = useState<"models" | "geometric">("models");
-  const [slotBySession, setSlotBySession] = useState<Record<string, number>>({});
-  const variant = model === "action-hmdb" ? "hmdb" : "ntu";
 
-  // Settings STICK PER TAB: keyed by `${recording}:${slot}`. The top bar binds to
-  // the active tab (last selected); editing updates that tab's settings and they
-  // persist when you switch away and back. New analysis uses its recording's tab.
-  const [activeKey, setActiveKey] = useState<string | null>(null);
-  const [tabSettings, setTabSettings] = useState<Record<string, TabSettings>>({});
+  // Analysis settings are GLOBAL, stored in action-classes.json's `settings` block
+  // (shared with detect/action.py). The bar edits them; a re-analysis picks them up.
   const { data: globalCfg } = useQuery({
     queryKey: ["action-classes"],
     queryFn: async () => (await fetch("/api/action-classes", { cache: "no-store" })).json(),
     staleTime: Infinity,
   });
-  const newDisabled = {
-    action: globalCfg?.action?.disabled ?? [],
-    "action-hmdb": globalCfg?.["action-hmdb"]?.disabled ?? [],
+  const cur = {
+    stride: globalCfg?.settings?.stride ?? 0,
+    spc: globalCfg?.settings?.samplesPerClassify ?? 0,
+    poseSource: (globalCfg?.settings?.poseSource === "rtmpose" ? "rtmpose" : "yolo") as PoseSource,
   };
-
-  // A tab's settings: explicit edits if any, else the slot's saved config, else auto.
-  const savedSettings = (s: Session, slot: number): TabSettings => {
-    const cfg = slot > 1 ? s.clips.map((c) => c.analyses?.[slot]?.config).find(Boolean) : undefined;
-    return {
-      stride: cfg?.settings?.stride ?? 0,
-      spc: cfg?.settings?.samplesPerClassify ?? 0,
-      poseSource: cfg?.settings?.poseSource === "rtmpose" ? "rtmpose" : "yolo",
-    };
-  };
-  const settingsFor = (s: Session, slot: number): TabSettings => tabSettings[`${s.key}:${slot}`] ?? savedSettings(s, slot);
-
-  const activeSession = sessions.find((s) => s.key === activeKey) ?? sessions[0];
-  const activeSlot = activeSession ? slotBySession[activeSession.key] ?? 1 : 1;
-  const cur: TabSettings = activeSession ? settingsFor(activeSession, activeSlot) : { stride: 0, spc: 0, poseSource: "yolo" };
-  const setCur = (patch: Partial<TabSettings>) => {
-    if (!activeSession) return;
-    const id = `${activeSession.key}:${activeSlot}`;
-    setTabSettings((t) => ({ ...t, [id]: { ...settingsFor(activeSession, activeSlot), ...patch } }));
-  };
-  // Which action model a slot actually produced (prefer NTU). Slots >=2 hold ONLY
-  // action sidecars — detection models are shared/slot-1 — so viewing a slot means
-  // viewing its action result.
-  const slotActionModel = (s: Session, slot: number): string | undefined => {
-    const det = s.clips.map((c) => c.analyses?.[slot]?.detections).find(Boolean) ?? {};
-    return ["action", "action-hmdb"].find((m) => det[m]);
-  };
-  const selectTab = (s: Session, slot: number) => {
-    setSlotBySession((m) => ({ ...m, [s.key]: slot }));
-    setActiveKey(s.key);
-    // A slot >=2 has no detection sidecars of its own, so if a shared detection
-    // model is selected the tab would show the (identical) shared result and the
-    // slot's action analysis would be invisible. Switch to its action model so the
-    // tab actually reflects what makes it distinct.
-    if (slot >= 2 && !isActionKey(model)) setSel(slotActionModel(s, slot) ?? "action");
+  // Optimistically patch the cached config for instant feedback, then persist. The
+  // route accepts one field at a time ({stride} | {samplesPerClassify} | {poseSource}).
+  const setSetting = (patch: Record<string, number | string>) => {
+    qc.setQueryData(["action-classes"], (old: Record<string, unknown> | undefined) => ({
+      ...(old ?? {}),
+      settings: { ...((old?.settings as object) ?? {}), ...patch },
+    }));
+    post("/api/action-classes", patch);
   };
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", { force: true }), onSuccess: () => pingSavedSoon(qc) });
   const actionAll = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "ntu" }), onSuccess: () => pingSavedSoon(qc) });
   const actionAllHmdb = useMutation({ mutationFn: () => post("/api/action", { force: true, variant: "hmdb" }), onSuccess: () => pingSavedSoon(qc) });
   const cancel = useMutation({ mutationFn: () => post("/api/detect/cancel"), onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }) });
-
-  const create = useMutation({
-    mutationFn: async (s: Session) => {
-      const slot = slotBySession[s.key] ?? 1;
-      const st = settingsFor(s, slot);
-      const { day, rec } = s.clips[0];
-      const res = await fetch("/api/analysis-slots", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ day, rec, settings: { stride: st.stride, samplesPerClassify: st.spc, poseSource: st.poseSource }, variants: [variant], disabled: newDisabled }),
-      });
-      const newSlot = res.ok ? ((await res.json())?.slot as number | undefined) : undefined;
-      return { key: s.key, slot: newSlot };
-    },
-    onSuccess: (r) => {
-      pingSavedSoon(qc);
-      if (r.slot) setSlotBySession((m) => ({ ...m, [r.key]: r.slot! }));
-      setActiveKey(r.key);
-      // Show the action model we're generating (slots produce action results only),
-      // so the new tab reflects the analysis instead of the shared detection view.
-      if (!isActionKey(model)) setSel(variant === "hmdb" ? "action-hmdb" : "action");
-    },
-  });
-  const del = useMutation({
-    mutationFn: async (s: Session) => {
-      const slot = slotBySession[s.key] ?? 1;
-      if (slot < 2) return s.key;
-      const { day, rec } = s.clips[0];
-      await fetch(`/api/analysis-slots?path=${encodeURIComponent(`${day}/${rec}`)}&slot=${slot}`, { method: "DELETE" });
-      return s.key;
-    },
-    onSuccess: (key) => { setSlotBySession((m) => ({ ...m, [key]: 1 })); qc.invalidateQueries({ queryKey: ["saved"] }); },
-  });
 
   return (
     <div>
@@ -378,7 +246,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
         <p className="text-sm text-muted">No clips to analyze yet — “Beam to laptop” on the Live tab first.</p>
       ) : (
         <>
-          {/* top controls: model + the single sticky settings bar */}
+          {/* top controls: model picker + global analysis settings + batch actions */}
           <div className="mb-4 flex flex-wrap items-center gap-3">
             {available.length > 0 && (
               <div className="flex items-center gap-2">
@@ -396,9 +264,9 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
                 </div>
               </div>
             )}
-            <Opt on={cur.stride} label="stride" val={STRIDE_OPTS} set={(n) => setCur({ stride: n })} />
-            <Opt on={cur.spc} label="samples / classify" val={SPC_OPTS} set={(n) => setCur({ spc: n })} />
-            <PoseOpt on={cur.poseSource} set={(p) => setCur({ poseSource: p })} />
+            <Opt on={cur.stride} label="stride" val={STRIDE_OPTS} set={(n) => setSetting({ stride: n })} />
+            <Opt on={cur.spc} label="samples / classify" val={SPC_OPTS} set={(n) => setSetting({ samplesPerClassify: n })} />
+            <PoseOpt on={cur.poseSource} set={(p) => setSetting({ poseSource: p })} />
             <div className="ml-auto flex items-center gap-2">
               <button
                 onClick={() => detectAll.mutate()}
@@ -423,29 +291,16 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
           </div>
 
           <div className="flex flex-col gap-7">
-            {sessions.map((s) => {
-              const slot = slotBySession[s.key] ?? 1;
-              return (
-                <div key={s.key}>
-                  <SlotTabs
-                    session={s}
-                    selected={slot}
-                    active={activeSession?.key === s.key}
-                    variant={variant}
-                    onSelect={(n) => selectTab(s, n)}
-                    onCreate={() => create.mutate(s)}
-                    onDelete={() => del.mutate(s)}
-                    creating={create.isPending}
-                    deleting={del.isPending}
-                  />
-                  <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                    {s.clips.map((v) => (
-                      <AnalysisCard key={v.relPath} v={v} model={model} slot={slot} settings={settingsFor(s, slot)} roomName={nameByNode.get(v.node) ?? v.node} />
-                    ))}
-                  </div>
+            {sessions.map((s) => (
+              <div key={s.key}>
+                <SessionHeader session={s} />
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                  {s.clips.map((v) => (
+                    <AnalysisCard key={v.relPath} v={v} model={model} roomName={nameByNode.get(v.node) ?? v.node} />
+                  ))}
                 </div>
-              );
-            })}
+              </div>
+            ))}
           </div>
         </>
       )}

@@ -13,13 +13,10 @@ export function pingSavedSoon(qc: QueryClient) {
   }
 }
 
-// True while any model on a clip is still being analyzed — across slot 1
-// (v.detections) AND the extra analysis slots, so slot re-runs/creates keep the
-// ["saved"] poll alive and the UI live-updates.
+// True while any model on a clip is still being analyzed, so the ["saved"] poll
+// stays alive and the UI live-updates during a re-analysis.
 export function clipAnalyzing(v: SavedVideo) {
-  const slot1 = Object.values(v.detections ?? {});
-  const slots = Object.values(v.analyses ?? {}).flatMap((a) => Object.values(a.detections ?? {}));
-  return [...slot1, ...slots].some((d) => d.status === "analyzing");
+  return Object.values(v.detections ?? {}).some((d) => d.status === "analyzing");
 }
 
 // A recording "session" = clips captured together (same day/rec across cameras,
