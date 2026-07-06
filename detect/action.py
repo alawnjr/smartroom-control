@@ -717,7 +717,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
 
 def main():
     ap = argparse.ArgumentParser(description="Per-person skeleton action recognition over saved clips.")
-    ap.add_argument("--path", help="single clip, relative to the recordings root")
+    ap.add_argument("--path", action="append", metavar="REL",
+                    help="clip to analyze, relative to the recordings root; repeatable for a subset")
     ap.add_argument("--variant", default="ntu",
                     help="action model(s), comma-separated: ntu (ST-GCN++/NTU-60), hmdb (PoseC3D/HMDB51)")
     ap.add_argument("--force", action="store_true")
@@ -750,7 +751,7 @@ def main():
 
     try:
         if args.path:
-            clips = [root / args.path]
+            clips = [root / p for p in args.path]
         else:
             clips = sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
         clips = [c for c in clips if c.exists()]
