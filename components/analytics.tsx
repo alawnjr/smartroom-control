@@ -155,23 +155,26 @@ function slotBadge(cfg?: SlotConfig): string | null {
   return parts.join(" · ");
 }
 
-// Per-session numbered analysis tabs + an "add" form. Slot 1 = the original.
+// Per-session numbered analysis tabs + an always-visible settings bar that runs a
+// new analysis. Slot 1 = the original. Tabs are shown as sequential ordinals
+// (1,2,3…) regardless of the underlying folder numbers, so they never skip.
 function SlotTabs({
-  session, selected, onSelect,
+  session, selected, onSelect, model,
 }: {
   session: Session;
   selected: number;
   onSelect: (slot: number) => void;
+  model: string;
 }) {
   const qc = useQueryClient();
-  const [adding, setAdding] = useState(false);
   const { day, rec } = session.clips[0];
 
-  const slots = [...new Set([1, ...session.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])]
+  const realSlots = [...new Set([1, ...session.clips.flatMap((c) => Object.keys(c.analyses ?? {}).map(Number))])]
     .sort((a, b) => a - b);
   const activeCfg = selected > 1
     ? session.clips.map((c) => c.analyses?.[selected]?.config).find(Boolean)
     : undefined;
+  const variant = model === "action-hmdb" ? "hmdb" : "ntu";
 
   const del = useMutation({
     mutationFn: (slot: number) =>
@@ -190,22 +193,15 @@ function SlotTabs({
           {session.clips.length} cam{session.clips.length > 1 ? "s" : ""}
         </span>
         <div className="flex overflow-hidden rounded-lg border border-line text-xs font-bold">
-          {slots.map((n) => (
+          {realSlots.map((real, i) => (
             <button
-              key={n}
-              onClick={() => onSelect(n)}
-              className={`px-2.5 py-1 ${n === selected ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
+              key={real}
+              onClick={() => onSelect(real)}
+              className={`px-2.5 py-1 ${real === selected ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
             >
-              {n === 1 ? "1 · original" : n}
+              {i === 0 ? "1 · original" : i + 1}
             </button>
           ))}
-          <button
-            onClick={() => setAdding((a) => !a)}
-            title="New analysis with different settings"
-            className="flex items-center gap-1 px-2.5 py-1 text-emerald-600 hover:bg-card"
-          >
-            <Plus className="size-3.5" /> New
-          </button>
         </div>
         {selected > 1 && (
           <button
@@ -228,14 +224,14 @@ function SlotTabs({
       {selected > 1 && slotBadge(activeCfg) && (
         <div className="mt-1 text-[11px] font-bold text-muted">⚙ {slotBadge(activeCfg)}</div>
       )}
-      {adding && (
-        <NewSlotForm day={day} rec={rec} onDone={(slot) => { setAdding(false); if (slot) onSelect(slot); }} />
-      )}
+      <NewSlotForm day={day} rec={rec} variant={variant} onCreated={(slot) => slot && onSelect(slot)} />
     </div>
   );
 }
 
-function NewSlotForm({ day, rec, onDone }: { day: string; rec: string; onDone: (slot?: number) => void }) {
+// Always-visible settings bar: stride + samples/classify + "Analyze" creates a new
+// numbered analysis. Variant follows the model picker (NTU unless the HMDB model is selected).
+function NewSlotForm({ day, rec, variant, onCreated }: { day: string; rec: string; variant: string; onCreated: (slot?: number) => void }) {
   const qc = useQueryClient();
   // Default the whitelist to the current global config so a new slot starts from
   // the same enabled classes; the user can still re-toggle on the Classes page.
@@ -246,19 +242,16 @@ function NewSlotForm({ day, rec, onDone }: { day: string; rec: string; onDone: (
   });
   const [stride, setStride] = useState(0);
   const [spc, setSpc] = useState(0);
-  const [ntu, setNtu] = useState(true);
-  const [hmdb, setHmdb] = useState(false);
 
   const create = useMutation({
     mutationFn: async () => {
-      const variants = [ntu && "ntu", hmdb && "hmdb"].filter(Boolean) as string[];
       const res = await fetch("/api/analysis-slots", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           day, rec,
           settings: { stride, samplesPerClassify: spc },
-          variants,
+          variants: [variant],
           disabled: {
             action: globalCfg?.action?.disabled ?? [],
             "action-hmdb": globalCfg?.["action-hmdb"]?.disabled ?? [],
@@ -269,7 +262,7 @@ function NewSlotForm({ day, rec, onDone }: { day: string; rec: string; onDone: (
     },
     onSuccess: (slot) => {
       pingSavedSoon(qc);
-      onDone(slot);
+      onCreated(slot);
     },
   });
 
@@ -290,18 +283,14 @@ function NewSlotForm({ day, rec, onDone }: { day: string; rec: string; onDone: (
     <div className="mt-2 flex flex-wrap items-center gap-3 rounded-xl border border-line bg-card p-3">
       <Opt on={stride} label="stride" val={STRIDE_OPTS} set={setStride} />
       <Opt on={spc} label="samples / classify" val={SPC_OPTS} set={setSpc} />
-      <div className="flex items-center gap-2 text-xs font-bold">
-        <label className="flex items-center gap-1"><input type="checkbox" checked={ntu} onChange={(e) => setNtu(e.target.checked)} /> NTU</label>
-        <label className="flex items-center gap-1"><input type="checkbox" checked={hmdb} onChange={(e) => setHmdb(e.target.checked)} /> HMDB</label>
-      </div>
       <button
         onClick={() => create.mutate()}
-        disabled={create.isPending || (!ntu && !hmdb)}
+        disabled={create.isPending}
+        title={`Run a new ${variant.toUpperCase()} analysis with these settings (creates a new tab)`}
         className="flex items-center gap-1.5 rounded-lg bg-emerald-500 px-3 py-1.5 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"
       >
-        {create.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Video className="size-3.5" />} Analyze
+        {create.isPending ? <Loader2 className="size-3.5 animate-spin" /> : <Plus className="size-3.5" />} New analysis ({variant.toUpperCase()})
       </button>
-      <button onClick={() => onDone()} className="text-xs font-bold text-muted hover:underline">cancel</button>
     </div>
   );
 }
@@ -411,7 +400,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
             const slot = slotBySession[s.key] ?? 1;
             return (
               <div key={s.key}>
-                <SlotTabs session={s} selected={slot} onSelect={(n) => setSlotBySession((m) => ({ ...m, [s.key]: n }))} />
+                <SlotTabs session={s} selected={slot} model={model} onSelect={(n) => setSlotBySession((m) => ({ ...m, [s.key]: n }))} />
                 <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
                   {s.clips.map((v) => (
                     <AnalysisCard key={v.relPath} v={v} model={model} slot={slot} roomName={nameByNode.get(v.node) ?? v.node} />
