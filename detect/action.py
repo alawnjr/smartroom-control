@@ -47,11 +47,12 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # produced it (safe because this is offline — see process_clip pass 2).
 WINDOW = int(os.environ.get("SMARTROOM_ACTION_WINDOW", "48"))
 STRIDE = int(os.environ.get("SMARTROOM_ACTION_STRIDE", "2"))
-# How far back to shift each label, as a fraction of the window span. 0.5 = the
-# window's exact center (theoretically correct, but feels early in practice
-# because an action is usually clearest in the latter part of its window); lower
-# = label lands closer to "now". Tunable via SMARTROOM_ACTION_OFFSET_FRAC.
-OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.35"))
+# How far back to shift each label, as a fraction of the window span. 0 = no
+# shift (label sits where it was computed). Set >0 to pull labels earlier toward
+# the window's center: 0.5 = exact center (theoretically correct but feels early,
+# since an action is usually clearest in the latter part of its window). Tunable
+# via SMARTROOM_ACTION_OFFSET_FRAC.
+OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.0"))
 # Open-set handling. These models always argmax over all 60/51 classes, so on
 # idle / out-of-distribution motion they emit a confident-looking *rare* class
 # (NTU's medical labels, HMDB's sports). Two post-hoc fixes, no retraining:
