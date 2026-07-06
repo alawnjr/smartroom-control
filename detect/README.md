@@ -8,8 +8,9 @@ dashboard can toggle between models (nano / small / medium):
 - `camera_main.detections.<model>.json` — occupancy stats + per-sampled-frame timeline
 - `camera_main.annotated.<model>.mp4` — boxes burned in, re-encoded to H.264 (browser-playable)
 
-Default models: `yolo26n, yolo26s, yolo26m`. Measured here (OpenVINO intel:cpu,
-640px): nano ~48 FPS, small ~18 FPS, medium ~7 FPS — all fine for offline batch.
+Default models: `yolo26n, yolo26s, yolo26m, yolo26l`. Measured here (OpenVINO
+intel:cpu, 640px): nano ~48 FPS, small ~18 FPS, medium ~7 FPS (large is slower
+still) — all fine for offline batch.
 
 It's idempotent (skips clips whose results are current), safe against concurrent
 runs (a global `flock` on `recordings/.detect.lock`), and writes a
@@ -51,7 +52,7 @@ the flock makes overlapping triggers safe.
 
 Each model must already be exported under `SMARTROOM_YOLO_DIR`, e.g.:
 ```bash
-for m in yolo26n yolo26s yolo26m; do
+for m in yolo26n yolo26s yolo26m yolo26l; do
   ~/Code/yolo-bench/.venv/bin/python -c "from ultralytics import YOLO; YOLO('$m.pt').export(format='openvino')"
 done
 ```
