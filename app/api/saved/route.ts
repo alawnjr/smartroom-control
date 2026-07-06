@@ -3,6 +3,7 @@ import path from "node:path";
 
 import { NextResponse } from "next/server";
 
+import { readDetectionSummary } from "@/lib/detections";
 import { savedRoot } from "@/lib/recordings";
 import type { SavedVideo } from "@/lib/types";
 
@@ -19,7 +20,12 @@ export async function GET() {
   try {
     const dirents = await readdir(root, { recursive: true, withFileTypes: true });
     rels = dirents
-      .filter((d) => d.isFile() && VIDEO_EXT.has(path.extname(d.name).toLowerCase()))
+      .filter(
+        (d) =>
+          d.isFile() &&
+          VIDEO_EXT.has(path.extname(d.name).toLowerCase()) &&
+          !d.name.endsWith(".annotated.mp4") // outputs, not source clips
+      )
       .map((d) => path.relative(root, path.join(d.parentPath, d.name)));
   } catch {
     rels = [];
@@ -28,15 +34,17 @@ export async function GET() {
   const videos: SavedVideo[] = [];
   for (const rel of rels) {
     const parts = rel.split(path.sep);
+    const abs = path.join(root, rel);
     let size = 0;
     let mtime = 0;
     try {
-      const st = await stat(path.join(root, rel));
+      const st = await stat(abs);
       size = st.size;
       mtime = st.mtimeMs;
     } catch {
       // ignore unreadable file
     }
+    const detection = await readDetectionSummary(abs);
     videos.push({
       node: parts[0] ?? "",
       day: parts[1] ?? "",
@@ -45,6 +53,7 @@ export async function GET() {
       relPath: rel,
       size,
       mtime,
+      detection,
     });
   }
   videos.sort((a, b) => b.mtime - a.mtime);

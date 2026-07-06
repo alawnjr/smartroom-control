@@ -1,0 +1,9 @@
+# Deps for detect/detect.py. By default the app reuses the existing
+# ~/Code/yolo-bench/.venv (set SMARTROOM_DETECT_PYTHON to point elsewhere).
+# This file documents the deps and lets you build a dedicated project venv:
+#   python -m venv detect/.venv && detect/.venv/bin/pip install -r detect/requirements.txt
+# then set SMARTROOM_DETECT_PYTHON=.../detect/.venv/bin/python
+ultralytics>=8.4
+openvino>=2024.0
+opencv-python>=4.9
+# ffmpeg (system package) is also required for browser-playable annotated video.

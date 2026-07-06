@@ -55,6 +55,22 @@ export type SavedVideo = {
   relPath: string; // full path relative to the recordings root
   size: number;
   mtime: number;
+  detection?: DetectionSummary;
+};
+
+export type DetectionStatus = "analyzing" | "done" | "error" | "none";
+
+export type DetectionTimelinePoint = { t: number; count: number };
+
+export type DetectionSummary = {
+  status: DetectionStatus;
+  maxPersons?: number;
+  avgPersons?: number;
+  framesAnalyzed?: number;
+  timeline?: DetectionTimelinePoint[];
+  hasAnnotated: boolean;
+  annotatedRelPath?: string; // recordings-relative, for /api/saved/file
+  error?: string;
 };
 
 export type SavedListing = { root: string; videos: SavedVideo[] };

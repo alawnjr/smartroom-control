@@ -1,0 +1,11 @@
+[Unit]
+Description=Watch recordings/ and trigger person-detection (backstop)
+
+[Path]
+# Fires on direct-child changes; nested writes are caught by the .timer. The
+# script's flock + idempotency make extra/early triggers harmless.
+PathChanged=/home/alawn/Code/smartroom-control/recordings
+Unit=smartroom-detect.service
+
+[Install]
+WantedBy=default.target
