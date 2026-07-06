@@ -53,19 +53,24 @@ function AnalysisCard({ v, model, slot, roomName }: { v: SavedVideo; model: stri
 
   const reanalyze = useMutation({
     mutationFn: () => {
+      // Re-run THIS tab. Slots >=2 always re-run that slot's action analysis
+      // (even when viewing the shared detection model), so ↻ never falls back to
+      // slot 1 / shared detection just because a detection model is selected.
+      if (slot >= 2) {
+        const cfg = v.analyses?.[slot]?.config;
+        return post("/api/analysis-slots", {
+          day: v.day, rec: v.rec, slot,
+          settings: cfg?.settings ?? {},
+          variants: cfg?.variants ?? [actionVariant],
+          disabled: {
+            action: (cfg?.action as { disabled?: string[] })?.disabled ?? [],
+            "action-hmdb": (cfg?.["action-hmdb"] as { disabled?: string[] })?.disabled ?? [],
+          },
+        });
+      }
+      // Slot 1 (original / shared): re-run the current model in place.
       if (!isAction) return post("/api/detect", { relPath: v.relPath, force: true });
-      if (slot <= 1) return post("/api/action", { relPath: v.relPath, force: true, variant: actionVariant });
-      // Re-run this slot (re-runs the whole recording for the slot's settings).
-      const cfg = v.analyses?.[slot]?.config;
-      return post("/api/analysis-slots", {
-        day: v.day, rec: v.rec, slot,
-        settings: cfg?.settings ?? {},
-        variants: cfg?.variants ?? [actionVariant],
-        disabled: {
-          action: (cfg?.action as { disabled?: string[] })?.disabled ?? [],
-          "action-hmdb": (cfg?.["action-hmdb"] as { disabled?: string[] })?.disabled ?? [],
-        },
-      });
+      return post("/api/action", { relPath: v.relPath, force: true, variant: actionVariant });
     },
     onSuccess: () => pingSavedSoon(qc),
   });
