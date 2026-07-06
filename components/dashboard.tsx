@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Download, Minus, Plus } from "lucide-react";
 
 import { Analytics } from "@/components/analytics";
-import { analyzingCount, clipAnalyzing, pingSavedSoon, useSaved } from "@/lib/use-saved";
+import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved } from "@/lib/use-saved";
 import type { CombinedStatus, DetectionSummary, NodeConfig, NodeStatus, SavedVideo } from "@/lib/types";
 
 // Per-room identity colours, cycled by node order.
@@ -385,9 +385,21 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
       {clips.length === 0 ? (
         <p className="text-sm text-muted">No clips yet — hit “Beam to laptop” to pull recordings.</p>
       ) : (
-        <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          {clips.map((v) => (
-            <ClipCard key={v.relPath} v={v} roomIdx={idxByNode.get(v.node) ?? 0} />
+        <div className="flex flex-col gap-7">
+          {groupSessions(clips).map((s) => (
+            <div key={s.key}>
+              <div className="mb-2 flex items-center gap-2 text-sm font-bold text-muted">
+                <span className="font-mono">{s.label}</span>
+                <span className="rounded-full bg-card px-2 py-0.5 text-xs">
+                  {s.clips.length} cam{s.clips.length > 1 ? "s" : ""}
+                </span>
+              </div>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                {s.clips.map((v) => (
+                  <ClipCard key={v.relPath} v={v} roomIdx={idxByNode.get(v.node) ?? 0} />
+                ))}
+              </div>
+            </div>
           ))}
         </div>
       )}
