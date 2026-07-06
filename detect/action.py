@@ -46,7 +46,29 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # shifts each label back by half a window to align it with the motion that
 # produced it (safe because this is offline — see process_clip pass 2).
 WINDOW = int(os.environ.get("SMARTROOM_ACTION_WINDOW", "48"))
-STRIDE = int(os.environ.get("SMARTROOM_ACTION_STRIDE", "2"))
+# Stride = how many native frames between the samples that fill the window. It is
+# NOT a compute knob (pose runs every frame anyway); it stretches the fixed-size
+# WINDOW to cover a target real-time span. A hardcoded stride only works at one
+# fps: the old default of 2 was tuned for 30fps (48*2/30 ≈ 3.2s), but these
+# cameras actually run ~13.5fps, where stride 2 gives a ~7s window sampled at only
+# ~6.75fps — too sparse to resolve running cadence / the flight phase, and too
+# long (brief actions get diluted). So derive stride from the clip's true fps to
+# hit TARGET_WINDOW_SEC, clamped to >=1. Pin it with SMARTROOM_ACTION_STRIDE.
+STRIDE_ENV = int(os.environ["SMARTROOM_ACTION_STRIDE"]) if os.environ.get("SMARTROOM_ACTION_STRIDE") else None
+TARGET_WINDOW_SEC = float(os.environ.get("SMARTROOM_ACTION_WINDOW_SEC", "3.2"))
+
+
+def pick_stride(native_fps: float) -> int:
+    # Priority: env override > the dashboard's stride setting > fps-adaptive auto.
+    # Auto: 48 samples spanning TARGET_WINDOW_SEC -> stride = fps*sec/WINDOW
+    # (13.5fps,3.2s -> 1 ; 30fps,3.2s -> 2). load_stride_setting() reads the same
+    # action-classes.json the whitelist uses; 0/absent there means "auto".
+    if STRIDE_ENV:
+        return max(1, STRIDE_ENV)
+    cfg_stride = load_stride_setting()
+    if cfg_stride:
+        return max(1, cfg_stride)
+    return max(1, round(native_fps * TARGET_WINDOW_SEC / WINDOW))
 # Minimum samples before a track is classified. Waiting for the full WINDOW means
 # no prediction for the first WINDOW*STRIDE frames (~7s at these cameras' real
 # ~13.5fps), so predictions only appear halfway through a short clip. Instead we
@@ -108,6 +130,17 @@ def load_disabled(key: str, class_names) -> list:
         return [i for i, n in enumerate(class_names) if n in names]
     except Exception:
         return []
+
+
+def load_stride_setting():
+    # Dashboard-set stride override under settings.stride (0/absent = auto). None if
+    # no config. Read from the same file as the whitelist (see pick_stride).
+    try:
+        cfg = json.loads(CLASSES_CONFIG.read_text())
+        s = cfg.get("settings", {}).get("stride")
+        return int(s) if s else None
+    except Exception:
+        return None
 
 
 def _env_float(name):
@@ -282,6 +315,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     # real seconds. Prefer the *true* average fps = frame_count / duration so the
     # timeline lines up with the playing video and warm-up reflects real time.
     native_fps = _true_fps(mp4) or reported_fps
+    stride = pick_stride(native_fps)  # samples per the clip's true fps (see pick_stride)
 
     def classify(window):
         # window: list of (kpts (17,2), conf (17,)) -> (label|None, conf, top)
@@ -318,7 +352,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     # frame's skeletons + each track's classification events; pass 2 re-decodes
     # and draws, shifting every label back by this offset to line it up with the
     # motion that produced it.
-    offset_frames = int(WINDOW * STRIDE * OFFSET_FRAC)
+    offset_frames = int(WINDOW * stride * OFFSET_FRAC)
 
     # Pass 1 — track + classify.
     framedata = []                  # framedata[g] -> list of (tid, (x1,y1), pts, cs)
@@ -339,7 +373,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
             xy = kpts.xy.cpu().numpy()
             conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
             for n, tid in enumerate(ids):
-                if idx % STRIDE == 0:
+                if idx % stride == 0:
                     tubes[tid].append((xy[n], conf[n]))
                     n_vis = int((conf[n] >= KP_CONF).sum())
                     trunc[tid].append(n_vis < MIN_KEYPOINTS)
@@ -433,7 +467,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
 
     _atomic_write_json(actions_path, {"schemaVersion": SCHEMA_VERSION, "model": key,
                                       "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
-                                      "nativeFps": round(native_fps, 3), "window": WINDOW, "stride": STRIDE,
+                                      "nativeFps": round(native_fps, 3), "window": WINDOW, "stride": stride,
                                       "tracks": {str(t): timeline[t] for t in timeline}})
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
