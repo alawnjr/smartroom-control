@@ -344,7 +344,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
                 className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50"
               >
                 {analyzing > 0 ? <Loader2 className="size-4 animate-spin" /> : <ScanEye className="size-4" />}
-                {analyzing > 0 ? `Analyzing ${analyzing}…` : selectedCount > 0 ? `Re-analyze ${selectedCount}` : "Re-analyze all"}
+                {analyzing > 0 ? `Analyzing ${analyzing}…` : selectedCount > 0 ? `Re-detect ${selectedCount}` : "Re-detect all"}
               </button>
               <button onClick={() => actionAll.mutate()} disabled={analyzing > 0 || actionAll.isPending} title="Per-person actions on the selected clips, or all if none selected (ST-GCN++ / NTU-RGB+D 60)" className="flex items-center gap-1.5 rounded-xl border border-line bg-card px-3 py-1.5 text-sm font-bold hover:bg-background disabled:opacity-50">
                 <Video className="size-4" /> Actions (NTU)
