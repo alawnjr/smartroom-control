@@ -1,11 +1,12 @@
 "use client";
 
 import { useState } from "react";
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { RefreshCw } from "lucide-react";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { Loader2, RefreshCw } from "lucide-react";
 
 import { OccupancySparkline } from "@/components/occupancy-sparkline";
-import type { DetectionSummary, SavedListing, SavedVideo } from "@/lib/types";
+import { analyzingCount, clipAnalyzing, useSaved } from "@/lib/use-saved";
+import type { DetectionSummary, SavedVideo } from "@/lib/types";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose"];
 const MODEL_LABEL: Record<string, string> = {
@@ -55,6 +56,7 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
   const [annotated, setAnnotated] = useState(false);
   const showAnnotated = annotated && hasAnnotated;
   const src = showAnnotated ? fileUrl(d!.annotatedRelPath!) : fileUrl(v.relPath);
+  const analyzing = clipAnalyzing(v);
 
   const qc = useQueryClient();
   const reanalyze = useMutation({
@@ -66,9 +68,14 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
       }).catch(() => {}),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["saved"] }),
   });
+  const spin = analyzing || reanalyze.isPending;
 
   return (
-    <div className="flex flex-col gap-1 rounded-lg border border-neutral-800 bg-black/30 p-2">
+    <div
+      className={`flex flex-col gap-1 rounded-lg border bg-black/30 p-2 ${
+        analyzing ? "border-amber-500/40 ring-1 ring-amber-500/30" : "border-neutral-800"
+      }`}
+    >
       <video key={src} controls preload="none" className="aspect-video w-full rounded bg-black" src={src} />
       {d?.status === "done" && d.timeline && <OccupancySparkline timeline={d.timeline} max={d.maxPersons ?? 0} />}
       <div className="flex items-center justify-between gap-2">
@@ -84,11 +91,11 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
           )}
           <button
             onClick={() => reanalyze.mutate()}
-            disabled={reanalyze.isPending}
-            title="Re-run detection on this clip (all models)"
+            disabled={spin}
+            title={analyzing ? "Analyzing…" : "Re-run detection on this clip (all models)"}
             className="flex items-center rounded border border-neutral-700 p-1 text-neutral-400 hover:bg-neutral-800 disabled:opacity-50"
           >
-            <RefreshCw className={`size-3 ${reanalyze.isPending ? "animate-spin" : ""}`} />
+            <RefreshCw className={`size-3 ${spin ? "animate-spin" : ""}`} />
           </button>
         </div>
       </div>
@@ -104,22 +111,9 @@ function ClipCard({ v, model }: { v: SavedVideo; model: string | null }) {
 }
 
 export function SavedGallery() {
-  const { data } = useQuery({
-    queryKey: ["saved"],
-    queryFn: async (): Promise<SavedListing> => {
-      const res = await fetch("/api/saved", { cache: "no-store" });
-      return res.json();
-    },
-    refetchOnWindowFocus: false,
-    refetchInterval: (q) =>
-      q.state.data?.videos?.some((v) =>
-        Object.values(v.detections ?? {}).some((d) => d.status === "analyzing")
-      )
-        ? 3000
-        : false,
-  });
-
+  const { data } = useSaved();
   const videos = data?.videos ?? [];
+  const analyzing = analyzingCount(data);
 
   // models present across all clips, in nano→small→medium order
   const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
@@ -140,7 +134,15 @@ export function SavedGallery() {
   return (
     <div className="rounded-xl border border-neutral-800 bg-neutral-900/50 p-4">
       <div className="mb-3 flex items-center justify-between gap-3">
-        <h2 className="text-sm font-medium text-neutral-300">Saved Recordings</h2>
+        <div className="flex items-center gap-2">
+          <h2 className="text-sm font-medium text-neutral-300">Saved Recordings</h2>
+          {analyzing > 0 && (
+            <span className="flex items-center gap-1.5 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs text-amber-400">
+              <Loader2 className="size-3 animate-spin" />
+              analyzing {analyzing} clip{analyzing > 1 ? "s" : ""}…
+            </span>
+          )}
+        </div>
         {available.length > 0 && (
           <div className="flex items-center gap-1 text-xs">
             <span className="text-neutral-500">model</span>
