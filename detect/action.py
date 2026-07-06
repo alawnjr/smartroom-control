@@ -20,7 +20,10 @@ Idempotent, flock-guarded (.action.lock), cancellable (.action.pid).
 
 Config (env): SMARTROOM_SAVE_DIR, SMARTROOM_YOLO_DIR (yolo26n-pose.pt),
 SMARTROOM_STGCN_CONFIG, SMARTROOM_STGCN_CKPT, SMARTROOM_ACTION_WINDOW (48),
-SMARTROOM_ACTION_STRIDE (2).
+SMARTROOM_ACTION_STRIDE (2), SMARTROOM_ACTION_OFFSET_FRAC (0.35),
+SMARTROOM_ACTION_TEMP (softmax temperature; >1 flattens),
+SMARTROOM_ACTION_MIN_CONF (absolute abstention threshold; overrides the
+per-variant k×chance default — below it a window is labelled "idle").
 """
 
 import argparse
@@ -49,7 +52,27 @@ STRIDE = int(os.environ.get("SMARTROOM_ACTION_STRIDE", "2"))
 # because an action is usually clearest in the latter part of its window); lower
 # = label lands closer to "now". Tunable via SMARTROOM_ACTION_OFFSET_FRAC.
 OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.35"))
+# Open-set handling. These models always argmax over all 60/51 classes, so on
+# idle / out-of-distribution motion they emit a confident-looking *rare* class
+# (NTU's medical labels, HMDB's sports). Two post-hoc fixes, no retraining:
+#   TEMP (temperature scaling) — divides the recovered logits before softmax so
+#     the confidence number is calibrated (the recognizer is overconfident).
+#     T=1 is a no-op; T>1 flattens. See Guo et al. temperature scaling.
+#   MIN_CONF (abstention) — below this calibrated confidence, emit no label
+#     ("idle") instead of guessing, à la the "background class when all scores
+#     are weak" rule in streaming action-detection work. Expressed as a MULTIPLE
+#     OF CHANCE (1/num_classes), because a 60-way softmax max is naturally small
+#     (and our webcam poses are out-of-distribution for these models, so output
+#     sits near uniform); "k× chance" auto-adapts to 60 vs 51 classes. A raw
+#     absolute override is also accepted (SMARTROOM_ACTION_MIN_CONF).
+# Both are per-variant; the env vars, when set, override both variants.
+IDLE = "idle"
 SCHEMA_VERSION = 2
+
+
+def _env_float(name):
+    v = os.environ.get(name)
+    return float(v) if v not in (None, "") else None
 
 # NTU-RGB+D 60 action labels, index-aligned with the model's classes (A1..A60).
 NTU60 = [
@@ -107,7 +130,7 @@ def _mm_skeleton_config(*parts) -> str:
 VARIANTS = {
     "ntu": {
         "key": "action", "labels": NTU60, "classifier": "stgcnpp_ntu60_2d",
-        "classify_every": 12,
+        "classify_every": 12, "temp": 1.0, "conf_mult": 9.0,
         "config_env": "SMARTROOM_STGCN_CONFIG", "ckpt_env": "SMARTROOM_STGCN_CKPT",
         "config": lambda: _mm_skeleton_config(
             "stgcnpp", "stgcnpp_8xb16-joint-u100-80e_ntu60-xsub-keypoint-2d.py"),
@@ -116,6 +139,7 @@ VARIANTS = {
     "hmdb": {
         "key": "action-hmdb", "labels": HMDB51, "classifier": "posec3d_hmdb51",
         "classify_every": 24,  # PoseC3D is much slower per inference; classify less often
+        "temp": 1.0, "conf_mult": 9.0,
         "config_env": "SMARTROOM_HMDB_CONFIG", "ckpt_env": "SMARTROOM_HMDB_CKPT",
         "config": lambda: _mm_skeleton_config(
             "posec3d", "slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint.py"),
@@ -130,6 +154,17 @@ def variant_config(v: dict) -> str:
 
 def variant_ckpt(v: dict) -> str:
     return os.environ.get(v["ckpt_env"]) or v["ckpt_default"]
+
+
+def variant_temp(v: dict) -> float:
+    e = _env_float("SMARTROOM_ACTION_TEMP")
+    return e if e is not None else v["temp"]
+
+
+def variant_min_conf(v: dict, num_classes: int) -> float:
+    # Absolute override wins; otherwise k× chance (1/num_classes).
+    e = _env_float("SMARTROOM_ACTION_MIN_CONF")
+    return e if e is not None else v["conf_mult"] / num_classes
 
 
 def sidecars(mp4: Path, key: str):
@@ -167,6 +202,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
 
     key, class_names = variant["key"], variant["labels"]
     classify_every = variant["classify_every"]
+    temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
     json_path, actions_path, annotated_path = sidecars(mp4, key)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
@@ -180,13 +216,19 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
     cap.release()
 
     def classify(window):
-        # window: list of (kpts (17,2) float, conf (17,) float) -> label, conf
+        # window: list of (kpts (17,2) float, conf (17,) float) -> (label|None, conf)
         pose_results = [{"keypoints": kp[None].astype("float32"),
                          "keypoint_scores": sc[None].astype("float32")} for kp, sc in window]
         res = infer(model, pose_results, (height, width))
+        # mmaction's pred_score is already softmax probabilities. Recover logits
+        # (log p, up to a constant softmax ignores), temperature-scale, re-softmax.
+        # At temp=1 this returns p exactly — and fixes the prior double-softmax
+        # that made the old confidence numbers meaningless.
         score = res.pred_score
-        probs = score.softmax(-1) if hasattr(score, "softmax") else score
+        probs = (score.clamp_min(1e-8).log() / temp).softmax(-1)
         c, i = float(probs.max()), int(probs.argmax())
+        if c < min_conf:
+            return None, c  # abstain — too uncertain to name a class
         return (class_names[i] if i < len(class_names) else str(i)), c
 
     # The label from a trailing window best describes motion at the window's
@@ -220,12 +262,15 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
                 if len(tubes[tid]) >= WINDOW and idx % classify_every == 0:
                     label, cf = classify(list(tubes[tid]))
                     ev_idx[tid].append(idx)
-                    ev_lab[tid].append(label)
-                    # center the timeline timestamp on the window, not its end
-                    t = max(0.0, (idx - offset_frames) / native_fps)
-                    timeline[tid].append({"t": round(t, 3), "action": label, "conf": round(cf, 3)})
-                    if label not in seen:
-                        seen.append(label)
+                    # overlay shows "idle" on abstention rather than a stale/guessed
+                    # label; the summary vote + chips only count confident windows.
+                    ev_lab[tid].append(label or IDLE)
+                    if label is not None:
+                        # center the timeline timestamp on the window, not its end
+                        t = max(0.0, (idx - offset_frames) / native_fps)
+                        timeline[tid].append({"t": round(t, 3), "action": label, "conf": round(cf, 3)})
+                        if label not in seen:
+                            seen.append(label)
                 x1, y1 = max(0, xyxy[n][0]), max(0, xyxy[n][1])
                 perframe.append((tid, (x1, y1), xy[n], conf[n]))
         framedata.append(perframe)
@@ -293,7 +338,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict):
         "device": "cpu", "classifier": variant["classifier"],
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "durationSec": round(total / native_fps, 3) if total else None,
-        "tracks": len(timeline), "trackActions": track_actions, "actions": seen,
+        "temp": temp, "minConf": min_conf,
+        "tracks": len(ev_idx), "trackActions": track_actions, "actions": seen,
         "annotated": annotated_path.name if has_annotated else None, "hasAnnotated": has_annotated,
     })
     print(f"  action done: {mp4.relative_to(saved_root())} tracks={len(timeline)} {seen}", file=sys.stderr)
