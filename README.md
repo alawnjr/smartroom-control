@@ -61,3 +61,11 @@ The unit pins the nvm node path (`~/.config/nvm/versions/node/v24.16.0/bin`).
 If you `nvm install` a newer node, update `PATH=` and `ExecStart=` in
 `deploy/smartroom-control.service` (and reinstall it), or switch to
 `ExecStart=/bin/bash -lc 'cd <dir> && npm run start'`.
+
+## LAN API (for other devices)
+
+A read-only machine API serves inference results (detections, actions,
+skeletons, centroids) and compressed frames from the saved recordings to any
+device on the network. Start at `http://<laptop-ip>:4000/api/v1` (self-
+describing) — full reference in [API.md](API.md) or served live at
+`/api/v1/docs`.
