@@ -57,3 +57,4 @@ __pycache__/
 
 # local action-class whitelist (written by the Classes tab)
 action-classes.json
+.validate.log

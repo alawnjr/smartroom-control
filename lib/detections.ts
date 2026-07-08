@@ -3,7 +3,7 @@ import { readFile } from "node:fs/promises";
 import path from "node:path";
 
 import { savedRoot } from "@/lib/recordings";
-import type { DetectionSummary } from "@/lib/types";
+import type { DetectionSummary, ValidationSummary } from "@/lib/types";
 
 // On cancel, remove stuck "analyzing" sidecars (so the UI clears) and any leftover
 // transcode temp files. Returns how many analyzing markers were cleared.
@@ -150,4 +150,42 @@ async function readDetectionsInDir(
 // All models' summaries for a clip (in-place), keyed by model.
 export async function readDetections(absMp4: string): Promise<Record<string, DetectionSummary>> {
   return readDetectionsInDir(path.dirname(absMp4), absMp4);
+}
+
+// One clip's data-validation sidecar (<stem>.validation.json, from detect/validate.py).
+// Undefined when the clip was never validated.
+export async function readValidation(absMp4: string): Promise<ValidationSummary | undefined> {
+  const stem = path.basename(absMp4, path.extname(absMp4));
+  const jsonPath = path.join(path.dirname(absMp4), `${stem}.validation.json`);
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(await readFile(jsonPath, "utf8"));
+  } catch {
+    return undefined;
+  }
+  const status = raw.status as ValidationSummary["status"];
+  if (status === "error") return { status, error: (raw.error as string) ?? "validation failed" };
+  if (status === "analyzing") return { status };
+  if (status !== "done") return undefined;
+  // Stale (source replaced since validation) -> treat as never validated.
+  try {
+    if (((raw.sourceMtimeMs as number) ?? 0) + 2000 < statSync(absMp4).mtimeMs) return undefined;
+  } catch {
+    return undefined;
+  }
+  let version: number | undefined;
+  try {
+    version = Math.round(statSync(jsonPath).mtimeMs);
+  } catch {
+    version = undefined;
+  }
+  return {
+    status: "done",
+    version,
+    passed: raw.passed as number,
+    failed: raw.failed as number,
+    failedChecks: (raw.failedChecks as string[]) ?? [],
+    // Every check with its outcome + human-readable detail, for the click-to-expand panel.
+    checks: (raw.checks as { name: string; ok: boolean; detail: string }[]) ?? [],
+  };
 }

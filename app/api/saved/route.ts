@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { NextResponse } from "next/server";
 
-import { readDetections } from "@/lib/detections";
+import { readDetections, readValidation } from "@/lib/detections";
 import { savedRoot } from "@/lib/recordings";
 import type { SavedVideo } from "@/lib/types";
 
@@ -24,7 +24,8 @@ export async function GET() {
         (d) =>
           d.isFile() &&
           VIDEO_EXT.has(path.extname(d.name).toLowerCase()) &&
-          !d.name.includes(".annotated.") // outputs, not source clips
+          !d.name.includes(".annotated.") && // outputs, not source clips
+          !d.parentPath.split(path.sep).includes("undistorted") // lens-corrected copies, not extra clips
       )
       .map((d) => path.relative(root, path.join(d.parentPath, d.name)));
   } catch {
@@ -47,7 +48,9 @@ export async function GET() {
       // ignore unreadable file
     }
     const detections = await readDetections(abs);
+    const validation = await readValidation(abs);
     videos.push({
+      validation,
       node: (si >= 0 ? parts[si + 1] : "") ?? "",
       day: parts[0] ?? "",
       rec: parts[1] ?? "",

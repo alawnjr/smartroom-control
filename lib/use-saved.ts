@@ -50,9 +50,15 @@ export function analyzingCount(listing?: SavedListing) {
   return listing?.videos?.filter(clipAnalyzing).length ?? 0;
 }
 
+// Clips currently being validated (validate.py's "analyzing" marker), so the
+// Validate button can show live progress like the analyze button does.
+export function validatingCount(listing?: SavedListing) {
+  return listing?.videos?.filter((v) => v.validation?.status === "analyzing").length ?? 0;
+}
+
 // Shared ["saved"] query — both the gallery and the save/analyze bar read it (React
-// Query dedupes to one fetch). Polls every 2s while anything is analyzing so the UI
-// reflects progress live.
+// Query dedupes to one fetch). Polls every 2s while anything is analyzing or being
+// validated so the UI reflects progress live.
 export function useSaved() {
   return useQuery({
     queryKey: ["saved"],
@@ -61,6 +67,7 @@ export function useSaved() {
       return res.json();
     },
     refetchOnWindowFocus: false,
-    refetchInterval: (q) => (analyzingCount(q.state.data) > 0 ? 2000 : false),
+    refetchInterval: (q) =>
+      analyzingCount(q.state.data) > 0 || validatingCount(q.state.data) > 0 ? 2000 : false,
   });
 }

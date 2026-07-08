@@ -56,9 +56,21 @@ export type SavedVideo = {
   size: number;
   mtime: number;
   detections?: Record<string, DetectionSummary>; // in-place per-model detection + action results
+  validation?: ValidationSummary; // data-integrity checks (detect/validate.py sidecar)
 };
 
 export type DetectionStatus = "analyzing" | "done" | "error" | "none";
+
+// One clip's data-validation outcome (camera_main.validation.json).
+export type ValidationSummary = {
+  status: DetectionStatus;
+  passed?: number;
+  failed?: number;
+  failedChecks?: string[]; // names of failed checks (for the chip tooltip)
+  checks?: { name: string; ok: boolean; detail: string }[]; // every check with its outcome + human explanation (click-to-expand panel)
+  version?: number; // sidecar mtime — cache-buster so a re-run re-renders
+  error?: string;
+};
 
 export type DetectionTimelinePoint = { t: number; count: number };
 
