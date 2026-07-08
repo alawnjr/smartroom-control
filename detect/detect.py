@@ -126,13 +126,18 @@ def needs_processing(mp4: Path, key: str, force: bool) -> bool:
 def process_clip(model, key: str, mp4: Path):
     import cv2
 
+    from calib_utils import analysis_source
+
     pose = _is_pose(key)
     json_path, annotated_path = sidecar_paths(mp4, key)
     source_mtime_ms = mp4.stat().st_mtime * 1000
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
                                    "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
 
-    cap = cv2.VideoCapture(str(mp4))
+    # Decode the lens-corrected copy when the recording is calibrated (see
+    # undistort.py); sidecar names/paths stay keyed to the raw clip.
+    src = analysis_source(mp4)
+    cap = cv2.VideoCapture(str(src))
     native_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
@@ -229,6 +234,7 @@ def process_clip(model, key: str, mp4: Path):
         "model": key,
         "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms,
+        "sourceVideo": "undistorted" if src != mp4 else "raw",
         "device": "intel:cpu",
         "class": "person",
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -302,7 +308,8 @@ def _run(root: Path, args) -> int:
     else:
         clips = sorted((p for p in root.rglob("camera_main.mp4")),
                        key=lambda p: p.stat().st_mtime, reverse=True)
-    clips = [c for c in clips if c.exists()]
+    # undistorted/ holds lens-corrected COPIES of clips, not additional clips.
+    clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
 
     if shutil.which("ffmpeg") is None and ANNOTATE:
         print("warning: ffmpeg not found; annotated videos will be skipped", file=sys.stderr)

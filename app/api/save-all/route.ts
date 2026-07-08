@@ -1,5 +1,5 @@
 import { createWriteStream } from "node:fs";
-import { mkdir, stat } from "node:fs/promises";
+import { mkdir, readdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { Readable } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -7,6 +7,7 @@ import { pipeline } from "node:stream/promises";
 import { NextResponse } from "next/server";
 
 import { NODES, baseUrl } from "@/lib/nodes";
+import { spawnBatch } from "@/lib/spawn-batch";
 import type { SaveResult } from "@/lib/types";
 
 export const runtime = "nodejs";
@@ -82,9 +83,82 @@ async function saveNode(
   return result;
 }
 
+// After both nodes' files are on disk, write one combined metadata.json in each
+// recording's streams/ dir — the folder that holds cam1/ and cam2/ — merging every
+// node's own per-camera metadata.json so a session's cameras are described together
+// in one place. Regenerated on every Save All (idempotent). Each stream's path is
+// re-rooted to the combined dir (e.g. "streams/camera_main.mp4" -> "cam1/camera_main.mp4").
+async function writeCombinedMetadata(root: string) {
+  const listDirs = async (dir: string) => {
+    try {
+      return (await readdir(dir, { withFileTypes: true }))
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name);
+    } catch {
+      return [];
+    }
+  };
+  for (const day of await listDirs(root)) {
+    for (const rec of await listDirs(path.join(root, day))) {
+      const streamsDir = path.join(root, day, rec, "streams");
+      const cameras: Record<string, unknown> = {};
+      let recordingId = rec;
+      let space: unknown;
+      let schemaVersion: unknown;
+      for (const node of NODES) {
+        let raw: Record<string, unknown>;
+        try {
+          raw = JSON.parse(await readFile(path.join(streamsDir, node.id, "metadata.json"), "utf8"));
+        } catch {
+          continue; // this node has no metadata for this rec — skip it
+        }
+        recordingId = (raw.recording_id as string) ?? recordingId;
+        space = raw.space ?? space;
+        schemaVersion = raw.schema_version ?? schemaVersion;
+        const reroot = (p: unknown) =>
+          typeof p === "string" ? `${node.id}/${path.basename(p)}` : p;
+        const streams: Record<string, unknown> = {};
+        for (const [name, s] of Object.entries((raw.streams as Record<string, unknown>) ?? {})) {
+          const sv = s as Record<string, unknown>;
+          streams[name] = { ...sv, path: reroot(sv.path), timestamps_path: reroot(sv.timestamps_path) };
+        }
+        cameras[node.id] = {
+          node: raw.node,
+          start_time: raw.start_time,
+          end_time: raw.end_time,
+          duration_seconds: raw.duration_seconds,
+          streams,
+        };
+      }
+      if (Object.keys(cameras).length === 0) continue;
+      const combined = { recording_id: recordingId, space, schema_version: schemaVersion, cameras };
+      try {
+        await writeFile(path.join(streamsDir, "metadata.json"), JSON.stringify(combined, null, 2));
+      } catch {
+        // best-effort — a failed combined write shouldn't fail the save
+      }
+    }
+  }
+}
+
 export async function POST() {
   const root = saveRoot();
   const nodes = await Promise.all(NODES.map((n) => saveNode(n, root)));
+  await writeCombinedMetadata(root);
+  // Lens-corrected copies for calibrated recordings (streams/<cam>/undistorted/);
+  // idempotent + flocked, so firing after every save is safe. Analysis prefers
+  // these copies when present. Same venv python as detection (needs cv2).
+  try {
+    const python =
+      process.env.SMARTROOM_DETECT_PYTHON ||
+      path.join(process.env.HOME || "", "Code", "yolo-bench", ".venv", "bin", "python");
+    spawnBatch(python, [path.join(process.cwd(), "detect", "undistort.py")], {
+      cwd: process.cwd(),
+      logName: ".undistort.log",
+    });
+  } catch {
+    // undistortion is best-effort; the save itself succeeded
+  }
   return NextResponse.json(
     { saveRoot: root, nodes },
     { headers: { "cache-control": "no-store" } }

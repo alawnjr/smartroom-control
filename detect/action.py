@@ -463,7 +463,12 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     _atomic_write_json(json_path, {"schemaVersion": SCHEMA_VERSION, "status": "analyzing",
                                    "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
 
-    cap = cv2.VideoCapture(str(mp4))
+    # Decode the lens-corrected copy when the recording is calibrated (see
+    # undistort.py) — pose estimation then runs on undistorted frames. Sidecar
+    # names/paths and staleness stay keyed to the raw clip.
+    from calib_utils import analysis_source
+    src = analysis_source(mp4)
+    cap = cv2.VideoCapture(str(src))
     reported_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
@@ -474,7 +479,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     # the timeline (t = idx/fps) and makes the sliding-window warm-up span ~2x the
     # real seconds. Prefer the *true* average fps = frame_count / duration so the
     # timeline lines up with the playing video and warm-up reflects real time.
-    native_fps = _true_fps(mp4) or reported_fps
+    native_fps = _true_fps(src) or reported_fps
     stride = pick_stride(native_fps)  # samples per the clip's true fps (see pick_stride)
     classify_every = pick_classify_every(stride, variant["classify_every"])  # frames between classifications
 
@@ -527,7 +532,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     centroids = defaultdict(list)   # per track: per-frame bbox centroid {t,x,y} (location tracking sidecar)
     seen = []
     idx = 0
-    for r in pose.track(str(mp4), stream=True, persist=True, classes=[0], device="cpu", verbose=False):
+    for r in pose.track(str(src), stream=True, persist=True, classes=[0], device="cpu", verbose=False):
         boxes = r.boxes
         kpts = r.keypoints
         perframe = []
@@ -602,7 +607,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     # centered on g, i.e. the latest classification computed at or before g+offset.
     tmp_raw = annotated_path.with_suffix(".raw.mp4")
     writer = cv2.VideoWriter(str(tmp_raw), cv2.VideoWriter_fourcc(*"mp4v"), native_fps, (width, height))
-    cap = cv2.VideoCapture(str(mp4))
+    cap = cv2.VideoCapture(str(src))  # same frames the keypoints were computed on
     for g, perframe in enumerate(framedata):
         ret, frame = cap.read()
         if not ret:
@@ -704,6 +709,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
+        "sourceVideo": "undistorted" if src != mp4 else "raw",
         "device": "cpu", "classifier": variant["classifier"], "poseSource": pose_source,
         # Settings that produced this analysis (shown in the dashboard header).
         "stride": stride, "classifyEvery": classify_every,
@@ -757,7 +763,8 @@ def main():
             clips = [root / p for p in args.path]
         else:
             clips = sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
-        clips = [c for c in clips if c.exists()]
+        # undistorted/ holds lens-corrected COPIES of clips, not additional clips.
+        clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
 
         from mmaction.apis import inference_skeleton, init_recognizer
         from ultralytics import YOLO
