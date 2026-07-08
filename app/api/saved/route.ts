@@ -3,7 +3,7 @@ import path from "node:path";
 
 import { NextResponse } from "next/server";
 
-import { readDetections, readValidation } from "@/lib/detections";
+import { readDetections, readUndistorted, readValidation } from "@/lib/detections";
 import { savedRoot } from "@/lib/recordings";
 import type { SavedVideo } from "@/lib/types";
 
@@ -49,8 +49,11 @@ export async function GET() {
     }
     const detections = await readDetections(abs);
     const validation = await readValidation(abs);
+    const undistorted = readUndistorted(abs);
     videos.push({
       validation,
+      undistortedRelPath: undistorted?.rel,
+      undistortedVersion: undistorted?.version,
       node: (si >= 0 ? parts[si + 1] : "") ?? "",
       day: parts[0] ?? "",
       rec: parts[1] ?? "",

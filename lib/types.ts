@@ -57,6 +57,9 @@ export type SavedVideo = {
   mtime: number;
   detections?: Record<string, DetectionSummary>; // in-place per-model detection + action results
   validation?: ValidationSummary; // data-integrity checks (detect/validate.py sidecar)
+  // Lens-corrected copy (undistort.py), when this clip is calibrated + processed:
+  undistortedRelPath?: string;
+  undistortedVersion?: number; // file mtime — cache-buster
 };
 
 export type DetectionStatus = "analyzing" | "done" | "error" | "none";

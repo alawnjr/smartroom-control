@@ -123,8 +123,16 @@ function AnalysisCard({ v, model, roomName, selected, onToggleSelect }: { v: Sav
   const [overlay, setOverlay] = useState(true);
   const [drawer, setDrawer] = useState(false);
   const [showValidation, setShowValidation] = useState(false);
+  // Before/after intrinsic calibration: when a lens-corrected copy exists,
+  // the raw view can flip between the original and the undistorted video.
+  const hasCorrected = Boolean(v.undistortedRelPath);
+  const [corrected, setCorrected] = useState(false);
   const showOverlay = overlay && hasOverlay;
-  const src = showOverlay ? fileUrl(d!.annotatedRelPath!, d!.version) : fileUrl(v.relPath);
+  const src = showOverlay
+    ? fileUrl(d!.annotatedRelPath!, d!.version)
+    : corrected && hasCorrected
+      ? fileUrl(v.undistortedRelPath!, v.undistortedVersion)
+      : fileUrl(v.relPath);
   const analyzing = clipAnalyzing(v);
 
   const reanalyze = useMutation({
@@ -198,6 +206,19 @@ function AnalysisCard({ v, model, roomName, selected, onToggleSelect }: { v: Sav
             className="absolute bottom-2 right-2 rounded-md border border-white/30 bg-black/60 px-2 py-0.5 text-[10px] font-bold text-white"
           >
             {showOverlay ? "raw" : isPose ? "skeleton" : isAction ? "labels" : "boxes"}
+          </button>
+        )}
+        {!showOverlay && hasCorrected && (
+          <button
+            onClick={() => setCorrected((c) => !c)}
+            title="Compare the original video with the lens-corrected (undistorted) copy — the difference is strongest at the frame edges"
+            className={`absolute bottom-2 left-2 rounded-md border px-2 py-0.5 text-[10px] font-bold ${
+              corrected
+                ? "border-emerald-300/60 bg-emerald-600/80 text-white"
+                : "border-white/30 bg-black/60 text-white"
+            }`}
+          >
+            {corrected ? "after: corrected" : "before: original"}
           </button>
         )}
       </div>

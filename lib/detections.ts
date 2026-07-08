@@ -152,6 +152,24 @@ export async function readDetections(absMp4: string): Promise<Record<string, Det
   return readDetectionsInDir(path.dirname(absMp4), absMp4);
 }
 
+// The clip's lens-corrected copy (streams/<cam>/undistorted/, from
+// detect/undistort.py), when present and at least as new as the raw clip and
+// its calibration — same freshness rule as detect/calib_utils.analysis_source.
+export function readUndistorted(absMp4: string): { rel: string; version: number } | undefined {
+  const out = path.join(path.dirname(absMp4), "undistorted", path.basename(absMp4));
+  try {
+    const outSt = statSync(out);
+    const newestSrc = Math.max(
+      statSync(absMp4).mtimeMs,
+      statSync(path.join(path.dirname(absMp4), "metadata.json")).mtimeMs
+    );
+    if (outSt.mtimeMs < newestSrc) return undefined;
+    return { rel: path.relative(savedRoot(), out), version: Math.round(outSt.mtimeMs) };
+  } catch {
+    return undefined;
+  }
+}
+
 // One clip's data-validation sidecar (<stem>.validation.json, from detect/validate.py).
 // Undefined when the clip was never validated.
 export async function readValidation(absMp4: string): Promise<ValidationSummary | undefined> {
