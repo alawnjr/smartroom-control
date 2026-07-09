@@ -113,9 +113,19 @@ def validate_clip(mp4: Path) -> list:
           f"duration={duration}s frames={frames}" if duration else "ffprobe could not read the file")
     real_fps = (frames / duration) if duration and frames else None
     if real_fps is not None:
-        lo, hi = TARGET_FPS * (1 - FPS_TOL_FRAC), TARGET_FPS * (1 + FPS_TOL_FRAC)
+        # Judge against the rate the NODE was configured for (metadata fps —
+        # e.g. cam1 runs a reduced 15fps on its flaky USB link), falling back
+        # to the global target.
+        nominal = TARGET_FPS
+        try:
+            meta_fps = json.loads((mp4.parent / "metadata.json").read_text())["streams"]["camera_main"]["fps"]
+            if meta_fps:
+                nominal = float(meta_fps)
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        lo, hi = nominal * (1 - FPS_TOL_FRAC), nominal * (1 + FPS_TOL_FRAC)
         check("fps_matches_target", lo <= real_fps <= hi,
-              f"actual {real_fps:.2f} fps vs target {TARGET_FPS:g} "
+              f"actual {real_fps:.2f} fps vs nominal {nominal:g} "
               f"(allowed {lo:.1f}-{hi:.1f}; {frames} frames / {duration:.2f}s)")
 
     # --- per-cam metadata.json (sibling of the mp4) ---
