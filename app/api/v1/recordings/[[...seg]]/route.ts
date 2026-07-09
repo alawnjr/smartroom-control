@@ -132,6 +132,27 @@ async function inference(day: string, rec: string, cam: string, model: string) {
   if (!any) return json({ error: `no inference for model '${model}' on this clip` }, 404);
   const meta = await readJsonIf(path.join(dir, "metadata.json"));
   out.calibration = meta?.streams?.camera_main?.calibration ?? null;
+
+  // Action models: also join everything per person into a top-level `tracks`
+  // array with an explicit trackId, so consumers don't have to correlate three
+  // separately-keyed blobs. (The raw sidecar sections above stay as-is.)
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  const timelines = (out.actions as any)?.tracks ?? {};
+  const persons = (out.persons as any)?.persons ?? {};
+  const cents = (out.centroids as any)?.persons ?? {};
+  const ids = [...new Set([...Object.keys(timelines), ...Object.keys(persons), ...Object.keys(cents)])];
+  if (ids.length) {
+    ids.sort((a, b) => Number(a) - Number(b));
+    out.tracks = ids.map((id) => ({
+      trackId: id,
+      dominantAction: (out.detections as any)?.trackActions?.[id] ?? null,
+      segments: persons[id]?.segments ?? [],       // merged action ranges {action,start,end,conf}
+      jumps: persons[id]?.jumps ?? [],             // geometric jump events, seconds
+      timeline: timelines[id] ?? [],               // per-window {t,action,conf,kept,top}
+      centroids: cents[id] ?? [],                  // per-frame body center {t,x,y}, pixels
+    }));
+  }
+  /* eslint-enable @typescript-eslint/no-explicit-any */
   return json(out);
 }
 

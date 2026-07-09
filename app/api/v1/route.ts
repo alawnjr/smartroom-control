@@ -22,7 +22,7 @@ export async function GET(req: NextRequest) {
         inference: {
           url: `${o}/api/v1/recordings/{day}/{rec}/{cam}/inference/{model}`,
           description:
-            "Every inference sidecar for one clip+model merged into one JSON: detections summary/timeline, action timelines, per-person segments+keypoints, centroids, raw pose keypoints; plus the camera calibration when present.",
+            "Every inference sidecar for one clip+model merged into one JSON. Action models include a per-person `tracks` array (explicit trackId + dominantAction + segments + timeline + centroids) plus the raw sidecar sections; plus the camera calibration when present.",
           models: ["yolo26l", "yolo26n-pose", "action", "action-hmdb"],
         },
         frame: {

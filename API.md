@@ -77,6 +77,7 @@ present only when that artifact exists for the model:
 | key | present for | contents |
 |---|---|---|
 | `detections` | all models | summary: status, occupancy timeline, run settings |
+| `tracks` | action models | **per-person join with explicit `trackId`** — start here |
 | `actions` | action models | per-track action timeline with per-window top-K |
 | `persons` | action models | per-person segments + per-window keypoints |
 | `centroids` | action models | per-frame body-center track (location over time) |
@@ -114,6 +115,28 @@ present only when that artifact exists for the model:
   "timeline": [{"t": 0.0, "count": 2}, ...]   // detection models: people per sampled frame
 }
 ```
+
+### `tracks` (per-person join — the easiest section to consume)
+
+One object per tracked person, everything correlated by explicit `trackId`:
+
+```jsonc
+{
+  "tracks": [
+    {
+      "trackId": "1",                    // same id used as the key in actions/persons/centroids
+      "dominantAction": "pour",          // majority vote over confident windows
+      "segments": [ {"action": "pour", "start": 0.167, "end": 0.567, "conf": 0.31}, ... ],
+      "jumps":    [ {"start": 3.2, "end": 3.6, "peak": 0.31} ],
+      "timeline": [ {"t": 0.167, "action": "pour", "conf": 0.361, "kept": true, "top": [...]}, ... ],
+      "centroids":[ {"t": 0.0, "x": 512.5, "y": 477.0}, ... ]   // per-frame body center, pixels
+    }
+  ]
+}
+```
+
+The sections below carry the same data in its raw sidecar layout (keyed by
+track id), kept for compatibility; `tracks` is the recommended entry point.
 
 ### `actions` (per-track timeline)
 
