@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Download, Minus, Plus } from "lucide-react";
+import { CloudUpload, Download, Minus, Plus } from "lucide-react";
 
 import { ActionClassesPage } from "@/components/action-classes-page";
 import { Analytics } from "@/components/analytics";
@@ -35,6 +35,53 @@ function post(url: string, body?: unknown) {
     headers: body ? { "content-type": "application/json" } : undefined,
     body: body ? JSON.stringify(body) : undefined,
   }).catch(() => {});
+}
+
+// "Sync to mirror" — pushes the saved recordings to the public Vercel mirror
+// (incremental; POST /api/mirror spawns the mirror repo's sync script). Polls
+// while a sync runs and shows the run's summary line when it finishes.
+function MirrorButton() {
+  const qc = useQueryClient();
+  const status = useQuery<{
+    running: boolean;
+    summary: string | null;
+    failed: boolean;
+    finishedAt: number | null;
+  }>({
+    queryKey: ["mirror"],
+    queryFn: () => fetch("/api/mirror").then((r) => r.json()),
+    refetchInterval: (q) => (q.state.data?.running ? 2000 : false),
+  });
+  const sync = useMutation({
+    mutationFn: () => post("/api/mirror"),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["mirror"] }),
+  });
+  const running = status.data?.running ?? false;
+  // "manifest: 12 sessions | uploaded 34 blobs (56.7 MB) | 890 up-to-date"
+  const summary = status.data?.summary?.replace(/^manifest:\s*/, "") ?? null;
+  return (
+    <div className="flex items-center gap-2">
+      {running ? (
+        <Pill className="bg-sky-100 text-sky-700">
+          <span className="size-2 animate-pulse rounded-full bg-sky-500" /> mirroring…
+        </Pill>
+      ) : status.data?.failed ? (
+        <Pill className="bg-rose-100 text-rose-700">mirror sync failed</Pill>
+      ) : summary ? (
+        <span className="hidden text-xs text-muted sm:inline" title={summary}>
+          {summary.split("|").slice(1).join("·").trim()}
+        </span>
+      ) : null}
+      <button
+        onClick={() => sync.mutate()}
+        disabled={running || sync.isPending}
+        className="flex items-center gap-1.5 rounded-full border border-line bg-card px-3 py-1 text-sm font-bold text-muted hover:bg-foreground hover:text-background disabled:opacity-50"
+        title="Upload new recordings + inference to the public Vercel mirror"
+      >
+        <CloudUpload size={14} /> Sync to mirror
+      </button>
+    </div>
+  );
 }
 
 function Pill({ className = "", children }: { className?: string; children: React.ReactNode }) {
@@ -429,6 +476,7 @@ export function Dashboard({ nodes: config }: { nodes: NodeConfig[] }) {
               <span className="size-2 animate-pulse rounded-full bg-amber-500" /> analyzing {analyzing}
             </Pill>
           )}
+          <MirrorButton />
           <Pill className="border border-line bg-card text-muted">{clips.length} clips</Pill>
         </div>
       </div>
