@@ -393,8 +393,10 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
     });
   const allRelPaths = videos.map((v) => v.relPath);
   const selectedCount = allRelPaths.filter((r) => selected.has(r)).length; // ignores stale entries
-  // Body for a batch run: the selected clips, or all when nothing is checked.
-  const batchBody = () => (selectedCount > 0 ? { relPaths: allRelPaths.filter((r) => selected.has(r)), force: true } : { force: true });
+  // Body for a batch run: the selected clips (forced — checking a clip means
+  // "redo this one"), or everything when nothing is checked — NOT forced, so
+  // already-analyzed clips are skipped and "Analyze all" only does new work.
+  const batchBody = () => (selectedCount > 0 ? { relPaths: allRelPaths.filter((r) => selected.has(r)), force: true } : { force: false });
 
   const detectAll = useMutation({ mutationFn: () => post("/api/detect", batchBody()), onSuccess: () => pingSavedSoon(qc) });
   const validateAll = useMutation({ mutationFn: () => post("/api/validate", batchBody()), onSuccess: () => pingSavedSoon(qc) });
