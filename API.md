@@ -80,9 +80,11 @@ present only when that artifact exists for the model:
 | `tracks` | action models | **per-person join with explicit `trackId`** — start here |
 | `actions` | action models | per-track action timeline with per-window top-K |
 | `persons` | action models | per-person segments + per-window keypoints |
-| `centroids` | action models | per-frame body-center track (location over time) |
+| `centroids` | action models | per-frame body-center track (+ metric `room` positions when located) |
 | `keypoints` | `yolo26n-pose` | raw normalized skeletons per sampled frame |
 | `calibration` | calibrated clips | camera intrinsics (else `null`) |
+| `extrinsics` | tag-calibrated clips | camera pose relative to the AprilTag (else `null`) |
+| `roomFrame` | located clips | metric room coordinate frame for `room` positions (else `null`) |
 
 ### Conventions used everywhere
 
@@ -90,7 +92,8 @@ present only when that artifact exists for the model:
   *true* average fps, so it lines up with video playback time.
 - **Coordinates** are **pixels** in the video frame, origin top-left, x right,
   y down — except the `keypoints` sidecar, which is **normalized 0–1** (multiply
-  by frame width/height).
+  by frame width/height), and `room` positions, which are **millimetres** in the
+  AprilTag floor frame (see `roomFrame` below).
 - **Skeletons** are **COCO-17** joints, in this order: nose, left-eye, right-eye,
   left-ear, right-ear, left-shoulder, right-shoulder, left-elbow, right-elbow,
   left-wrist, right-wrist, left-hip, right-hip, left-knee, right-knee,
@@ -129,7 +132,9 @@ One object per tracked person, everything correlated by explicit `trackId`:
       "segments": [ {"action": "pour", "start": 0.167, "end": 0.567, "conf": 0.31}, ... ],
       "jumps":    [ {"start": 3.2, "end": 3.6, "peak": 0.31} ],
       "timeline": [ {"t": 0.167, "action": "pour", "conf": 0.361, "kept": true, "top": [...]}, ... ],
-      "centroids":[ {"t": 0.0, "x": 512.5, "y": 477.0}, ... ]   // per-frame body center, pixels
+      "centroids":[ {"t": 0.0, "x": 512.5, "y": 477.0,
+                     "room": [780.0, 1220.0], "src": "ankles"},  // see room positions below
+                    ... ]
     }
   ]
 }
@@ -176,8 +181,41 @@ track id), kept for compatibility; `tracks` is the recommended entry point.
 ### `centroids` (location tracking)
 
 ```jsonc
-{ "persons": { "1": [ {"t": 0.0, "x": 512.5, "y": 477.0}, ... ] } }  // bbox center, pixels, every frame
+{ "persons": { "1": [ {"t": 0.0, "x": 512.5, "y": 477.0,        // bbox center, pixels, every frame
+                       "room": [780.0, 1220.0], "src": "ankles"} // metric room position (see below)
+                    , ... ] },
+  "roomFrame": { ... } }   // present only when the clip could be located (same object as top-level)
 ```
+
+### `roomFrame` + `room` — metric person positions (AprilTag-relative)
+
+Clips recorded with **both** an intrinsic (checkerboard) and extrinsic
+(AprilTag) calibration, analyzed after the room's floor height was solved, get
+real-world positions: each centroid entry carries `room: [x_mm, z_mm]` — where
+that person is **standing on the floor**, in millimetres relative to the tag.
+
+```jsonc
+{ "roomFrame": {
+    "origin": "floor point directly under the AprilTag's center",
+    "axes": "X = tag's right (viewed facing the tag), Z = out of the wall; mm",
+    "tagId": 1,
+    "tagHeightMm": 1203.8,                     // tag center above the floor
+    "cameraPositionMm": [-1769.4, 1136.7, 2785.9],  // camera [X, height, Z] in the same frame
+    "cameraId": "usb-046d_HD_Pro_Webcam_C920_6E6D65AF" } }
+```
+
+- Coordinates are a **top-down plan view**: `x` along the tag's wall, `z`
+  perpendicular distance from the wall. Distance from the tag is
+  `hypot(x, z)`; distance from the camera is `hypot(x - camX, z - camZ)`
+  (ignoring height).
+- `src` says which pixel was projected: `"ankles"` (visible ankle keypoints —
+  trust it) or `"bbox"` (feet occluded, bounding-box bottom used — biased
+  toward the camera when the person is behind furniture).
+- `room` is `null` for samples whose ray didn't hit a believable floor point.
+- **Assumption**: the person is standing on the floor. Positions are wrong
+  while jumping, sitting on elevated furniture, or lying down.
+- `roomFrame` is `null` and `room`/`src` keys are absent entirely for clips
+  without the needed calibrations.
 
 ### `keypoints` (raw pose stream, `yolo26n-pose` only)
 

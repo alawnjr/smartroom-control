@@ -132,6 +132,13 @@ async function inference(day: string, rec: string, cam: string, model: string) {
   if (!any) return json({ error: `no inference for model '${model}' on this clip` }, 404);
   const meta = await readJsonIf(path.join(dir, "metadata.json"));
   out.calibration = meta?.streams?.camera_main?.calibration ?? null;
+  out.extrinsics = meta?.streams?.camera_main?.extrinsics ?? null;
+  // Metric room coordinate frame (AprilTag-relative floor positions) — present
+  // when the clip was analyzed with extrinsics + a known tag height. Track
+  // centroid entries then carry room:[x_mm,z_mm] + src ("ankles"|"bbox").
+  /* eslint-disable @typescript-eslint/no-explicit-any */
+  out.roomFrame = (out.centroids as any)?.roomFrame ?? null;
+  /* eslint-enable @typescript-eslint/no-explicit-any */
 
   // Action models: also join everything per person into a top-level `tracks`
   // array with an explicit trackId, so consumers don't have to correlate three
@@ -149,7 +156,7 @@ async function inference(day: string, rec: string, cam: string, model: string) {
       segments: persons[id]?.segments ?? [],       // merged action ranges {action,start,end,conf}
       jumps: persons[id]?.jumps ?? [],             // geometric jump events, seconds
       timeline: timelines[id] ?? [],               // per-window {t,action,conf,kept,top}
-      centroids: cents[id] ?? [],                  // per-frame body center {t,x,y}, pixels
+      centroids: cents[id] ?? [],                  // per-frame {t,x,y} px (+ room:[x,z] mm, src when located)
     }));
   }
   /* eslint-enable @typescript-eslint/no-explicit-any */

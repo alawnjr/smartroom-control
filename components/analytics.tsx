@@ -6,6 +6,7 @@ import { Download, LineChart, Loader2, RefreshCw, ScanEye, ShieldAlert, ShieldCh
 
 import { ClipAnalyticsDrawer } from "@/components/clip-analytics-drawer";
 import { GeometricPanel } from "@/components/geometric-page";
+import { RoomMapPanel } from "@/components/room-map";
 import { OccupancyGraph } from "@/components/occupancy-graph";
 import { tagClass } from "@/lib/action-colors";
 import { analyzingCount, clipAnalyzing, groupSessions, pingSavedSoon, useSaved, validatingCount, type Session } from "@/lib/use-saved";
@@ -358,7 +359,7 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
   const available = MODEL_ORDER.filter((m) => videos.some((v) => v.detections?.[m]));
   const [sel, setSel] = useState<string | null>(null);
   const model = sel && available.includes(sel) ? sel : (available[0] ?? "yolo26n");
-  const [view, setView] = useState<"models" | "geometric">("models");
+  const [view, setView] = useState<"models" | "geometric" | "map">("models");
 
   // Analysis settings are GLOBAL, stored in action-classes.json's `settings` block
   // (shared with detect/action.py). The bar edits them; a re-analysis picks them up.
@@ -405,19 +406,21 @@ export function Analytics({ nodes: config }: { nodes: NodeConfig[] }) {
     <div>
       {/* sub-view: model analysis vs. geometric (classifier-independent) events */}
       <div className="mb-4 flex overflow-hidden rounded-xl border border-line w-fit">
-        {(["models", "geometric"] as const).map((vw) => (
+        {(["models", "geometric", "map"] as const).map((vw) => (
           <button
             key={vw}
             onClick={() => setView(vw)}
             className={`px-3.5 py-1.5 text-sm font-bold ${view === vw ? "bg-foreground text-background" : "text-muted hover:bg-card"}`}
           >
-            {vw === "models" ? "Models" : "Geometric"}
+            {vw === "models" ? "Models" : vw === "geometric" ? "Geometric" : "Room map"}
           </button>
         ))}
       </div>
 
       {view === "geometric" ? (
         <GeometricPanel nodes={config} />
+      ) : view === "map" ? (
+        <RoomMapPanel />
       ) : videos.length === 0 ? (
         <p className="text-sm text-muted">No clips to analyze yet — “Beam to laptop” on the Live tab first.</p>
       ) : (

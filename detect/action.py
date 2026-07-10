@@ -112,6 +112,9 @@ PARTIAL = "not fully in frame"
 KP_CONF = float(os.environ.get("SMARTROOM_ACTION_KP_CONF", "0.3"))
 KP_CONF_SET = os.environ.get("SMARTROOM_ACTION_KP_CONF") is not None  # explicit override?
 MIN_KEYPOINTS = int(os.environ.get("SMARTROOM_ACTION_MIN_KEYPOINTS", "10"))
+# Ankle-confidence floor for metric room positions (independent of the relaxed
+# RTMPose kp_conf — see the room-position block in process_clip).
+ROOM_KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
 # How many top classes to record per window for the live per-person bar graph.
 TOPK = int(os.environ.get("SMARTROOM_ACTION_TOPK", "12"))
 SCHEMA_VERSION = 2
@@ -466,7 +469,8 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     # Decode the lens-corrected copy when the recording is calibrated (see
     # undistort.py) — pose estimation then runs on undistorted frames. Sidecar
     # names/paths and staleness stay keyed to the raw clip.
-    from calib_utils import analysis_source
+    from calib_utils import (ANKLE_JOINT_HEIGHT_MM, analysis_source,
+                             load_room_geometry, pixel_to_floor)
     src = analysis_source(mp4)
     cap = cv2.VideoCapture(str(src))
     reported_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -481,6 +485,11 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     # timeline lines up with the playing video and warm-up reflects real time.
     native_fps = _true_fps(src) or reported_fps
     stride = pick_stride(native_fps)  # samples per the clip's true fps (see pick_stride)
+
+    # Metric room positions (mm, relative to the AprilTag's floor point) for
+    # clips with embedded extrinsics + a known tag height; None otherwise and
+    # the centroids sidecar stays exactly as before.
+    room_geom = load_room_geometry(mp4, width, height, undistorted=(src != mp4))
     classify_every = pick_classify_every(stride, variant["classify_every"])  # frames between classifications
 
     def classify(window):
@@ -551,9 +560,28 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
                 conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
             for n, tid in enumerate(ids):
                 traj[tid].append((idx, xy[n], conf[n]))  # every frame (full vertical resolution)
-                centroids[tid].append({"t": round(idx / native_fps, 3),
-                                       "x": round((xyxy[n][0] + xyxy[n][2]) / 2.0, 1),
-                                       "y": round((xyxy[n][1] + xyxy[n][3]) / 2.0, 1)})
+                entry = {"t": round(idx / native_fps, 3),
+                         "x": round((xyxy[n][0] + xyxy[n][2]) / 2.0, 1),
+                         "y": round((xyxy[n][1] + xyxy[n][3]) / 2.0, 1)}
+                if room_geom is not None:
+                    # Ground contact pixel: the ankles when visible, else the box
+                    # bottom (feet occluded -> position biased toward the camera,
+                    # marked "bbox" so consumers can weight it accordingly).
+                    # Stricter gate than kp_conf: a hallucinated ankle merely
+                    # mis-draws a skeleton, but it projects meters of position error.
+                    vis = [j for j in (15, 16) if conf[n][j] >= max(kp_conf, ROOM_KP_CONF)]
+                    if vis:
+                        gu = float(sum(xy[n][j][0] for j in vis)) / len(vis)
+                        gv = float(sum(xy[n][j][1] for j in vis)) / len(vis)
+                        ground_src, plane = "ankles", ANKLE_JOINT_HEIGHT_MM
+                    else:
+                        gu, gv = (xyxy[n][0] + xyxy[n][2]) / 2.0, float(xyxy[n][3])
+                        ground_src, plane = "bbox", 0.0
+                    hit = pixel_to_floor(gu, gv, room_geom, plane)
+                    entry["room"] = ([round(hit[0], 1), round(hit[1], 1)]
+                                     if hit is not None else None)
+                    entry["src"] = ground_src
+                centroids[tid].append(entry)
                 if idx % stride == 0:
                     tubes[tid].append((xy[n], conf[n]))
                     n_vis = int((conf[n] >= kp_conf).sum())
@@ -700,12 +728,24 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
         "window": WINDOW, "stride": stride, "poseSource": pose_source, "persons": persons})
 
-    # Location/centroid tracking — its own file (per-frame bbox centroid per person).
-    centroids_path = out_dir / f"{mp4.stem}.centroids.{key}.json"
-    _atomic_write_json(centroids_path, {
+    # Location/centroid tracking — its own file (per-frame bbox centroid per
+    # person, plus metric room positions when the clip has extrinsics).
+    centroids_doc = {
         "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
-        "persons": {str(t): centroids[t] for t in centroids}})
+        "persons": {str(t): centroids[t] for t in centroids}}
+    if room_geom is not None:
+        cam_pos = room_geom["cam_pos_mm"]
+        centroids_doc["roomFrame"] = {
+            "origin": "floor point directly under the AprilTag's center",
+            "axes": "X = tag's right (viewed facing the tag), Z = out of the wall; mm",
+            "tagId": room_geom["tag_id"],
+            "tagHeightMm": round(room_geom["tag_height_mm"], 1),
+            "cameraPositionMm": [round(float(v), 1) for v in cam_pos],
+            "cameraId": room_geom["camera_id"],
+        }
+    centroids_path = out_dir / f"{mp4.stem}.centroids.{key}.json"
+    _atomic_write_json(centroids_path, centroids_doc)
     _atomic_write_json(json_path, {
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
