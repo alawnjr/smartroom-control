@@ -154,10 +154,11 @@ function analysisCard(v) {
     selected.has(v.relPath) ? selected.delete(v.relPath) : selected.add(v.relPath);
     render(true);
   }});
-  const reBtn = h("button", { class: "icobtn", title: "Re-run this model on this clip", disabled: analyzing || model === GEOMETRIC, onclick: async (e) => {
+  // Retry always re-runs the NTU action analysis on this clip (regardless of
+  // which model the card is showing) — that's the pass worth redoing.
+  const reBtn = h("button", { class: "icobtn", title: "Re-run actions (NTU) on this clip", disabled: analyzing, onclick: async (e) => {
     e.currentTarget.disabled = true;
-    await post(isAction ? "/api/action" : "/api/detect",
-      isAction ? { relPath: v.relPath, force: true, variant: model === "action-hmdb" ? "hmdb" : "ntu" } : { relPath: v.relPath, force: true });
+    await post("/api/action", { relPath: v.relPath, force: true, variant: "ntu" });
     pingSoon();
   }}, analyzing ? h("span", { class: "spin" }, "⟳") : "⟳");
   const valBtn = h("button", { class: "icobtn", title: "Re-run data validation on this clip", disabled: v.validation?.status === "analyzing", onclick: async (e) => {
