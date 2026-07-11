@@ -177,33 +177,20 @@ function analysisCard(v) {
     body = geometricBody(v);
   } else {
     const hasOverlay = Boolean(d?.hasAnnotated && d.annotatedRelPath);
-    const hasCorrected = Boolean(v.undistortedRelPath);
-    let overlay = hasOverlay;   // per-render state; toggles just swap src in place
-    let corrected = false;
-    const src = () => (overlay && hasOverlay)
-      ? fileUrl(d.annotatedRelPath, d.version)
-      : corrected && hasCorrected ? fileUrl(v.undistortedRelPath, v.undistortedVersion) : fileUrl(v.relPath);
+    let overlay = hasOverlay;   // per-render state; the toggle just swaps src in place
+    const src = () => (overlay && hasOverlay ? fileUrl(d.annotatedRelPath, d.version) : fileUrl(v.relPath));
 
     const vwrap = h("div", { class: "vwrap" });
     if (d?.status === "done") {
       const video = h("video", { controls: true, preload: "none", src: src() });
       const obtn = hasOverlay ? h("button", { class: "vbtn right" }, "raw") : null;
-      const lbtn = hasCorrected ? h("button", { class: "vbtn left" }, "before: original") : null;
       const sync = () => {
         video.src = src();
         if (obtn) obtn.textContent = overlay ? "raw" : isPose ? "skeleton" : isAction ? "labels" : "boxes";
-        if (lbtn) {
-          lbtn.textContent = overlay && hasOverlay ? "compare lens fix" : corrected ? "after: corrected" : "before: original";
-          lbtn.className = `vbtn left ${!overlay && corrected ? "on" : ""}`;
-        }
       };
       if (obtn) obtn.addEventListener("click", () => { overlay = !overlay; sync(); });
-      if (lbtn) lbtn.addEventListener("click", () => {
-        if (overlay && hasOverlay) { overlay = false; corrected = true; } else corrected = !corrected;
-        sync();
-      });
       sync();
-      vwrap.append(video, ...[obtn, lbtn].filter(Boolean));
+      vwrap.append(video, ...[obtn].filter(Boolean));
     } else {
       vwrap.append(h("div", { class: "empty" },
         d?.status === "analyzing" ? "analyzing…" : d?.status === "error" ? "analysis failed" : "not analyzed"));

@@ -172,8 +172,6 @@ input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-colo
 .vwrap .empty { display: flex; height: 100%; align-items: center; justify-content: center; font-size: 12px; color: var(--neutral-4); }
 .vbtn { position: absolute; bottom: 8px; border-radius: 6px; border: 1px solid rgb(255 255 255 / .3); background: rgb(0 0 0 / .6); padding: 2px 8px; font-size: 10px; font-weight: 700; color: #fff; }
 .vbtn.right { right: 8px; }
-.vbtn.left { left: 8px; }
-.vbtn.on { border-color: rgb(110 231 183 / .6); background: rgb(5 150 105 / .8); }
 .vbadge { position: absolute; left: 8px; top: 8px; display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; background: var(--amber-4); padding: 2px 6px; font-size: 11px; font-weight: 800; color: #451a03; }
 
 .acard .foot { margin-top: 8px; }
