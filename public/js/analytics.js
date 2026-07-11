@@ -34,6 +34,11 @@ function nameFor(nodeId) {
   return nodeNames.get(nodeId) ?? nodeId;
 }
 
+// Preview frame for a clip (1s in), extracted+cached by the v1 frame endpoint.
+function posterUrl(v) {
+  return `/api/v1/recordings/${encodeURIComponent(v.day)}/${encodeURIComponent(v.rec)}/${encodeURIComponent(v.node)}/frame?t=1&w=640`;
+}
+
 function cardModel(v) {
   const avail = MODEL_ORDER.filter((m) => v.detections?.[m]);
   const hasAction = avail.some(isActionKey);
@@ -100,7 +105,7 @@ function validationPanel(v) {
 // ---------- geometric (jump) card body ----------
 function geometricBody(v) {
   const actionModel = ["action", "action-hmdb"].find((m) => v.detections?.[m]?.status === "done");
-  const video = h("video", { controls: true, preload: "metadata", src: fileUrl(v.relPath) });
+  const video = h("video", { controls: true, preload: "none", poster: posterUrl(v), src: fileUrl(v.relPath) });
   const badge = h("span", { class: "vbadge" }, "");
   badge.hidden = true;
   const vwrap = h("div", { class: "vwrap" }, video, badge);
@@ -181,8 +186,12 @@ function analysisCard(v) {
     const src = () => (overlay && hasOverlay ? fileUrl(d.annotatedRelPath, d.version) : fileUrl(v.relPath));
 
     const vwrap = h("div", { class: "vwrap" });
+    // The raw clip is always playable (analysis only adds overlays), so every
+    // card shows a real video with a preview frame; a status pill sits on top
+    // while this model's analysis is pending/failed.
+    const video = h("video", { controls: true, preload: "none", poster: posterUrl(v), src: src() });
+    vwrap.append(video);
     if (d?.status === "done") {
-      const video = h("video", { controls: true, preload: "none", src: src() });
       const obtn = hasOverlay ? h("button", { class: "vbtn right" }, "raw") : null;
       const sync = () => {
         video.src = src();
@@ -190,9 +199,9 @@ function analysisCard(v) {
       };
       if (obtn) obtn.addEventListener("click", () => { overlay = !overlay; sync(); });
       sync();
-      vwrap.append(video, ...[obtn].filter(Boolean));
+      if (obtn) vwrap.append(obtn);
     } else {
-      vwrap.append(h("div", { class: "empty" },
+      vwrap.append(h("span", { class: "vstatus" },
         d?.status === "analyzing" ? "analyzing…" : d?.status === "error" ? "analysis failed" : "not analyzed"));
     }
 

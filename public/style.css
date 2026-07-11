@@ -173,6 +173,7 @@ input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-colo
 .vbtn { position: absolute; bottom: 8px; border-radius: 6px; border: 1px solid rgb(255 255 255 / .3); background: rgb(0 0 0 / .6); padding: 2px 8px; font-size: 10px; font-weight: 700; color: #fff; }
 .vbtn.right { right: 8px; }
 .vbadge { position: absolute; left: 8px; top: 8px; display: inline-flex; align-items: center; gap: 4px; border-radius: 6px; background: var(--amber-4); padding: 2px 6px; font-size: 11px; font-weight: 800; color: #451a03; }
+.vstatus { position: absolute; left: 8px; top: 8px; border-radius: 6px; background: rgb(0 0 0 / .6); padding: 2px 8px; font-size: 10px; font-weight: 700; color: #fff; pointer-events: none; }
 
 .acard .foot { margin-top: 8px; }
 .stat-line { margin-top: 4px; font-size: 12px; font-weight: 700; color: var(--muted); }

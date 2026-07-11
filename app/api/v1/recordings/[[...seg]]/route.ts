@@ -199,7 +199,15 @@ async function frame(dir: string, req: NextRequest) {
     );
     if (!stdout.length) return json({ error: "no frame at that time (past end of clip?)" }, 416);
     return new NextResponse(new Uint8Array(stdout), {
-      headers: { ...CORS, "content-type": "image/jpeg", "content-length": String(stdout.length) },
+      // Recordings are immutable once saved, so extracted frames can cache hard
+      // (the dashboard uses these as video posters — no-store would re-run
+      // ffmpeg for every card on every visit).
+      headers: {
+        ...CORS,
+        "cache-control": "public, max-age=86400",
+        "content-type": "image/jpeg",
+        "content-length": String(stdout.length),
+      },
     });
   } catch {
     return json({ error: "frame extraction failed" }, 500);
