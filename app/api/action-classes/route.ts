@@ -3,6 +3,8 @@ import path from "node:path";
 
 import { NextRequest, NextResponse } from "next/server";
 
+import { DATASETS } from "@/lib/action-classes";
+
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
@@ -28,7 +30,9 @@ async function read(): Promise<Config> {
 }
 
 export async function GET() {
-  return NextResponse.json(await read());
+  // `_datasets` ships the full label catalogs so the static frontend doesn't
+  // hardcode them. Underscored to keep clear of variant keys in the config map.
+  return NextResponse.json({ ...(await read()), _datasets: DATASETS });
 }
 
 // Body: { variant: string, disabled: string[] } updates one variant, or a full
@@ -61,7 +65,9 @@ export async function POST(req: NextRequest) {
     }
     cfg[variant] = { disabled: disabled.filter((d) => typeof d === "string") };
   } else if (body && typeof body === "object") {
-    Object.assign(cfg, body as Config);
+    // A client echoing GET's response back must not persist the catalog.
+    const { _datasets: _ignored, ...rest } = body as Config & { _datasets?: unknown };
+    Object.assign(cfg, rest);
   } else {
     return NextResponse.json({ error: "expected object" }, { status: 400 });
   }
