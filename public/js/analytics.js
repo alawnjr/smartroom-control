@@ -267,6 +267,9 @@ function toolbar() {
     h("button", { class: "tbtn", disabled: analyzing > 0, title: "Per-person actions (PoseC3D / HMDB51)", onclick: run("/api/action", { variant: "hmdb" }) }, "▶ Actions (HMDB)"),
     analyzing > 0 ? h("button", { class: "tbtn tbtn-cancel", onclick: async () => { await post("/api/detect/cancel"); pingSoon(); } }, "✕ Cancel") : null,
     h("span", { class: "grow" }),
+    h("button", { class: "tbtn", title: "Pull new recordings from the Pis, then analyze what's new",
+        onclick: async (e) => { e.target.disabled = true; try { await post("/api/save-all"); post("/api/detect"); } finally { e.target.disabled = false; } pingSoon(); } },
+      "⤓ Beam to laptop"),
     ...mirrorBits,
     h("button", { class: "tbtn", disabled: mirror.running, title: "Upload new recordings + inference to the public Vercel mirror", onclick: async () => { await post("/api/mirror"); pollMirror(); } }, "☁ Sync to mirror"),
   ].filter(Boolean);
@@ -282,7 +285,7 @@ function render(force = false) {
   const host = document.getElementById("an-sessions");
   const videos = listing.videos ?? [];
   if (videos.length === 0) {
-    host.replaceChildren(h("p", { class: "empty-note" }, "No clips to analyze yet — “Beam to laptop” on the Live tab first."));
+    host.replaceChildren(h("p", { class: "empty-note" }, "No clips to analyze yet — record on a node's page, then “Beam to laptop” above."));
     return;
   }
   const sessions = groupSessions(videos);

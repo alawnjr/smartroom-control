@@ -264,6 +264,3 @@ input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-colo
 .cls .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .empty-note { font-size: 14px; color: var(--muted); }
 
-/* depth camera cards: color + depth streams side by side in one card */
-.depth-pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.depth-pair .room-tile { aspect-ratio: 16/10; }
