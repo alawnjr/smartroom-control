@@ -19,3 +19,9 @@ export const NODES: NodeConfig[] = (process.env.SMARTROOM_NODES || FALLBACK)
 export function baseUrl(node: { host: string }): string {
   return `http://${node.host}:8000`;
 }
+
+// The RealSense depth page (realsense_depth_page.py) runs beside the video
+// page on every node; nodes without depth cameras just return an empty list.
+export function depthBaseUrl(node: { host: string }): string {
+  return `http://${node.host}:8001`;
+}

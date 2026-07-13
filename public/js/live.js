@@ -8,6 +8,7 @@
 import { getJSON, post, h, fmtClock, fmtDur } from "./api.js";
 
 const cards = new Map(); // node id -> {root, refs, state}
+const depthCards = new Map(); // `${nodeId}:${serial}` -> {root, refs}
 let duration = 30;
 let statusData = null;
 export let nodesConfig = []; // [{id,name,host,online}] — analytics uses names too
@@ -89,6 +90,80 @@ function setTileState(card, node) {
   } else {
     refs.progress.hidden = true;
   }
+}
+
+function depthStreamUrl(id, serial, kind) {
+  return `/api/depth-stream/${encodeURIComponent(id)}?s=${encodeURIComponent(serial)}&k=${kind}`;
+}
+
+// Depth camera cards (RealSense on port 8001): one card per camera with its
+// color and colorized-depth streams side by side. Built once and updated in
+// place, same as the room cards — rebuilding would restart the MJPEG streams.
+function buildDepthCard(node, dev, idx) {
+  const refs = {};
+  const mkTile = (kind, label) => {
+    const img = h("img", { class: "scanlines", alt: `${dev.name} ${label}` });
+    let retryKey = 0;
+    img.addEventListener("error", () =>
+      setTimeout(() => { img.src = `${depthStreamUrl(node.id, dev.serial, kind)}&r=${++retryKey}`; }, 2000));
+    img.src = depthStreamUrl(node.id, dev.serial, kind);
+    return h("div", { class: "room-tile grad" },
+      h("span", { class: "pill", style: "background:rgb(255 255 255/.8);color:var(--neutral-5)" }, label),
+      img);
+  };
+  refs.meta = h("div", { class: "room-host" });
+  const root = h(
+    "div",
+    { class: `card card-sm room-card room-${idx % 4}` },
+    h("div", { class: "bar" }),
+    h("div", { class: "inner" },
+      h("div", { class: "depth-pair" }, mkTile("rgb", "Color"), mkTile("depth", "Depth")),
+      h("div", { class: "room-meta" },
+        h("div", {},
+          h("div", { class: "room-name" }, dev.name),
+          refs.meta),
+        h("div", { class: "room-side" },
+          h("div", { class: "room-dots" }, ...[0, 1].map(() => h("span", { class: "dot dot-id" })))))),
+  );
+  return { root, refs };
+}
+
+async function refreshDepth() {
+  let data;
+  try {
+    data = await getJSON("/api/depth");
+  } catch {
+    return;
+  }
+  const grid = document.getElementById("depth-cams");
+  const heading = document.getElementById("depth-h2");
+  const seen = new Set();
+  let idx = 0;
+  (data.nodes ?? []).forEach((node) => {
+    (node.devices ?? []).forEach((dev) => {
+      const key = `${node.id}:${dev.serial}`;
+      seen.add(key);
+      let card = depthCards.get(key);
+      if (!card) {
+        card = buildDepthCard(node, dev, idx);
+        depthCards.set(key, card);
+        grid.append(card.root);
+      }
+      idx += 1;
+      const st = dev.status ?? {}, info = st.info ?? {};
+      const usb = dev.usb && dev.usb !== "?" ? dev.usb : (info.usb ?? "?");
+      card.refs.meta.textContent =
+        `${node.name} · S/N ${dev.serial} · USB ${usb}` +
+        (st.running && info.profile ? ` · ${info.profile}` : "");
+    });
+  });
+  for (const [key, card] of depthCards) {
+    if (!seen.has(key)) {
+      card.root.remove();
+      depthCards.delete(key);
+    }
+  }
+  heading.hidden = grid.hidden = seen.size === 0;
 }
 
 async function refresh() {
@@ -177,6 +252,8 @@ export function initLive() {
 
   refresh();
   refreshStats();
+  refreshDepth();
   setInterval(refresh, 1000);
   setInterval(refreshStats, 8000);
+  setInterval(refreshDepth, 4000);
 }
