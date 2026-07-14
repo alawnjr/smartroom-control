@@ -108,6 +108,7 @@ function geometricBody(v) {
   const actionModel = ["action", "action-hmdb"].find((m) => v.detections?.[m]?.status === "done");
   const video = h("video", { preload: "none", poster: posterUrl(v), src: fileUrl(v.relPath) });
   video.dataset.off = String(v._syncOff ?? 0);
+  video.dataset.csv = v.relPath.replace(/\.mp4$/, "_timestamps.csv");
   const badge = h("span", { class: "vbadge" }, "");
   badge.hidden = true;
   const vwrap = h("div", { class: "vwrap" }, video, badge);
@@ -191,6 +192,7 @@ function analysisCard(v) {
     // the session header's Play all drives every camera together.
     const video = h("video", { preload: "none", poster: posterUrl(v), src: src() });
     video.dataset.off = String(v._syncOff ?? 0);
+    video.dataset.csv = v.relPath.replace(/\.mp4$/, "_timestamps.csv");
     vwrap.append(video);
     if (d?.status === "done") {
       const obtn = hasOverlay ? h("button", { class: "vbtn right" }, "raw") : null;
@@ -328,54 +330,131 @@ function render(force = false) {
         h("a", { class: "tbtn tbtn-sm dl", href: `/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`, title: "Download this whole recording folder as a .zip" }, "⤓ Download folder")),
       h("div", { class: "session-grid" }, ...cards));
 
-    const clock = { t: 0, anchor: 0, timer: null };
+    // Frame-scheduled playback: videos NEVER play() — they stay paused, and a
+    // 30Hz clock loop steps each one to the frame whose recorded timestamp
+    // (from its *_timestamps.csv) has come due on the shared session
+    // timeline. Display timing therefore follows the ground-truth capture
+    // times: a frame is shown exactly when its clock time arrives, cameras
+    // with different frame rates and start offsets included.
+    const clock = { t: 0, anchor: 0, timer: null, loading: false };
+    const scheds = new Map();  // el -> { times: session-relative seconds per frame, shown: last idx }
     const vids = () => [...sessionEl.querySelectorAll("video")].map((el) => ({ el, off: Number(el.dataset.off || 0) }));
-    const setTime = (el, target) => {
-      const apply = () => { try { el.currentTime = Math.max(0, Math.min(target, el.duration || target)); } catch { /* not seekable yet */ } };
-      if (el.readyState === 0) { el.preload = "metadata"; el.addEventListener("loadedmetadata", apply, { once: true }); el.load(); }
-      else apply();
+
+    const parseCsv = (text) => {
+      const lines = text.trim().split("\n");
+      const cols = lines[0].split(",");
+      const iSec = cols.indexOf("timestamp_seconds");
+      const iHw = cols.indexOf("hw_timestamp_ms");
+      const sec = [], hw = [];
+      for (let i = 1; i < lines.length; i++) {
+        const c = lines[i].split(",");
+        if (iSec >= 0) sec.push(Number(c[iSec]));
+        if (iHw >= 0) hw.push(Number(c[iHw]));
+      }
+      return { sec, hw: iHw >= 0 && hw.some((x) => x > 0) ? hw : null };
     };
-    const seekAll = (t) => vids().forEach(({ el, off }) => setTime(el, t - off));
-    const sessionEnd = () => Math.max(1, ...vids().map(({ el, off }) => off + (el.duration || 0)));
+
+    const ensureMeta = (el) => new Promise((res) => {
+      if (el.readyState >= 1) return res();
+      el.preload = "metadata";
+      el.addEventListener("loadedmetadata", () => res(), { once: true });
+      el.addEventListener("error", () => res(), { once: true });
+      el.load();
+    });
+
+    // Fetch every camera's CSV once, then put all frames on ONE timeline:
+    // hardware timestamps (shared host clock) when present, else the stream's
+    // metadata start offset + capture-relative seconds.
+    const loadSchedules = async () => {
+      if (clock.loading || scheds.size) return;
+      clock.loading = true;
+      const entries = vids();
+      const raw = await Promise.all(entries.map(async ({ el, off }) => {
+        await ensureMeta(el);
+        try {
+          const r = await fetch(fileUrl(el.dataset.csv));
+          if (!r.ok) throw new Error();
+          return { el, off, ...parseCsv(await r.text()) };
+        } catch {
+          return { el, off, sec: [], hw: null };
+        }
+      }));
+      const bases = raw.filter((x) => x.hw).map((x) => x.hw[0]);
+      const hwBase = bases.length ? Math.min(...bases) : 0;
+      for (const x of raw) {
+        let times;
+        if (x.hw) times = x.hw.map((ms) => (ms - hwBase) / 1000);
+        else if (x.sec.length) times = x.sec.map((t) => t + x.off);
+        else {  // no CSV — synthesize a CFR schedule from the container
+          const dur = x.el.duration || 0;
+          const n = Math.max(1, Math.round(dur * 30));
+          times = Array.from({ length: n }, (_, i) => x.off + (i * dur) / n);
+        }
+        scheds.set(x.el, { times, shown: -1 });
+      }
+      clock.loading = false;
+    };
+
+    const sessionEnd = () => {
+      let end = 1;
+      for (const { times } of scheds.values()) if (times.length) end = Math.max(end, times[times.length - 1]);
+      return end;
+    };
+
+    // Latest frame whose timestamp is <= t (binary search), -1 if none yet.
+    const dueIdx = (times, t) => {
+      let lo = 0, hi = times.length - 1, ans = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (times[mid] <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+      }
+      return ans;
+    };
+
+    const applyFrames = (t) => {
+      for (const [el, sch] of scheds) {
+        if (!sch.times.length || el.seeking) continue;  // skip while a seek is in flight — next tick catches up
+        const idx = dueIdx(sch.times, t);
+        if (idx < 0 || idx === sch.shown) continue;
+        sch.shown = idx;
+        const n = sch.times.length;
+        const dur = el.duration || 0;
+        // frame idx sits at idx/fps in the (measured-rate) container; +0.4
+        // frame keeps the seek safely inside the frame's display interval
+        try { el.currentTime = Math.min(((idx + 0.4) * dur) / n, dur); } catch { /* not seekable yet */ }
+      }
+    };
 
     const stop = (atEnd) => {
       if (clock.timer) { clearInterval(clock.timer); clock.timer = null; }
-      vids().forEach(({ el }) => { el.pause(); el.playbackRate = 1; });
       if (atEnd) clock.t = 0;
       playBtn.textContent = "▶ Play";
     };
     const tick = () => {
       clock.t = (performance.now() - clock.anchor) / 1000;
       const end = sessionEnd();
-      for (const { el, off } of vids()) {
-        const target = clock.t - off;
-        const dur = el.duration || 0;
-        if (target < 0 || (dur && target >= dur)) {  // this camera hasn't started / already ended
-          if (!el.paused) el.pause();
-          continue;
-        }
-        if (el.paused) { setTime(el, target); el.play().catch(() => {}); continue; }
-        const drift = el.currentTime - target;      // + = ahead of the clock
-        if (Math.abs(drift) > 0.5) el.currentTime = target;
-        else el.playbackRate = Math.max(0.9, Math.min(1.1, 1 - drift * 0.6));
-      }
+      applyFrames(clock.t);
       slider.max = end.toFixed(2);
       slider.value = String(Math.min(clock.t, end));
       timeLbl.textContent = `${clock.t.toFixed(1)}s`;
-      if (clock.t >= end) stop(true);
+      if (clock.t >= end + 0.1) stop(true);
     };
-    playBtn.addEventListener("click", () => {
+    playBtn.addEventListener("click", async () => {
       if (clock.timer) { stop(false); return; }
+      playBtn.textContent = "…";
+      await loadSchedules();
       clock.anchor = performance.now() - clock.t * 1000;
-      clock.timer = setInterval(tick, 100);
+      clock.timer = setInterval(tick, 33);
       playBtn.textContent = "⏸ Pause";
       tick();
     });
-    slider.addEventListener("input", () => {
+    slider.addEventListener("input", async () => {
       clock.t = Number(slider.value) || 0;
       clock.anchor = performance.now() - clock.t * 1000;
       timeLbl.textContent = `${clock.t.toFixed(1)}s`;
-      seekAll(clock.t);  // paused videos show the sought frame; playing ones are re-anchored by tick()
+      if (!scheds.size) await loadSchedules();
+      for (const sch of scheds.values()) sch.shown = -2;  // force re-apply even to the same frame
+      applyFrames(clock.t);
     });
     return sessionEl;
   }));
