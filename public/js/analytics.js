@@ -107,6 +107,7 @@ function validationPanel(v) {
 function geometricBody(v) {
   const actionModel = ["action", "action-hmdb"].find((m) => v.detections?.[m]?.status === "done");
   const video = h("video", { preload: "none", poster: posterUrl(v), src: fileUrl(v.relPath) });
+  video.dataset.off = String(v._syncOff ?? 0);
   const badge = h("span", { class: "vbadge" }, "");
   badge.hidden = true;
   const vwrap = h("div", { class: "vwrap" }, video, badge);
@@ -189,6 +190,7 @@ function analysisCard(v) {
     // while this model's analysis is pending/failed. No per-video controls —
     // the session header's Play all drives every camera together.
     const video = h("video", { preload: "none", poster: posterUrl(v), src: src() });
+    video.dataset.off = String(v._syncOff ?? 0);
     vwrap.append(video);
     if (d?.status === "done") {
       const obtn = hasOverlay ? h("button", { class: "vbtn right" }, "raw") : null;
@@ -291,16 +293,27 @@ function render(force = false) {
     const clipPaths = s.clips.map((c) => c.relPath);
     const allSel = clipPaths.every((r) => selected.has(r));
     const { day, rec } = s.clips[0];
+    // Wall-clock offsets: cameras in a recording START at slightly different
+    // moments (recorders spin up independently) — each video's timeline is
+    // shifted by (its start - the session's earliest start), so the master
+    // clock below plays true simultaneity, not frame-index alignment.
+    const starts = s.clips.map((c) => c.startMs).filter(Boolean);
+    const minStart = starts.length ? Math.min(...starts) : 0;
     const cards = [];
     for (const v of s.clips) {
+      v._syncOff = v.startMs ? (v.startMs - minStart) / 1000 : 0;
       cards.push(analysisCard(v));
       const map = roomMapCard(v, nameFor(v.node)); // side-card when the clip is located
       if (map) cards.push(map);
     }
-    // One play button for the whole recording: every camera's video starts
-    // together (they're synced captures), replacing per-video controls.
-    const playBtn = h("button", { class: "tbtn tbtn-sm", title: "Play/pause every camera in this recording together" }, "▶ Play");
-    const rewindBtn = h("button", { class: "tbtn tbtn-sm", title: "Rewind every camera to the start (keeps playing if playing)" }, "⏮ Rewind");
+    // Clock-driven playback for the whole recording: ONE master clock, every
+    // camera disciplined to it (its own wall-clock offset included). Videos
+    // never free-run — a drifting one gets its rate nudged (or hard-seeked),
+    // so what's on screen at any slider position is true simultaneity.
+    const playBtn = h("button", { class: "tbtn tbtn-sm", title: "Play/pause every camera in this recording on one clock" }, "▶ Play");
+    const slider = h("input", { class: "seek", type: "range", min: 0, max: 30, step: 0.01, value: 0,
+                                title: "Seek every camera to this moment" });
+    const timeLbl = h("span", { class: "cams", style: "min-width:5.5ch;text-align:right" }, "0.0s");
     const sessionEl = h("div", { class: "session" },
       h("div", { class: "session-hd" },
         h("input", { type: "checkbox", checked: allSel, title: "Select all cameras in this recording", onchange: () => {
@@ -310,36 +323,60 @@ function render(force = false) {
         h("span", { class: "lbl" }, s.label),
         h("span", { class: "cams" }, `${s.clips.length} cam${s.clips.length > 1 ? "s" : ""}`),
         playBtn,
-        rewindBtn,
+        slider,
+        timeLbl,
         h("a", { class: "tbtn tbtn-sm dl", href: `/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`, title: "Download this whole recording folder as a .zip" }, "⤓ Download folder")),
       h("div", { class: "session-grid" }, ...cards));
+
+    const clock = { t: 0, anchor: 0, timer: null };
+    const vids = () => [...sessionEl.querySelectorAll("video")].map((el) => ({ el, off: Number(el.dataset.off || 0) }));
+    const setTime = (el, target) => {
+      const apply = () => { try { el.currentTime = Math.max(0, Math.min(target, el.duration || target)); } catch { /* not seekable yet */ } };
+      if (el.readyState === 0) { el.preload = "metadata"; el.addEventListener("loadedmetadata", apply, { once: true }); el.load(); }
+      else apply();
+    };
+    const seekAll = (t) => vids().forEach(({ el, off }) => setTime(el, t - off));
+    const sessionEnd = () => Math.max(1, ...vids().map(({ el, off }) => off + (el.duration || 0)));
+
+    const stop = (atEnd) => {
+      if (clock.timer) { clearInterval(clock.timer); clock.timer = null; }
+      vids().forEach(({ el }) => { el.pause(); el.playbackRate = 1; });
+      if (atEnd) clock.t = 0;
+      playBtn.textContent = "▶ Play";
+    };
+    const tick = () => {
+      clock.t = (performance.now() - clock.anchor) / 1000;
+      const end = sessionEnd();
+      for (const { el, off } of vids()) {
+        const target = clock.t - off;
+        const dur = el.duration || 0;
+        if (target < 0 || (dur && target >= dur)) {  // this camera hasn't started / already ended
+          if (!el.paused) el.pause();
+          continue;
+        }
+        if (el.paused) { setTime(el, target); el.play().catch(() => {}); continue; }
+        const drift = el.currentTime - target;      // + = ahead of the clock
+        if (Math.abs(drift) > 0.5) el.currentTime = target;
+        else el.playbackRate = Math.max(0.9, Math.min(1.1, 1 - drift * 0.6));
+      }
+      slider.max = end.toFixed(2);
+      slider.value = String(Math.min(clock.t, end));
+      timeLbl.textContent = `${clock.t.toFixed(1)}s`;
+      if (clock.t >= end) stop(true);
+    };
     playBtn.addEventListener("click", () => {
-      const vids = [...sessionEl.querySelectorAll("video")];
-      if (!vids.length) return;
-      if (vids.some((el) => !el.paused && !el.ended)) {
-        vids.forEach((el) => el.pause());
-        playBtn.textContent = "▶ Play";
-      } else {
-        if (vids.every((el) => el.ended)) vids.forEach((el) => { el.currentTime = 0; });
-        vids.forEach((el) => el.play().catch(() => {}));
-        playBtn.textContent = "⏸ Pause";
-      }
+      if (clock.timer) { stop(false); return; }
+      clock.anchor = performance.now() - clock.t * 1000;
+      clock.timer = setInterval(tick, 100);
+      playBtn.textContent = "⏸ Pause";
+      tick();
     });
-    rewindBtn.addEventListener("click", () => {
-      const vids = [...sessionEl.querySelectorAll("video")];
-      const wasPlaying = vids.some((el) => !el.paused && !el.ended);
-      vids.forEach((el) => { el.currentTime = 0; });
-      if (wasPlaying) {
-        vids.forEach((el) => el.play().catch(() => {}));  // an ended video needs the nudge
-        playBtn.textContent = "⏸ Pause";
-      }
+    slider.addEventListener("input", () => {
+      clock.t = Number(slider.value) || 0;
+      clock.anchor = performance.now() - clock.t * 1000;
+      timeLbl.textContent = `${clock.t.toFixed(1)}s`;
+      seekAll(clock.t);  // paused videos show the sought frame; playing ones are re-anchored by tick()
     });
-    // flip the button back when the last camera finishes ("ended" doesn't
-    // bubble — catch it in the capture phase)
-    sessionEl.addEventListener("ended", () => {
-      const vids = [...sessionEl.querySelectorAll("video")];
-      if (vids.every((el) => el.paused || el.ended)) playBtn.textContent = "▶ Play";
-    }, true);
     return sessionEl;
   }));
 }

@@ -55,6 +55,7 @@ export type SavedVideo = {
   relPath: string; // full path relative to the recordings root
   size: number;
   mtime: number;
+  startMs?: number; // stream's wall-clock start (epoch ms, from metadata.json) — aligns cameras on one timeline
   detections?: Record<string, DetectionSummary>; // in-place per-model detection + action results
   validation?: ValidationSummary; // data-integrity checks (detect/validate.py sidecar)
   // Lens-corrected copy (undistort.py), when this clip is calibrated + processed:

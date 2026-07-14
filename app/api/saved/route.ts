@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { readdir, stat } from "node:fs/promises";
 import path from "node:path";
 
@@ -36,6 +37,25 @@ export async function GET() {
   }
 
   const videos: SavedVideo[] = [];
+  // Per-clip wall-clock start from the cam dir's metadata.json (streams are
+  // keyed by the clip's stem). Cached per dir — several clips share one file.
+  const metaCache = new Map<string, Record<string, { start_time?: string }> | null>();
+  const startMsFor = (abs: string): number | undefined => {
+    const dir = path.dirname(abs);
+    if (!metaCache.has(dir)) {
+      try {
+        metaCache.set(dir, JSON.parse(readFileSync(path.join(dir, "metadata.json"), "utf8")));
+      } catch {
+        metaCache.set(dir, null);
+      }
+    }
+    const meta = metaCache.get(dir) as { start_time?: string; streams?: Record<string, { start_time?: string }> } | null;
+    const stem = path.basename(abs, path.extname(abs));
+    const iso = meta?.streams?.[stem]?.start_time ?? meta?.start_time;
+    const ms = iso ? Date.parse(iso) : NaN;
+    return Number.isFinite(ms) ? ms : undefined;
+  };
+
   for (const rel of rels) {
     // Layout: <day>/<rec>/streams/<node>/<file> — node lives inside streams/.
     const parts = rel.split(path.sep);
@@ -64,6 +84,7 @@ export async function GET() {
       relPath: rel,
       size,
       mtime,
+      startMs: startMsFor(abs),
       detections,
     });
   }

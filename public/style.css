@@ -264,3 +264,6 @@ input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; accent-colo
 .cls .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .empty-note { font-size: 14px; color: var(--muted); }
 
+
+/* shared timeline slider in the session header */
+.session-hd .seek { flex: 1; min-width: 140px; max-width: 480px; accent-color: var(--rose, #e11d48); cursor: pointer; }
