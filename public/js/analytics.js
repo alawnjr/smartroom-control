@@ -105,7 +105,7 @@ function validationPanel(v) {
 // ---------- geometric (jump) card body ----------
 function geometricBody(v) {
   const actionModel = ["action", "action-hmdb"].find((m) => v.detections?.[m]?.status === "done");
-  const video = h("video", { controls: true, preload: "none", poster: posterUrl(v), src: fileUrl(v.relPath) });
+  const video = h("video", { preload: "none", poster: posterUrl(v), src: fileUrl(v.relPath) });
   const badge = h("span", { class: "vbadge" }, "");
   badge.hidden = true;
   const vwrap = h("div", { class: "vwrap" }, video, badge);
@@ -185,8 +185,9 @@ function analysisCard(v) {
     const vwrap = h("div", { class: "vwrap" });
     // The raw clip is always playable (analysis only adds overlays), so every
     // card shows a real video with a preview frame; a status pill sits on top
-    // while this model's analysis is pending/failed.
-    const video = h("video", { controls: true, preload: "none", poster: posterUrl(v), src: src() });
+    // while this model's analysis is pending/failed. No per-video controls —
+    // the session header's Play all drives every camera together.
+    const video = h("video", { preload: "none", poster: posterUrl(v), src: src() });
     vwrap.append(video);
     if (d?.status === "done") {
       const obtn = hasOverlay ? h("button", { class: "vbtn right" }, "raw") : null;
@@ -295,7 +296,10 @@ function render(force = false) {
       const map = roomMapCard(v, nameFor(v.node)); // side-card when the clip is located
       if (map) cards.push(map);
     }
-    return h("div", { class: "session" },
+    // One play button for the whole recording: every camera's video starts
+    // together (they're synced captures), replacing per-video controls.
+    const playBtn = h("button", { class: "tbtn tbtn-sm", title: "Play/pause every camera in this recording together" }, "▶ Play");
+    const sessionEl = h("div", { class: "session" },
       h("div", { class: "session-hd" },
         h("input", { type: "checkbox", checked: allSel, title: "Select all cameras in this recording", onchange: () => {
           allSel ? clipPaths.forEach((r) => selected.delete(r)) : clipPaths.forEach((r) => selected.add(r));
@@ -303,8 +307,28 @@ function render(force = false) {
         }}),
         h("span", { class: "lbl" }, s.label),
         h("span", { class: "cams" }, `${s.clips.length} cam${s.clips.length > 1 ? "s" : ""}`),
+        playBtn,
         h("a", { class: "tbtn tbtn-sm dl", href: `/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`, title: "Download this whole recording folder as a .zip" }, "⤓ Download folder")),
       h("div", { class: "session-grid" }, ...cards));
+    playBtn.addEventListener("click", () => {
+      const vids = [...sessionEl.querySelectorAll("video")];
+      if (!vids.length) return;
+      if (vids.some((el) => !el.paused && !el.ended)) {
+        vids.forEach((el) => el.pause());
+        playBtn.textContent = "▶ Play";
+      } else {
+        if (vids.every((el) => el.ended)) vids.forEach((el) => { el.currentTime = 0; });
+        vids.forEach((el) => el.play().catch(() => {}));
+        playBtn.textContent = "⏸ Pause";
+      }
+    });
+    // flip the button back when the last camera finishes ("ended" doesn't
+    // bubble — catch it in the capture phase)
+    sessionEl.addEventListener("ended", () => {
+      const vids = [...sessionEl.querySelectorAll("video")];
+      if (vids.every((el) => el.paused || el.ended)) playBtn.textContent = "▶ Play";
+    }, true);
+    return sessionEl;
   }));
 }
 
