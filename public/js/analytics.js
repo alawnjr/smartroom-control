@@ -34,9 +34,10 @@ function nameFor(nodeId) {
   return nodeNames.get(nodeId) ?? nodeId;
 }
 
-// Preview frame for a clip (1s in), extracted+cached by the v1 frame endpoint.
+// Preview frame for a clip (1s in), extracted+cached by the v1 frame endpoint;
+// clip= picks THIS card's video (a recording holds several cameras).
 function posterUrl(v) {
-  return `/api/v1/recordings/${encodeURIComponent(v.day)}/${encodeURIComponent(v.rec)}/${encodeURIComponent(v.node)}/frame?t=1&w=640`;
+  return `/api/v1/recordings/${encodeURIComponent(v.day)}/${encodeURIComponent(v.rec)}/${encodeURIComponent(v.node)}/frame?t=1&w=640&clip=${encodeURIComponent(v.file)}`;
 }
 
 function cardModel(v) {

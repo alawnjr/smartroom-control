@@ -163,12 +163,36 @@ async function inference(day: string, rec: string, cam: string, model: string) {
   return json(out);
 }
 
+// The primary RGB clip in a cam dir: camera_main.mp4 (legacy webcam
+// recordings), else the first camera_*_color.mp4 (RealSense recordings).
+function primaryClip(dir: string): string {
+  const main = path.join(dir, "camera_main.mp4");
+  try {
+    statSync(main);
+    return "camera_main.mp4";
+  } catch {
+    try {
+      const colors = readdirSync(dir)
+        .filter((n) => /^camera_[\w-]+_color\.mp4$/.test(n))
+        .sort();
+      if (colors.length) return colors[0];
+    } catch {
+      // fall through
+    }
+    return "camera_main.mp4";
+  }
+}
+
 // Which video file a variant refers to; annotated variants are per-model.
-function videoPath(dir: string, variant: string): string | null {
-  if (variant === "raw") return path.join(dir, "camera_main.mp4");
-  if (variant === "undistorted") return path.join(dir, "undistorted", "camera_main.mp4");
+// `clip` picks a specific source video (e.g. camera_d435_color.mp4) instead
+// of the primary one — sanitized to plain camera_*.mp4 names.
+function videoPath(dir: string, variant: string, clip?: string | null): string | null {
+  const name = clip && /^camera_[\w.-]+\.mp4$/.test(clip) ? clip : primaryClip(dir);
+  const stem = name.replace(/\.mp4$/, "");
+  if (variant === "raw") return path.join(dir, name);
+  if (variant === "undistorted") return path.join(dir, "undistorted", name);
   const m = variant.match(/^annotated\.([\w-]+)$/);
-  if (m) return path.join(dir, `camera_main.annotated.${m[1]}.mp4`);
+  if (m) return path.join(dir, `${stem}.annotated.${m[1]}.mp4`);
   return null;
 }
 
@@ -181,7 +205,7 @@ async function frame(dir: string, req: NextRequest) {
   const w = Math.min(1920, Math.max(64, Number(sp.get("w") ?? 640) || 640));
   const q = Math.min(100, Math.max(1, Number(sp.get("q") ?? 80) || 80));
   const variant = sp.get("video") ?? "raw";
-  const src = videoPath(dir, variant);
+  const src = videoPath(dir, variant, sp.get("clip"));
   if (!src) return json({ error: `unknown video variant '${variant}'` }, 400);
   try {
     statSync(src);
@@ -219,7 +243,7 @@ async function frame(dir: string, req: NextRequest) {
 function video(day: string, rec: string, cam: string, req: NextRequest) {
   const variant = req.nextUrl.searchParams.get("variant") ?? "raw";
   const dir = camDir(day, rec, cam);
-  const abs = videoPath(dir, variant);
+  const abs = videoPath(dir, variant, req.nextUrl.searchParams.get("clip"));
   if (!abs) return json({ error: `unknown video variant '${variant}'` }, 400);
   try {
     statSync(abs);
