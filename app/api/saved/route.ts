@@ -25,6 +25,9 @@ export async function GET() {
           d.isFile() &&
           VIDEO_EXT.has(path.extname(d.name).toLowerCase()) &&
           !d.name.includes(".annotated.") && // outputs, not source clips
+          // raw 16-bit depth data (lossless FFV1, camera_*_depth.mkv) — not
+          // playable video; beamed + stored for analysis but not a clip card
+          !/_depth\.\w+$/.test(d.name) &&
           !d.parentPath.split(path.sep).includes("undistorted") // lens-corrected copies, not extra clips
       )
       .map((d) => path.relative(root, path.join(d.parentPath, d.name)));
