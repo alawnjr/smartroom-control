@@ -38,8 +38,34 @@ def analysis_source(mp4: Path) -> Path:
     return mp4
 
 
+def stream_entry(mp4: Path) -> dict:
+    """This clip's entry in metadata.json's streams{} — keyed by the clip's
+    stem (camera_main, camera_d455_color, ...), matching capture.py."""
+    meta = json.loads((mp4.parent / "metadata.json").read_text())
+    return meta["streams"][mp4.stem]
+
+
+def parse_intrinsics(cal: dict):
+    """(K, dist, (w, h)) from either calibration schema: the checkerboard one
+    (camera_matrix / dist_coeffs / image_size, from calibrate_camera.py) or the
+    RealSense factory one (fx/fy/ppx/ppy/width/height; distortion negligible —
+    the color sensor reports (inverse_)brown_conrady with tiny coefficients)."""
+    if "camera_matrix" in cal:
+        mtx = np.array(cal["camera_matrix"], dtype=np.float64)
+        dist = np.array(cal["dist_coeffs"], dtype=np.float64)
+        w, h = (int(v) for v in cal["image_size"])
+    else:
+        mtx = np.array([[cal["fx"], 0.0, cal["ppx"]],
+                        [0.0, cal["fy"], cal["ppy"]],
+                        [0.0, 0.0, 1.0]], dtype=np.float64)
+        dist = np.zeros(5, dtype=np.float64)
+        w, h = int(cal["width"]), int(cal["height"])
+    return mtx, dist, (w, h)
+
+
 def load_undistort_maps(mp4: Path, frame_w: int, frame_h: int):
-    """(map1, map2) for cv2.remap, or None when this clip has no calibration.
+    """(map1, map2) for cv2.remap, or None when this clip has no calibration
+    (or none worth applying — RealSense factory distortion is negligible).
 
     Reads the metadata.json saved next to the clip. If the calibration was done
     at a different resolution than the clip, fx/fy/cx/cy are scaled (distortion
@@ -47,13 +73,12 @@ def load_undistort_maps(mp4: Path, frame_w: int, frame_h: int):
     camera matrix, so image size and framing are unchanged.
     """
     try:
-        meta = json.loads((mp4.parent / "metadata.json").read_text())
-        cal = meta["streams"]["camera_main"]["calibration"]
-        mtx = np.array(cal["camera_matrix"], dtype=np.float64)
-        dist = np.array(cal["dist_coeffs"], dtype=np.float64)
-        cal_w, cal_h = (int(v) for v in cal["image_size"])
+        cal = stream_entry(mp4)["calibration"]
+        mtx, dist, (cal_w, cal_h) = parse_intrinsics(cal)
     except (OSError, ValueError, KeyError, TypeError):
         return None
+    if not np.any(dist):
+        return None  # zero distortion — remapping would be a no-op
     if mtx.shape != (3, 3) or not frame_w or not frame_h or not cal_w or not cal_h:
         return None
     if (cal_w, cal_h) != (frame_w, frame_h):
@@ -118,12 +143,9 @@ def load_room_geometry(mp4: Path, frame_w: int, frame_h: int, undistorted: bool)
     (analysis_source) — if not, distortion is removed per-point instead.
     """
     try:
-        meta = json.loads((mp4.parent / "metadata.json").read_text())
-        stream = meta["streams"]["camera_main"]
+        stream = stream_entry(mp4)
         cal, ext = stream["calibration"], stream["extrinsics"]
-        mtx = np.array(cal["camera_matrix"], dtype=np.float64)
-        dist = np.array(cal["dist_coeffs"], dtype=np.float64)
-        cal_w, cal_h = (int(v) for v in cal["image_size"])
+        mtx, dist, (cal_w, cal_h) = parse_intrinsics(cal)
         R = np.array(ext["rotation_cam_to_room"], dtype=np.float64)
         cam = np.array(ext["camera_position_mm"], dtype=np.float64)
         camera_id = ext.get("camera_id", "")

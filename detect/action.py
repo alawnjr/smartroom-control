@@ -799,10 +799,15 @@ def main():
         pass
 
     try:
+        # Action classification runs only on the PRIMARY RGB per recording:
+        # legacy webcam clips and the D455 color stream (30fps). The D435
+        # (15fps secondary) gets detection + pose only — see detect.py.
+        ACTION_SOURCES = ("camera_main.mp4", "camera_d455_color.mp4")
         if args.path:
             clips = [root / p for p in args.path]
         else:
-            clips = sorted(root.rglob("camera_main.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+            clips = sorted((p for name in ACTION_SOURCES for p in root.rglob(name)),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
         # undistorted/ holds lens-corrected COPIES of clips, not additional clips.
         clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
 

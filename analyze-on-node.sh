@@ -28,7 +28,7 @@
 # Handy env overrides:
 #   FORCE=1                 re-analyze clips even if results already exist
 #   SMARTROOM_YOLO_MODELS   detection models   (default: n,s,m,l + n-pose)
-#   SMARTROOM_ACTION_VARIANTS  action models   (default: ntu,hmdb)
+#   SMARTROOM_ACTION_VARIANTS  action models   (default: hmdb — NTU retired)
 #   SMARTROOM_LOCAL_REC     local recordings dir
 #   SMARTROOM_GW / SMARTROOM_NODE   gateway / node ssh targets
 #
@@ -41,7 +41,7 @@ LOCAL_REC="${SMARTROOM_LOCAL_REC:-$HOME/Code/smartroom-control/recordings}"
 REMOTE_DIR="${SMARTROOM_REMOTE_DIR:-/root/smartroom-control}"
 REMOTE_REC="$REMOTE_DIR/recordings"
 YOLO_MODELS="${SMARTROOM_YOLO_MODELS:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose}"
-ACTION_VARIANTS="${SMARTROOM_ACTION_VARIANTS:-ntu,hmdb}"
+ACTION_VARIANTS="${SMARTROOM_ACTION_VARIANTS:-hmdb}"
 FORCE="${FORCE:-0}"
 
 # All SSH/rsync hops the node via the grid gateway (ProxyJump).
@@ -96,7 +96,7 @@ cd /root/smartroom-control
 export PATH="$HOME/.local/bin:$PATH"
 export SMARTROOM_SAVE_DIR=/root/smartroom-control/recordings
 MODELS="${1:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose}"
-VARIANTS="${2:-ntu,hmdb}"
+VARIANTS="${2:-hmdb}"
 FORCE_FLAG="${3:-}"
 rc=0
 echo "[$(date)] === object detection + pose: $MODELS ${FORCE_FLAG:+(force)} ==="
@@ -115,6 +115,10 @@ REMOTE
 # --------------------------------------------------------------- push -------
 push() {
   [ -d "$LOCAL_REC" ] || die "local recordings dir not found: $LOCAL_REC"
+  local script_dir; script_dir="$(cd "$(dirname "$0")" && pwd)"
+  log "Syncing analysis code -> srv1:$REMOTE_DIR/detect (laptop copy is canonical)"
+  rsync -a -e "$RSYNC_RSH" --include='*.py' --include='*.txt' --include='*.sh' \
+    --exclude='*' "$script_dir/detect/" "$NODE:$REMOTE_DIR/detect/"
   log "Uploading recordings -> srv1:$REMOTE_REC"
   node_ssh "mkdir -p '$REMOTE_REC'"
   rsync -ah --info=progress2 -e "$RSYNC_RSH" "$LOCAL_REC/" "$NODE:$REMOTE_REC/"

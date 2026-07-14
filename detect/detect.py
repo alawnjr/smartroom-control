@@ -303,10 +303,13 @@ def main():
 
 
 def _run(root: Path, args) -> int:
+    # Every RGB source gets detection + pose: legacy webcam clips plus both
+    # RealSense color streams (new recordings are depth-cameras-only).
+    RGB_SOURCES = ("camera_main.mp4", "camera_d455_color.mp4", "camera_d435_color.mp4")
     if args.path:
         clips = [root / p for p in args.path]
     else:
-        clips = sorted((p for p in root.rglob("camera_main.mp4")),
+        clips = sorted((p for name in RGB_SOURCES for p in root.rglob(name)),
                        key=lambda p: p.stat().st_mtime, reverse=True)
     # undistorted/ holds lens-corrected COPIES of clips, not additional clips.
     clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
