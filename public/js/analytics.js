@@ -299,6 +299,7 @@ function render(force = false) {
     // One play button for the whole recording: every camera's video starts
     // together (they're synced captures), replacing per-video controls.
     const playBtn = h("button", { class: "tbtn tbtn-sm", title: "Play/pause every camera in this recording together" }, "▶ Play");
+    const rewindBtn = h("button", { class: "tbtn tbtn-sm", title: "Rewind every camera to the start (keeps playing if playing)" }, "⏮ Rewind");
     const sessionEl = h("div", { class: "session" },
       h("div", { class: "session-hd" },
         h("input", { type: "checkbox", checked: allSel, title: "Select all cameras in this recording", onchange: () => {
@@ -308,6 +309,7 @@ function render(force = false) {
         h("span", { class: "lbl" }, s.label),
         h("span", { class: "cams" }, `${s.clips.length} cam${s.clips.length > 1 ? "s" : ""}`),
         playBtn,
+        rewindBtn,
         h("a", { class: "tbtn tbtn-sm dl", href: `/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`, title: "Download this whole recording folder as a .zip" }, "⤓ Download folder")),
       h("div", { class: "session-grid" }, ...cards));
     playBtn.addEventListener("click", () => {
@@ -319,6 +321,15 @@ function render(force = false) {
       } else {
         if (vids.every((el) => el.ended)) vids.forEach((el) => { el.currentTime = 0; });
         vids.forEach((el) => el.play().catch(() => {}));
+        playBtn.textContent = "⏸ Pause";
+      }
+    });
+    rewindBtn.addEventListener("click", () => {
+      const vids = [...sessionEl.querySelectorAll("video")];
+      const wasPlaying = vids.some((el) => !el.paused && !el.ended);
+      vids.forEach((el) => { el.currentTime = 0; });
+      if (wasPlaying) {
+        vids.forEach((el) => el.play().catch(() => {}));  // an ended video needs the nudge
         playBtn.textContent = "⏸ Pause";
       }
     });
