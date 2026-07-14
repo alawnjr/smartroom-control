@@ -255,20 +255,20 @@ function toolbar() {
     h("span", { class: "sel-count" }, selCount > 0 ? `${selCount} selected` : "all clips"),
     h("button", { class: "tbtn tbtn-sm", onclick: () => { allRelPaths.forEach((r) => selected.add(r)); render(true); } }, "Select all"),
     h("button", { class: "tbtn tbtn-sm", disabled: selCount === 0, onclick: () => { selected.clear(); render(true); } }, "Clear"),
-    h("button", { class: "tbtn", disabled: analyzing > 0, title: "Object detection on the selected clips (or all new clips if none selected)", onclick: run("/api/detect") },
-      analyzing > 0 ? h("span", { class: "spin" }, "⟳") : "◉", analyzing > 0 ? ` Analyzing ${analyzing}…` : selCount > 0 ? ` Re-detect ${selCount}` : " Analyze all"),
+    // No local "Analyze" button: analysis runs on the COSMOS node via
+    // analyze-on-node.sh (analyzing counts still show progress when results
+    // are pulled back / a local run was started by hand).
+    analyzing > 0 ? h("span", { class: "pill" }, h("span", { class: "spin" }, "⟳"), ` Analyzing ${analyzing}…`) : null,
     h("button", { class: "tbtn", disabled: validating > 0, title: "Data-integrity checks on the selected clips, or all if none selected", onclick: run("/api/validate") },
       validating > 0 ? h("span", { class: "spin" }, "⟳") : "⛨", validating > 0 ? ` Validating ${validating}…` : selCount > 0 ? ` Validate ${selCount}` : " Validate all"),
     validated.length > 0 && validating === 0
       ? h("span", { class: `chip ${validFailed > 0 ? "chip-bad" : "chip-ok"}`, title: validFailed > 0 ? "Some clips failed validation — see the red chips on their cards" : "All validated clips passed" },
           validFailed > 0 ? `⛨ ${validFailed}/${validated.length} flagged` : `⛨ ${validated.length} valid`)
       : null,
-    h("button", { class: "tbtn", disabled: analyzing > 0, title: "Per-person actions (ST-GCN++ / NTU-RGB+D 60)", onclick: run("/api/action", { variant: "ntu" }) }, "▶ Actions (NTU)"),
-    h("button", { class: "tbtn", disabled: analyzing > 0, title: "Per-person actions (PoseC3D / HMDB51)", onclick: run("/api/action", { variant: "hmdb" }) }, "▶ Actions (HMDB)"),
     analyzing > 0 ? h("button", { class: "tbtn tbtn-cancel", onclick: async () => { await post("/api/detect/cancel"); pingSoon(); } }, "✕ Cancel") : null,
     h("span", { class: "grow" }),
-    h("button", { class: "tbtn", title: "Pull new recordings from the Pis, then analyze what's new",
-        onclick: async (e) => { e.target.disabled = true; try { await post("/api/save-all"); post("/api/detect"); } finally { e.target.disabled = false; } pingSoon(); } },
+    h("button", { class: "tbtn", title: "Pull new recordings from the Pis (analysis happens on the server: analyze-on-node.sh)",
+        onclick: async (e) => { e.target.disabled = true; try { await post("/api/save-all"); } finally { e.target.disabled = false; } pingSoon(); } },
       "⤓ Beam to laptop"),
     ...mirrorBits,
     h("button", { class: "tbtn", disabled: mirror.running, title: "Upload new recordings + inference to the public Vercel mirror", onclick: async () => { await post("/api/mirror"); pollMirror(); } }, "☁ Sync to mirror"),
