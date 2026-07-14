@@ -398,6 +398,10 @@ function render(force = false) {
           times = Array.from({ length: n }, (_, i) => x.off + (i * dur) / n);
         }
         scheds.set(x.el, { times, shown: -1 });
+        // when a slow seek finishes, immediately chase the newest due frame
+        // instead of waiting for the next tick — keeps a slow-decoding video
+        // from trailing the others
+        x.el.addEventListener("seeked", () => { if (clock.timer) applyFrames(clock.t); });
       }
       clock.loading = false;
     };
