@@ -39,8 +39,9 @@ export async function GET() {
   const videos: SavedVideo[] = [];
   // Per-clip wall-clock start from the cam dir's metadata.json (streams are
   // keyed by the clip's stem). Cached per dir — several clips share one file.
-  const metaCache = new Map<string, Record<string, { start_time?: string }> | null>();
-  const startMsFor = (abs: string): number | undefined => {
+  type StreamMeta = { start_time?: string; hw_clock_offset_ms?: number };
+  const metaCache = new Map<string, { start_time?: string; streams?: Record<string, StreamMeta> } | null>();
+  const streamInfoFor = (abs: string): { startMs?: number; hwOffsetMs?: number } => {
     const dir = path.dirname(abs);
     if (!metaCache.has(dir)) {
       try {
@@ -49,11 +50,15 @@ export async function GET() {
         metaCache.set(dir, null);
       }
     }
-    const meta = metaCache.get(dir) as { start_time?: string; streams?: Record<string, { start_time?: string }> } | null;
+    const meta = metaCache.get(dir);
     const stem = path.basename(abs, path.extname(abs));
-    const iso = meta?.streams?.[stem]?.start_time ?? meta?.start_time;
+    const entry = meta?.streams?.[stem];
+    const iso = entry?.start_time ?? meta?.start_time;
     const ms = iso ? Date.parse(iso) : NaN;
-    return Number.isFinite(ms) ? ms : undefined;
+    return {
+      startMs: Number.isFinite(ms) ? ms : undefined,
+      hwOffsetMs: typeof entry?.hw_clock_offset_ms === "number" ? entry.hw_clock_offset_ms : undefined,
+    };
   };
 
   for (const rel of rels) {
@@ -84,7 +89,7 @@ export async function GET() {
       relPath: rel,
       size,
       mtime,
-      startMs: startMsFor(abs),
+      ...streamInfoFor(abs),
       detections,
     });
   }

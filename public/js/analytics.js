@@ -108,6 +108,7 @@ function geometricBody(v) {
   const actionModel = ["action", "action-hmdb"].find((m) => v.detections?.[m]?.status === "done");
   const video = h("video", { preload: "none", poster: posterUrl(v), src: fileUrl(v.relPath) });
   video.dataset.off = String(v._syncOff ?? 0);
+  video.dataset.hwoff = String(v.hwOffsetMs ?? 0);
   video.dataset.csv = v.relPath.replace(/\.mp4$/, "_timestamps.csv");
   const badge = h("span", { class: "vbadge" }, "");
   badge.hidden = true;
@@ -192,6 +193,7 @@ function analysisCard(v) {
     // the session header's Play all drives every camera together.
     const video = h("video", { preload: "none", poster: posterUrl(v), src: src() });
     video.dataset.off = String(v._syncOff ?? 0);
+    video.dataset.hwoff = String(v.hwOffsetMs ?? 0);
     video.dataset.csv = v.relPath.replace(/\.mp4$/, "_timestamps.csv");
     vwrap.append(video);
     if (d?.status === "done") {
@@ -370,11 +372,16 @@ function render(force = false) {
       clock.loading = true;
       const entries = vids();
       const raw = await Promise.all(entries.map(async ({ el, off }) => {
+        // hwoff: measured inter-camera clock offset (timing calibration) —
+        // subtracting it puts both cameras' hw timestamps on one true clock
+        const hwoff = Number(el.dataset.hwoff || 0);
         await ensureMeta(el);
         try {
           const r = await fetch(fileUrl(el.dataset.csv));
           if (!r.ok) throw new Error();
-          return { el, off, ...parseCsv(await r.text()) };
+          const parsed = parseCsv(await r.text());
+          if (parsed.hw) parsed.hw = parsed.hw.map((ms) => ms - hwoff);
+          return { el, off, ...parsed };
         } catch {
           return { el, off, sec: [], hw: null };
         }
