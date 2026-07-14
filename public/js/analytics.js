@@ -154,13 +154,9 @@ function analysisCard(v) {
     selected.has(v.relPath) ? selected.delete(v.relPath) : selected.add(v.relPath);
     render(true);
   }});
-  // Retry always re-runs the NTU action analysis on this clip (regardless of
-  // which model the card is showing) — that's the pass worth redoing.
-  const reBtn = h("button", { class: "icobtn", title: "Re-run actions (NTU) on this clip", disabled: analyzing, onclick: async (e) => {
-    e.currentTarget.disabled = true;
-    await post("/api/action", { relPath: v.relPath, force: true, variant: "ntu" });
-    pingSoon();
-  }}, analyzing ? h("span", { class: "spin" }, "⟳") : "⟳");
+  // Analysis runs on the COSMOS node (analyze-on-node.sh) — no local re-run
+  // button; just show a spinner while a run is in flight.
+  const reBtn = analyzing ? h("span", { class: "icobtn", title: "Analyzing…" }, h("span", { class: "spin" }, "⟳")) : null;
   const valBtn = h("button", { class: "icobtn", title: "Re-run data validation on this clip", disabled: v.validation?.status === "analyzing", onclick: async (e) => {
     e.currentTarget.disabled = true;
     await post("/api/validate", { relPath: v.relPath, force: true });
