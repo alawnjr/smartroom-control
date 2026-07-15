@@ -9,6 +9,7 @@
 import { getJSON, post, h, fileUrl, groupSessions, analyzingCount, validatingCount, clipAnalyzing } from "./api.js";
 import { roomMapCard } from "./room-map.js";
 import { openDrawer } from "./drawer.js";
+import { parseMp4 } from "./mp4demux.js";
 
 const MODEL_ORDER = ["yolo26n", "yolo26s", "yolo26m", "yolo26l", "yolo26n-pose", "action", "action-hmdb"];
 const MODEL_LABEL = {
@@ -84,6 +85,250 @@ function dropsChip(v) {
     class: "chip chip-bad",
     title: `${dropped} frames lost in the capture pipeline — expect this camera to trail the others during motion`,
   }, `⚠ ${v.fps}fps · ${dropped} dropped`);
+}
+
+// ---------- synced playback drivers ----------
+// Two ways to put a scheduled frame on screen. CanvasDriver (preferred) uses
+// WebCodecs: the mp4 is demuxed + decoded in JS and frames are PAINTED onto a
+// canvas by the master clock itself, so both cameras hit the screen in the
+// same tick — <video> seek/present latency (the last unverifiable desync
+// source) is out of the loop entirely. SeekDriver is the old currentTime
+// stepping, kept as the fallback when WebCodecs can't handle a clip.
+
+// Latest frame whose timestamp is <= t (binary search), -1 if none yet.
+const dueIdx = (times, t) => {
+  let lo = 0, hi = times.length - 1, ans = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (times[mid] <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1;
+  }
+  return ans;
+};
+
+const parseCsv = (text) => {
+  // the Pi writes CRLF (python csv.writer default) — trim each header cell or
+  // the last column reads as "hw_timestamp_ms\r" and never matches
+  const lines = text.trim().split("\n");
+  const cols = lines[0].split(",").map((s) => s.trim());
+  const iSec = cols.indexOf("timestamp_seconds");
+  const iHw = cols.indexOf("hw_timestamp_ms");
+  const sec = [], hw = [];
+  for (let i = 1; i < lines.length; i++) {
+    const c = lines[i].split(",");
+    if (iSec >= 0) sec.push(Number(c[iSec]));
+    if (iHw >= 0) hw.push(Number(c[iHw]));
+  }
+  return { sec, hw: iHw >= 0 && hw.some((x) => x > 0) ? hw : null };
+};
+
+const ensureMeta = (el) => new Promise((res) => {
+  if (el.readyState >= 1) return res();
+  el.preload = "metadata";
+  el.addEventListener("loadedmetadata", () => res(), { once: true });
+  el.addEventListener("error", () => res(), { once: true });
+  el.load();
+});
+
+// #debug HUD: a small readout on the card showing which frame is on screen
+// and how far it trails the master clock.
+const hudTag = (el) => {
+  if (!location.hash.includes("debug")) return null;
+  const wrap = el.closest(".vwrap") || el.parentElement;
+  const tag = h("div", { style: "position:absolute;left:6px;bottom:6px;background:#000c;color:#3f6;" +
+    "font:12px/1.4 monospace;padding:2px 7px;border-radius:6px;z-index:5;pointer-events:none" }, "sync: —");
+  wrap.appendChild(tag);
+  return tag;
+};
+
+class CanvasDriver {
+  static async create(el, times) {
+    const src = el.currentSrc || el.src;
+    const res = await fetch(src);
+    if (!res.ok) throw new Error(`fetch ${res.status}`);
+    const buf = await res.arrayBuffer();
+    const { codec, description, samples } = parseMp4(buf);
+    if (!samples.length) throw new Error("no samples");
+    const { supported } = await VideoDecoder.isConfigSupported({ codec, description });
+    if (!supported) throw new Error(`codec unsupported: ${codec}`);
+    return new CanvasDriver(el, times, buf, { codec, description }, samples);
+  }
+
+  constructor(el, times, buf, config, samples) {
+    this.el = el;
+    this.times = times;
+    this.src = el.currentSrc || el.src;
+    this.buf = buf;
+    // optimizeForLatency: emit each decoded frame immediately instead of
+    // buffering a reorder window — we schedule presentation ourselves
+    this.config = { ...config, optimizeForLatency: true };
+    this.samples = samples;
+    // Sample -> CSV row via each frame's pts SLOT, not its ordinal: the Pi's
+    // hw encoder occasionally drops a frame mid-encode but leaves its time
+    // slot in the container, so slot index is what matches the CSV.
+    const deltas = samples.slice(1).map((s, i) => s.pts - samples[i].pts).sort((a, b) => a - b);
+    const step = deltas.length ? Math.max(deltas[deltas.length >> 1], 1e-3) : 1 / 30;
+    const p0 = samples[0].pts;
+    this.sched = samples.map((s) =>
+      times[Math.min(times.length - 1, Math.max(0, Math.round((s.pts - p0) / step)))]);
+
+    const wrap = el.closest(".vwrap") || el.parentElement;
+    this.canvas = document.createElement("canvas");
+    this.canvas.style.cssText =
+      "position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:#000;display:none";
+    wrap.appendChild(this.canvas);
+    this.canvas.width = 0; // sized to the first decoded frame (default is 300x150)
+    this.ctx = this.canvas.getContext("2d");
+    this.hud = hudTag(el);
+
+    this.ready = new Map(); // sample idx -> decoded VideoFrame awaiting its turn
+    this.want = -1;         // newest due sample per the master clock
+    this.wantT = 0;
+    this.shown = -1;
+    this.fed = 0;           // next sample to hand the decoder
+    this.outIdx = 0;        // sample idx of the decoder's next output
+    this.dead = false;
+    this.decoder = new VideoDecoder({
+      output: (frame) => this._onFrame(frame),
+      error: () => { this.dead = true; },
+    });
+    this.decoder.configure(this.config);
+  }
+
+  showAt(t) {
+    if (this.dead) return;
+    const target = dueIdx(this.sched, t);
+    if (target < 0) return;
+    this.want = target;
+    this.wantT = t;
+    if (target === this.shown) return;
+    this._ensurePipeline(target);
+    this._feed();
+    this._present();
+  }
+
+  scrub(t) { this.shown = -2; this.showAt(t); }
+
+  // Restart decode at a keyframe when the target is behind the pipeline
+  // (scrub back) or far ahead of it (big forward jump).
+  _ensurePipeline(target) {
+    if (this.decoder.state === "closed") { this.dead = true; return; }
+    const canProduce = target >= this.outIdx || this.ready.has(target);
+    if (canProduce && this.decoder.state === "configured" && target <= this.fed + 300) return;
+    for (const f of this.ready.values()) f.close();
+    this.ready.clear();
+    if (this.decoder.state !== "unconfigured") this.decoder.reset();
+    this.decoder.configure(this.config);
+    let k = Math.min(target, this.samples.length - 1);
+    while (k > 0 && !this.samples[k].key) k--;
+    this.fed = k;
+    this.outIdx = k;
+  }
+
+  _feed() {
+    const PRE = 8, MAXQ = 16; // decode a touch ahead; cap in-flight work
+    const stopAt = Math.min(this.want + PRE, this.samples.length - 1);
+    while (this.fed <= stopAt && this.decoder.state === "configured" &&
+           this.decoder.decodeQueueSize < MAXQ) {
+      const s = this.samples[this.fed];
+      this.decoder.decode(new EncodedVideoChunk({
+        type: s.key ? "key" : "delta",
+        timestamp: Math.round(s.pts * 1e6),
+        data: new Uint8Array(this.buf, s.offset, s.size),
+      }));
+      this.fed++;
+    }
+  }
+
+  _onFrame(frame) {
+    const idx = this.outIdx++;
+    if (idx < this.shown) frame.close(); // something newer is already on screen
+    else this.ready.set(idx, frame);
+    this._present();
+    this._feed();
+  }
+
+  // Paint the newest decoded frame that is due; drop the ones it obsoletes.
+  _present() {
+    let best = -1;
+    for (const k of this.ready.keys()) if (k <= this.want && k > best) best = k;
+    if (best < 0 || best === this.shown) return;
+    const frame = this.ready.get(best);
+    this.ready.delete(best);
+    for (const [k, f] of this.ready) {
+      if (k < best) { f.close(); this.ready.delete(k); }
+    }
+    if (!this.canvas.width) {
+      this.canvas.width = frame.displayWidth;
+      this.canvas.height = frame.displayHeight;
+    }
+    this.ctx.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+    frame.close();
+    this.canvas.style.display = "block";
+    this.shown = best;
+    if (this.hud) {
+      const lag = (this.wantT - this.sched[best]) * 1000;
+      this.hud.textContent = `canvas f${best}/${this.samples.length} lag ${lag.toFixed(0)}ms`;
+    }
+  }
+
+  destroy() {
+    for (const f of this.ready.values()) f.close();
+    this.ready.clear();
+    try { this.decoder.close(); } catch { /* already closed */ }
+    this.canvas.remove();
+    if (this.hud) this.hud.remove();
+  }
+}
+
+class SeekDriver {
+  constructor(el, times) {
+    this.el = el;
+    this.times = times;
+    this.src = el.currentSrc || el.src;
+    this.shown = -1;
+    this.lastT = null;
+    // when a slow seek finishes, immediately chase the newest due frame
+    // instead of waiting for the next tick
+    this.onSeeked = () => { if (this.lastT != null) this.showAt(this.lastT); };
+    el.addEventListener("seeked", this.onSeeked);
+    this.hud = hudTag(el);
+    if (this.hud && el.requestVideoFrameCallback) {
+      const lags = [];
+      const loop = (_, meta) => {
+        const n = this.times.length, dur = el.duration || 1;
+        const j = Math.min(n - 1, Math.max(0, Math.round((meta.mediaTime / dur) * n - 0.4)));
+        if (this.lastT != null && n) {
+          const lag = (this.lastT - this.times[j]) * 1000;
+          lags.push(lag);
+          if (lags.length > 30) lags.shift();
+          const med = [...lags].sort((a, b) => a - b)[lags.length >> 1];
+          this.hud.textContent = `video f${j}/${n} lag ${lag.toFixed(0)}ms med ${med.toFixed(0)}ms`;
+        }
+        el.requestVideoFrameCallback(loop);
+      };
+      el.requestVideoFrameCallback(loop);
+    }
+  }
+
+  showAt(t) {
+    this.lastT = t;
+    if (!this.times.length || this.el.seeking) return; // seek in flight — seeked handler catches up
+    const idx = dueIdx(this.times, t);
+    if (idx < 0 || idx === this.shown) return;
+    this.shown = idx;
+    const n = this.times.length;
+    const dur = this.el.duration || 0;
+    // frame idx sits at idx/fps in the (measured-rate) container; +0.4
+    // frame keeps the seek safely inside the frame's display interval
+    try { this.el.currentTime = Math.min(((idx + 0.4) * dur) / n, dur); } catch { /* not seekable yet */ }
+  }
+
+  scrub(t) { this.shown = -2; this.showAt(t); }
+
+  destroy() {
+    this.el.removeEventListener("seeked", this.onSeeked);
+    if (this.hud) this.hud.remove();
+  }
 }
 
 // ---------- validation ----------
@@ -351,50 +596,35 @@ function render(force = false) {
         h("a", { class: "tbtn tbtn-sm dl", href: `/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`, title: "Download this whole recording folder as a .zip" }, "⤓ Download folder")),
       h("div", { class: "session-grid" }, ...cards));
 
-    // Frame-scheduled playback: videos NEVER play() — they stay paused, and a
-    // 30Hz clock loop steps each one to the frame whose recorded timestamp
-    // (from its *_timestamps.csv) has come due on the shared session
-    // timeline. Display timing therefore follows the ground-truth capture
-    // times: a frame is shown exactly when its clock time arrives, cameras
-    // with different frame rates and start offsets included.
-    const clock = { t: 0, anchor: 0, rate: 1, timer: null, loading: false };
-    const scheds = new Map();  // el -> { times: session-relative seconds per frame, shown: last idx }
+    // Frame-scheduled playback: ONE master clock; each video gets a driver
+    // (CanvasDriver = WebCodecs decode + canvas paint, SeekDriver = <video>
+    // currentTime stepping as fallback) that shows the frame whose recorded
+    // timestamp (from its *_timestamps.csv) has come due on the shared
+    // session timeline. Display timing follows the ground-truth capture
+    // times, cameras with different frame rates and start offsets included.
+    const clock = { t: 0, anchor: 0, rate: 1, timer: null, loading: false, hwBase: null };
+    const players = new Map();  // video el -> playback driver
     const vids = () => [...sessionEl.querySelectorAll("video")].map((el) => ({ el, off: Number(el.dataset.off || 0) }));
 
-    const parseCsv = (text) => {
-      const lines = text.trim().split("\n");
-      const cols = lines[0].split(",");
-      const iSec = cols.indexOf("timestamp_seconds");
-      const iHw = cols.indexOf("hw_timestamp_ms");
-      const sec = [], hw = [];
-      for (let i = 1; i < lines.length; i++) {
-        const c = lines[i].split(",");
-        if (iSec >= 0) sec.push(Number(c[iSec]));
-        if (iHw >= 0) hw.push(Number(c[iHw]));
-      }
-      return { sec, hw: iHw >= 0 && hw.some((x) => x > 0) ? hw : null };
-    };
-
-    const ensureMeta = (el) => new Promise((res) => {
-      if (el.readyState >= 1) return res();
-      el.preload = "metadata";
-      el.addEventListener("loadedmetadata", () => res(), { once: true });
-      el.addEventListener("error", () => res(), { once: true });
-      el.load();
-    });
-
-    // Fetch every camera's CSV once, then put all frames on ONE timeline:
-    // hardware timestamps (shared host clock) when present, else the stream's
-    // metadata start offset + capture-relative seconds.
-    const loadSchedules = async () => {
-      if (clock.loading || scheds.size) return;
+    // Fetch every camera's CSV once, put all frames on ONE timeline (hardware
+    // timestamps when present, else metadata start offset + capture-relative
+    // seconds), then build a driver per video. Re-entrant: videos whose source
+    // changed (overlay toggle) get their driver rebuilt, others are kept.
+    const loadPlayers = async () => {
+      if (clock.loading) return;
       clock.loading = true;
-      const entries = vids();
+      const entries = vids().filter(({ el }) => {
+        const cur = players.get(el);
+        if (!cur) return true;
+        if (cur.src === (el.currentSrc || el.src)) return false;
+        cur.destroy();
+        players.delete(el);
+        return true;
+      });
       const raw = await Promise.all(entries.map(async ({ el, off }) => {
         // hwoff: measured inter-camera clock offset (timing calibration) —
         // subtracting it puts both cameras' hw timestamps on one true clock
         const hwoff = Number(el.dataset.hwoff || 0);
-        await ensureMeta(el);
         try {
           const r = await fetch(fileUrl(el.dataset.csv));
           if (!r.ok) throw new Error();
@@ -405,84 +635,41 @@ function render(force = false) {
           return { el, off, sec: [], hw: null };
         }
       }));
+      // the shared zero-point is fixed on first load so a later partial
+      // rebuild (overlay toggle) stays on the same timeline
       const bases = raw.filter((x) => x.hw).map((x) => x.hw[0]);
-      const hwBase = bases.length ? Math.min(...bases) : 0;
+      if (clock.hwBase === null) clock.hwBase = bases.length ? Math.min(...bases) : 0;
       for (const x of raw) {
         let times;
-        if (x.hw) times = x.hw.map((ms) => (ms - hwBase) / 1000);
+        if (x.hw) times = x.hw.map((ms) => (ms - clock.hwBase) / 1000);
         else if (x.sec.length) times = x.sec.map((t) => t + x.off);
         else {  // no CSV — synthesize a CFR schedule from the container
+          await ensureMeta(x.el);
           const dur = x.el.duration || 0;
           const n = Math.max(1, Math.round(dur * 30));
           times = Array.from({ length: n }, (_, i) => x.off + (i * dur) / n);
         }
-        scheds.set(x.el, { times, shown: -1 });
-        // when a slow seek finishes, immediately chase the newest due frame
-        // instead of waiting for the next tick — keeps a slow-decoding video
-        // from trailing the others
-        x.el.addEventListener("seeked", () => { if (clock.timer) applyFrames(clock.t); });
-        attachHud(x.el, scheds.get(x.el));
+        let driver = null;
+        if (window.VideoDecoder) {
+          try {
+            driver = await CanvasDriver.create(x.el, times);
+          } catch (e) {
+            console.warn("WebCodecs fallback for", x.el.dataset.csv, e);
+          }
+        }
+        if (!driver) {
+          await ensureMeta(x.el);
+          driver = new SeekDriver(x.el, times);
+        }
+        players.set(x.el, driver);
       }
       clock.loading = false;
     };
 
-    // Sync debug HUD (#debug in the URL): for every frame the browser ACTUALLY
-    // presents (requestVideoFrameCallback), show which schedule frame it is and
-    // how far behind the master clock it appeared. The data/schedule side is
-    // verified in sync, so any real on-screen offset must show up here as a
-    // per-video lag difference.
-    const attachHud = (el, sch) => {
-      if (!location.hash.includes("debug") || !el.requestVideoFrameCallback) return;
-      const wrap = el.closest(".vwrap") || el.parentElement;
-      const tag = h("div", { style: "position:absolute;left:6px;bottom:6px;background:#000c;color:#3f6;" +
-        "font:12px/1.4 monospace;padding:2px 7px;border-radius:6px;z-index:5;pointer-events:none" }, "sync: —");
-      wrap.appendChild(tag);
-      const lags = [];
-      const loop = (_, meta) => {
-        const n = sch.times.length;
-        const dur = el.duration || 1;
-        // invert the seek mapping: presented mediaTime -> schedule frame index
-        const j = Math.min(n - 1, Math.max(0, Math.round((meta.mediaTime / dur) * n - 0.4)));
-        if (clock.timer) {
-          const lag = (clock.t - sch.times[j]) * 1000;
-          lags.push(lag);
-          if (lags.length > 30) lags.shift();
-          const med = [...lags].sort((a, b) => a - b)[lags.length >> 1];
-          tag.textContent = `f${j}/${n} lag ${lag.toFixed(0)}ms med ${med.toFixed(0)}ms`;
-        }
-        el.requestVideoFrameCallback(loop);
-      };
-      el.requestVideoFrameCallback(loop);
-    };
-
     const sessionEnd = () => {
       let end = 1;
-      for (const { times } of scheds.values()) if (times.length) end = Math.max(end, times[times.length - 1]);
+      for (const { times } of players.values()) if (times.length) end = Math.max(end, times[times.length - 1]);
       return end;
-    };
-
-    // Latest frame whose timestamp is <= t (binary search), -1 if none yet.
-    const dueIdx = (times, t) => {
-      let lo = 0, hi = times.length - 1, ans = -1;
-      while (lo <= hi) {
-        const mid = (lo + hi) >> 1;
-        if (times[mid] <= t) { ans = mid; lo = mid + 1; } else hi = mid - 1;
-      }
-      return ans;
-    };
-
-    const applyFrames = (t) => {
-      for (const [el, sch] of scheds) {
-        if (!sch.times.length || el.seeking) continue;  // skip while a seek is in flight — next tick catches up
-        const idx = dueIdx(sch.times, t);
-        if (idx < 0 || idx === sch.shown) continue;
-        sch.shown = idx;
-        const n = sch.times.length;
-        const dur = el.duration || 0;
-        // frame idx sits at idx/fps in the (measured-rate) container; +0.4
-        // frame keeps the seek safely inside the frame's display interval
-        try { el.currentTime = Math.min(((idx + 0.4) * dur) / n, dur); } catch { /* not seekable yet */ }
-      }
     };
 
     const stop = (atEnd) => {
@@ -493,7 +680,7 @@ function render(force = false) {
     const tick = () => {
       clock.t = ((performance.now() - clock.anchor) / 1000) * clock.rate;
       const end = sessionEnd();
-      applyFrames(clock.t);
+      for (const d of players.values()) d.showAt(clock.t);
       slider.max = end.toFixed(2);
       slider.value = String(Math.min(clock.t, end));
       timeLbl.textContent = `${clock.t.toFixed(1)}s`;
@@ -502,7 +689,7 @@ function render(force = false) {
     playBtn.addEventListener("click", async () => {
       if (clock.timer) { stop(false); return; }
       playBtn.textContent = "…";
-      await loadSchedules();
+      await loadPlayers();
       clock.anchor = performance.now() - (clock.t * 1000) / clock.rate;
       clock.timer = setInterval(tick, 33);
       playBtn.textContent = "⏸ Pause";
@@ -512,9 +699,8 @@ function render(force = false) {
       clock.t = Number(slider.value) || 0;
       clock.anchor = performance.now() - (clock.t * 1000) / clock.rate;
       timeLbl.textContent = `${clock.t.toFixed(1)}s`;
-      if (!scheds.size) await loadSchedules();
-      for (const sch of scheds.values()) sch.shown = -2;  // force re-apply even to the same frame
-      applyFrames(clock.t);
+      if (!players.size) await loadPlayers();
+      for (const d of players.values()) d.scrub(clock.t);
     });
     speedSlider.addEventListener("input", () => {
       clock.rate = Number(speedSlider.value) || 1;
