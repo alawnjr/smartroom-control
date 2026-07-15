@@ -318,6 +318,11 @@ function render(force = false) {
     const slider = h("input", { class: "seek", type: "range", min: 0, max: 30, step: 0.01, value: 0,
                                 title: "Seek every camera to this moment" });
     const timeLbl = h("span", { class: "cams", style: "min-width:5.5ch;text-align:right" }, "0.0s");
+    // Replay speed: scales the master clock only — frames still land exactly
+    // on their CSV timestamps, just on a slower/faster timeline.
+    const speedSlider = h("input", { class: "seek", type: "range", min: 0.1, max: 2, step: 0.05, value: 1,
+                                     style: "max-width:90px", title: "Replay speed (0.1×–2×)" });
+    const speedLbl = h("span", { class: "cams", style: "min-width:4.5ch;text-align:right" }, "1.00×");
     const sessionEl = h("div", { class: "session" },
       h("div", { class: "session-hd" },
         h("input", { type: "checkbox", checked: allSel, title: "Select all cameras in this recording", onchange: () => {
@@ -329,6 +334,8 @@ function render(force = false) {
         playBtn,
         slider,
         timeLbl,
+        speedSlider,
+        speedLbl,
         h("a", { class: "tbtn tbtn-sm dl", href: `/api/saved/archive?path=${encodeURIComponent(`${day}/${rec}`)}`, title: "Download this whole recording folder as a .zip" }, "⤓ Download folder")),
       h("div", { class: "session-grid" }, ...cards));
 
@@ -338,7 +345,7 @@ function render(force = false) {
     // timeline. Display timing therefore follows the ground-truth capture
     // times: a frame is shown exactly when its clock time arrives, cameras
     // with different frame rates and start offsets included.
-    const clock = { t: 0, anchor: 0, timer: null, loading: false };
+    const clock = { t: 0, anchor: 0, rate: 1, timer: null, loading: false };
     const scheds = new Map();  // el -> { times: session-relative seconds per frame, shown: last idx }
     const vids = () => [...sessionEl.querySelectorAll("video")].map((el) => ({ el, off: Number(el.dataset.off || 0) }));
 
@@ -442,7 +449,7 @@ function render(force = false) {
       playBtn.textContent = "▶ Play";
     };
     const tick = () => {
-      clock.t = (performance.now() - clock.anchor) / 1000;
+      clock.t = ((performance.now() - clock.anchor) / 1000) * clock.rate;
       const end = sessionEnd();
       applyFrames(clock.t);
       slider.max = end.toFixed(2);
@@ -454,18 +461,24 @@ function render(force = false) {
       if (clock.timer) { stop(false); return; }
       playBtn.textContent = "…";
       await loadSchedules();
-      clock.anchor = performance.now() - clock.t * 1000;
+      clock.anchor = performance.now() - (clock.t * 1000) / clock.rate;
       clock.timer = setInterval(tick, 33);
       playBtn.textContent = "⏸ Pause";
       tick();
     });
     slider.addEventListener("input", async () => {
       clock.t = Number(slider.value) || 0;
-      clock.anchor = performance.now() - clock.t * 1000;
+      clock.anchor = performance.now() - (clock.t * 1000) / clock.rate;
       timeLbl.textContent = `${clock.t.toFixed(1)}s`;
       if (!scheds.size) await loadSchedules();
       for (const sch of scheds.values()) sch.shown = -2;  // force re-apply even to the same frame
       applyFrames(clock.t);
+    });
+    speedSlider.addEventListener("input", () => {
+      clock.rate = Number(speedSlider.value) || 1;
+      // re-anchor so the clock keeps its current position when the rate changes
+      clock.anchor = performance.now() - (clock.t * 1000) / clock.rate;
+      speedLbl.textContent = `${clock.rate.toFixed(2)}×`;
     });
     return sessionEl;
   }));
