@@ -44,9 +44,14 @@ YOLO_MODELS="${SMARTROOM_YOLO_MODELS:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-po
 ACTION_VARIANTS="${SMARTROOM_ACTION_VARIANTS:-hmdb}"
 FORCE="${FORCE:-0}"
 
-# All SSH/rsync hops the node via the grid gateway (ProxyJump).
-SSHOPTS=(-J "$GW" -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30)
-RSYNC_RSH="ssh -J $GW -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30"
+# SSH/rsync hop the node via the gateway (ProxyJump) unless SMARTROOM_GW is
+# set EMPTY — some nodes (e.g. srv2-lg2.bed) are directly reachable.
+SSHOPTS=(-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30)
+RSYNC_RSH="ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30"
+if [ -n "$GW" ]; then
+  SSHOPTS=(-J "$GW" "${SSHOPTS[@]}")
+  RSYNC_RSH="ssh -J $GW -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=30"
+fi
 
 node_ssh() { ssh "${SSHOPTS[@]}" "$NODE" "$@"; }
 log()      { printf '\n\033[1;36m== %s ==\033[0m\n' "$*" >&2; }
