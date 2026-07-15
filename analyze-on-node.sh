@@ -135,6 +135,11 @@ push() {
   log "Syncing analysis code -> srv1:$REMOTE_DIR/detect (laptop copy is canonical)"
   rsync -a -e "$RSYNC_RSH" --include='*.py' --include='*.txt' --include='*.sh' \
     --exclude='*' "$script_dir/detect/" "$NODE:$REMOTE_DIR/detect/"
+  # action-classes.json (class toggles from the dashboard's Classes tab) is
+  # gitignored, so it must ride along or the server run ignores the toggles.
+  if [ -f "$script_dir/action-classes.json" ]; then
+    rsync -a -e "$RSYNC_RSH" "$script_dir/action-classes.json" "$NODE:$REMOTE_DIR/"
+  fi
   log "Uploading recordings -> srv1:$REMOTE_REC"
   node_ssh "mkdir -p '$REMOTE_REC'"
   rsync -ah --info=progress2 -e "$RSYNC_RSH" "$LOCAL_REC/" "$NODE:$REMOTE_REC/"

@@ -37,11 +37,11 @@ function datasetCard(ds) {
         h("span", { class: "count-pill" }, `${enabledCount} / ${ds.classes.length} on`),
         h("button", { class: "tbtn tbtn-sm", onclick: () => save([]) }, "all on"),
         h("button", { class: "tbtn tbtn-sm", onclick: () => save([...ds.classes]) }, "all off"),
-        h("button", { class: "apply-btn", title: "Re-run this model on all clips so the toggles take effect", onclick: async (e) => {
-          e.currentTarget.disabled = true;
-          e.currentTarget.textContent = "re-analyzing…";
-          await post("/api/action", { force: true, variant });
-        } }, "⟳ apply"))),
+        // Analysis is server-only: toggles save instantly to action-classes.json
+        // (which push() ships to the node) and take effect on the next
+        // analyze-on-node.sh run — nothing to launch from the laptop.
+        h("span", { class: "meta", title: "Toggles are saved immediately; re-run analyze-on-node.sh (FORCE=1 for actions) to apply them" },
+          "applies on next server run"))),
     h("p", { class: "ds-blurb" }, ds.blurb),
     rows.length === 0
       ? h("div", { class: "empty-note" }, `No classes match “${query}”.`)

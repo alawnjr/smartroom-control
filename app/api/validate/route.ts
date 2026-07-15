@@ -13,9 +13,11 @@ function validatePython() {
   return process.env.SMARTROOM_VALIDATE_PYTHON || "python3";
 }
 
-// Kick off data validation (detached, non-blocking). Same contract as
-// /api/detect: the script holds a global flock so concurrent triggers are safe;
-// { relPath } / { relPaths: [...] } validates a subset (neither = all clips).
+// Kick off data validation (detached, non-blocking) — the only analysis-like
+// job that still runs on the laptop (cheap integrity checks; the real analysis
+// is server-only via analyze-on-node.sh). The script holds a global flock so
+// concurrent triggers are safe; { relPath } / { relPaths: [...] } validates a
+// subset (neither = all clips).
 export async function POST(req: NextRequest) {
   let relPaths: string[] = [];
   let force = false;

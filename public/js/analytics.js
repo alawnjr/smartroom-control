@@ -487,7 +487,7 @@ function analysisCard(v) {
 
   return h("div", { class: "card card-sm acard" },
     h("div", { class: "acard-hd" },
-      h("label", { class: "who", title: "Select for re-analysis" }, checkbox, ` ${nameFor(v.node)} `, h("span", { class: "take" }, `· ${take}`)),
+      h("label", { class: "who", title: "Select for validation" }, checkbox, ` ${nameFor(v.node)} `, h("span", { class: "take" }, `· ${take}`)),
       h("div", { class: "acts" }, dropsChip(v), validationChip(v), graphsBtn, reBtn, valBtn)),
     validationPanel(v),
     picker,
@@ -526,7 +526,7 @@ function toolbar() {
       ? h("span", { class: `chip ${validFailed > 0 ? "chip-bad" : "chip-ok"}`, title: validFailed > 0 ? "Some clips failed validation — see the red chips on their cards" : "All validated clips passed" },
           validFailed > 0 ? `⛨ ${validFailed}/${validated.length} flagged` : `⛨ ${validated.length} valid`)
       : null,
-    analyzing > 0 ? h("button", { class: "tbtn tbtn-cancel", onclick: async () => { await post("/api/detect/cancel"); pingSoon(); } }, "✕ Cancel") : null,
+    // No Cancel either — there is nothing local to cancel; runs live on the server.
     h("span", { class: "grow" }),
     h("button", { class: "tbtn", title: "Pull new recordings from the Pis (analysis happens on the server: analyze-on-node.sh)",
         onclick: async (e) => { e.target.disabled = true; try { await post("/api/save-all"); } finally { e.target.disabled = false; } pingSoon(); } },
