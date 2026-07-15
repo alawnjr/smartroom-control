@@ -88,7 +88,16 @@ if [ ! -x .venv-action/bin/python ]; then
   bash detect/setup-action-env.sh
 fi
 
-# --- write the detached analysis runner used by the analyze step ---
+echo "bootstrap complete"
+REMOTE
+}
+
+# The detached runner the analyze step launches. (Re)written on EVERY analyze —
+# not just at bootstrap — so pass changes here reach already-bootstrapped nodes.
+write_runner() {
+  node_ssh 'bash -s' <<'REMOTE'
+set -euo pipefail
+cd /root/smartroom-control
 cat > run-analysis.sh <<'RUNNER'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -101,14 +110,14 @@ FORCE_FLAG="${3:-}"
 rc=0
 echo "[$(date)] === object detection + pose: $MODELS ${FORCE_FLAG:+(force)} ==="
 SMARTROOM_YOLO_MODELS="$MODELS" detect/.venv-detect/bin/python detect/detect.py $FORCE_FLAG || rc=$?
+echo "[$(date)] === spatial localization (pose + depth -> room positions) ==="
+detect/.venv-detect/bin/python detect/localize.py $FORCE_FLAG || rc=$?
 echo "[$(date)] === action recognition: $VARIANTS ${FORCE_FLAG:+(force)} ==="
 .venv-action/bin/python detect/action.py --variant "$VARIANTS" $FORCE_FLAG || rc=$?
 echo "[$(date)] === finished, exit=$rc ==="
 echo "$rc" > /root/smartroom-control/analyze.done
 RUNNER
 chmod +x run-analysis.sh
-
-echo "bootstrap complete"
 REMOTE
 }
 
@@ -126,8 +135,9 @@ push() {
 
 # -------------------------------------------------------------- analyze -----
 analyze() {
-  node_ssh "test -x '$REMOTE_DIR/run-analysis.sh'" \
+  node_ssh "test -x '$REMOTE_DIR/detect/.venv-detect/bin/python'" \
     || die "node not bootstrapped — run: $0 bootstrap"
+  write_runner
   local ff=""; [ "$FORCE" = "1" ] && ff="--force"
   log "Launching analysis on srv1 (detached; survives disconnect)"
   node_ssh bash -s -- "$YOLO_MODELS" "$ACTION_VARIANTS" "$ff" <<'REMOTE'

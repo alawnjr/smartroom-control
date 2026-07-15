@@ -7,7 +7,7 @@
 // changes nothing doesn't tear down playing videos.
 
 import { getJSON, post, h, fileUrl, groupSessions, analyzingCount, validatingCount, clipAnalyzing } from "./api.js";
-import { roomMapCard } from "./room-map.js";
+import { sessionMapCard } from "./room-map.js";
 import { openDrawer } from "./drawer.js";
 import { parseMp4 } from "./mp4demux.js";
 
@@ -564,9 +564,11 @@ function render(force = false) {
     for (const v of s.clips) {
       v._syncOff = v.startMs ? (v.startMs - minStart) / 1000 : 0;
       cards.push(analysisCard(v));
-      const map = roomMapCard(v, nameFor(v.node)); // side-card when the clip is located
-      if (map) cards.push(map);
     }
+    // ONE merged room map per recording: every located camera's tracks on the
+    // shared tag-1 frame (color-coded per camera).
+    const map = sessionMapCard(s.clips, nameFor);
+    if (map) cards.push(map);
     // Clock-driven playback for the whole recording: ONE master clock, every
     // camera disciplined to it (its own wall-clock offset included). Videos
     // never free-run — a drifting one gets its rate nudged (or hard-seeked),

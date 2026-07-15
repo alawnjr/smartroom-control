@@ -132,6 +132,18 @@ def tag_height_mm(mp4: Path, camera_id: str):
     entry = _floor_config(mp4).get(camera_id)
     if isinstance(entry, dict) and entry.get("tag_height_mm"):
         return float(entry["tag_height_mm"])
+    # Fall back to the recording's own metadata: capture.py embeds the room
+    # frame's tag height (room_frame.tag_center_above_floor_mm) in every
+    # recording. .floor.json only covers cameras that went through the
+    # person-stature calibration (the webcams) — without this fallback the
+    # RealSense clips can never be located.
+    try:
+        meta = json.loads((mp4.parent / "metadata.json").read_text())
+        height = (meta.get("room_frame") or {}).get("tag_center_above_floor_mm")
+        if height:
+            return float(height)
+    except (OSError, ValueError):
+        pass
     return None
 
 

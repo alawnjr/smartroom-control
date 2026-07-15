@@ -1,0 +1,495 @@
+#!/usr/bin/env python3
+"""
+Spatial localization pass: person room positions from pose keypoints + depth.
+
+Runs AFTER detect.py (consumes its .keypoints.yolo26n-pose.json sidecars) on
+every color clip that has pose keypoints plus embedded calibration/extrinsics.
+For the RealSense streams the recorded lossless depth (camera_*_depth.mkv,
+aligned to color) supplies each person's true range: the mid-hip pixel's depth
+is back-projected through the factory intrinsics and rotated into the shared
+AprilTag room frame. Clips without a depth stream (camera_main) fall back to
+the monocular pixel->floor-plane ray (calib_utils.pixel_to_floor), as does any
+sample where depth is missing/invalid.
+
+Both cameras' outputs share the tag-1 room frame, so the dashboard can overlay
+them on one map. Cross-camera fusion is deliberately NOT done here — each clip
+gets its own sidecar; tracks are per-camera greedy nearest-neighbor chains.
+
+Outputs per clip (same schema family as action.py so the map code is shared):
+  <stem>.centroids.geo.json   persons{tid:[{t,x,y,room,src}]} + roomFrame
+  <stem>.detections.geo.json  status sidecar so /api/saved exposes the model
+
+Env:
+  SMARTROOM_SAVE_DIR       recordings root (default: <project>/recordings)
+  SMARTROOM_ROOM_KP_CONF   min keypoint confidence for localization (0.5)
+
+Usage:
+  python detect/localize.py [--force] [--path day_x/rec_y/streams/cam/clip.mp4 ...]
+"""
+
+import argparse
+import csv
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from calib_utils import (ANKLE_JOINT_HEIGHT_MM, MAX_FLOOR_RANGE_MM,  # noqa: E402
+                         load_room_geometry, pixel_to_floor, stream_entry)
+
+SCHEMA_VERSION = 2
+MODEL_KEY = "geo"
+KEYPOINTS_MODEL = "yolo26n-pose"
+ROOM_KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
+
+# COCO-17 joint indices
+L_HIP, R_HIP = 11, 12
+L_ANKLE, R_ANKLE = 15, 16
+
+DEPTH_PATCH = 3            # half-size: (2*3+1)^2 = 7x7 median patch
+HW_PAIR_MAX_MS = 50.0      # color<->depth hw-timestamp pairing tolerance
+PERSON_HEIGHT_MIN_MM = -200.0   # sanity band for the mid-hip point's room height
+PERSON_HEIGHT_MAX_MM = 2200.0
+TRACK_GATE_MM_PER_S = 4000.0    # association gate grows with the sample gap
+TRACK_GATE_MIN_MM = 500.0
+TRACK_DEAD_S = 1.0
+
+
+def saved_root() -> Path:
+    return Path(os.environ.get("SMARTROOM_SAVE_DIR") or (PROJECT_ROOT / "recordings"))
+
+
+def _atomic_write_json(path: Path, data: dict):
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
+    with os.fdopen(fd, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def sidecar_paths(mp4: Path):
+    stem = mp4.stem
+    return (mp4.parent / f"{stem}.detections.{MODEL_KEY}.json",
+            mp4.parent / f"{stem}.centroids.{MODEL_KEY}.json")
+
+
+def needs_processing(mp4: Path, force: bool) -> bool:
+    if force:
+        return True
+    status_path, centroids_path = sidecar_paths(mp4)
+    if not status_path.exists() or not centroids_path.exists():
+        return True
+    try:
+        data = json.loads(status_path.read_text())
+    except Exception:  # noqa: BLE001
+        return True
+    if data.get("status") != "done":
+        return True
+    if data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000:
+        return True
+    # re-run when the pose sidecar is newer than our output (fresh detect run)
+    kp = mp4.parent / f"{mp4.stem}.keypoints.{KEYPOINTS_MODEL}.json"
+    if kp.exists() and kp.stat().st_mtime > status_path.stat().st_mtime:
+        return True
+    return False
+
+
+# --------------------------------------------------------- frame mapping ---
+
+def container_pts_slots(mp4: Path):
+    """Per-container-frame pts SLOT index. The Pi's hw encoder occasionally
+    drops a frame mid-encode but leaves its time slot in the container, so
+    slot index (round(pts/median_delta)) — not frame ordinal — is what lines
+    up with the timestamps CSV rows."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "v:0",
+         "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(mp4)],
+        capture_output=True, text=True, timeout=120, check=True)
+    pts = sorted(float(x) for x in out.stdout.split() if x.strip())
+    if len(pts) < 2:
+        return [0] * len(pts), 1 / 30.0
+    deltas = sorted(b - a for a, b in zip(pts, pts[1:]))
+    step = max(deltas[len(deltas) // 2], 1e-3)
+    return [round(p / step) for p in pts], step
+
+
+def read_csv_hw(path: Path):
+    """hw_timestamp_ms column (list of float, one per CSV row) or None."""
+    try:
+        with path.open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        hw = [float(r["hw_timestamp_ms"]) for r in rows]
+        return hw if hw and any(x > 0 for x in hw) else None
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+# ----------------------------------------------------------- depth reader ---
+
+def read_depth_frames(mkv: Path, indices, width, height):
+    """Decode the FFV1 depth mkv sequentially, keeping only `indices` (set of
+    frame numbers) as uint16 arrays. One pass — the sampled frames are a tiny
+    fraction of the clip."""
+    wanted = set(indices)
+    if not wanted:
+        return {}
+    frames = {}
+    frame_bytes = width * height * 2
+    last = max(wanted)
+    proc = subprocess.Popen(
+        ["ffmpeg", "-v", "error", "-i", str(mkv),
+         "-f", "rawvideo", "-pix_fmt", "gray16le", "-"],
+        stdout=subprocess.PIPE)
+    try:
+        idx = 0
+        while idx <= last:
+            buf = proc.stdout.read(frame_bytes)
+            if len(buf) < frame_bytes:
+                break
+            if idx in wanted:
+                frames[idx] = np.frombuffer(buf, dtype=np.uint16).reshape(height, width)
+            idx += 1
+    finally:
+        proc.stdout.close()
+        proc.kill()
+        proc.wait()
+    return frames
+
+
+def depth_at(depth, u, v, depth_scale_m):
+    """Median valid depth (mm) in a small patch around pixel (u,v), or None."""
+    h, w = depth.shape
+    x, y = int(round(u)), int(round(v))
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+    patch = depth[max(0, y - DEPTH_PATCH):y + DEPTH_PATCH + 1,
+                  max(0, x - DEPTH_PATCH):x + DEPTH_PATCH + 1]
+    valid = patch[patch > 0]
+    if valid.size < 3:  # mostly holes — don't trust it
+        return None
+    return float(np.median(valid)) * depth_scale_m * 1000.0
+
+
+# ------------------------------------------------------------ geometry ---
+
+def backproject_room(u, v, z_mm, geom):
+    """Depth pixel -> room-frame point. Returns (x,y,z) mm or None."""
+    pt = np.array([[[float(u), float(v)]]], dtype=np.float64)
+    import cv2
+    n = cv2.undistortPoints(pt, geom["K"], geom["dist"]).reshape(2)
+    p_cam = z_mm * np.array([n[0], n[1], 1.0])
+    p_room = geom["R"] @ p_cam + geom["cam_pos_mm"]
+    if not (PERSON_HEIGHT_MIN_MM <= p_room[1] <= PERSON_HEIGHT_MAX_MM):
+        return None
+    if float(np.linalg.norm(p_cam)) > MAX_FLOOR_RANGE_MM:
+        return None
+    return p_room
+
+
+def joint_px(person, idx, width, height):
+    """(u, v) pixels for a conf-gated joint, or None."""
+    if person["conf"][idx] < ROOM_KP_CONF:
+        return None
+    x, y = person["kpts"][idx]
+    return x * width, y * height
+
+
+def ground_point(person, width, height):
+    """The pixel to ray-cast for the fallback path: ankle avg (conf-gated)."""
+    pts = [p for p in (joint_px(person, L_ANKLE, width, height),
+                       joint_px(person, R_ANKLE, width, height)) if p]
+    if not pts:
+        return None
+    return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+
+
+def hip_point(person, width, height):
+    pts = [p for p in (joint_px(person, L_HIP, width, height),
+                       joint_px(person, R_HIP, width, height)) if p]
+    if not pts:
+        return None
+    return sum(p[0] for p in pts) / len(pts), sum(p[1] for p in pts) / len(pts)
+
+
+# -------------------------------------------------------------- tracking ---
+
+class Tracks:
+    """Greedy nearest-neighbor association in room space. Just enough to give
+    the map stable polylines — not a real tracker (fusion comes later)."""
+
+    def __init__(self):
+        self.next_id = 0
+        self.active = {}  # tid -> {"pos": (x,z), "t": last time}
+
+    def assign(self, t, positions):
+        """positions: list of (x_mm, z_mm). Returns list of track ids."""
+        ids = [None] * len(positions)
+        used = set()
+        # match each detection to the nearest live track inside the gate
+        order = sorted(range(len(positions)),
+                       key=lambda i: min((self._dist(positions[i], tr["pos"])
+                                          for tr in self.active.values()), default=1e18))
+        for i in order:
+            best_tid, best_d = None, 1e18
+            for tid, tr in self.active.items():
+                if tid in used or t - tr["t"] > TRACK_DEAD_S:
+                    continue
+                gate = max(TRACK_GATE_MIN_MM, TRACK_GATE_MM_PER_S * (t - tr["t"]))
+                d = self._dist(positions[i], tr["pos"])
+                if d < gate and d < best_d:
+                    best_tid, best_d = tid, d
+            if best_tid is None:
+                best_tid = self.next_id
+                self.next_id += 1
+            used.add(best_tid)
+            ids[i] = best_tid
+            self.active[best_tid] = {"pos": positions[i], "t": t}
+        # cull the dead
+        self.active = {tid: tr for tid, tr in self.active.items()
+                       if t - tr["t"] <= TRACK_DEAD_S}
+        return ids
+
+    @staticmethod
+    def _dist(a, b):
+        return ((a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2) ** 0.5
+
+
+# ------------------------------------------------------------- per clip ---
+
+def load_keypoints(mp4: Path):
+    kp_path = mp4.parent / f"{mp4.stem}.keypoints.{KEYPOINTS_MODEL}.json"
+    try:
+        data = json.loads(kp_path.read_text())
+    except (OSError, ValueError):
+        return None
+    if not data.get("frames"):
+        return None
+    return data
+
+
+def depth_stream_for(mp4: Path):
+    """(mkv path, depth csv path, depth_scale_m) for a camera_*_color clip,
+    or None when this clip has no recorded depth."""
+    stem = mp4.stem
+    if not stem.endswith("_color"):
+        return None
+    base = stem[:-len("_color")]
+    mkv = mp4.parent / f"{base}_depth.mkv"
+    dcsv = mp4.parent / f"{base}_depth_timestamps.csv"
+    if not mkv.exists() or not dcsv.exists():
+        return None
+    try:
+        entry = stream_entry(mp4.parent / f"{base}_depth.mkv")
+        scale = float(entry.get("depth_scale_m") or 0.001)
+    except Exception:  # noqa: BLE001
+        scale = 0.001
+    return mkv, dcsv, scale
+
+
+def process_clip(mp4: Path) -> bool:
+    status_path, centroids_path = sidecar_paths(mp4)
+    source_mtime_ms = mp4.stat().st_mtime * 1000
+    _atomic_write_json(status_path, {
+        "schemaVersion": SCHEMA_VERSION, "status": "analyzing",
+        "model": MODEL_KEY, "source": mp4.name, "sourceMtimeMs": source_mtime_ms})
+
+    kp = load_keypoints(mp4)
+    if kp is None:
+        _atomic_write_json(status_path, {
+            "schemaVersion": SCHEMA_VERSION, "status": "error", "model": MODEL_KEY,
+            "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
+            "error": "no pose keypoints sidecar (run detect.py first)"})
+        return False
+
+    try:
+        cal = stream_entry(mp4).get("calibration") or {}
+        width, height = int(cal.get("width") or 0), int(cal.get("height") or 0)
+    except Exception:  # noqa: BLE001
+        width = height = 0
+    if not width or not height:
+        # fall back to probing the clip
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height", "-of", "csv=p=0", str(mp4)],
+            capture_output=True, text=True, timeout=60)
+        try:
+            width, height = (int(x) for x in out.stdout.strip().split(","))
+        except ValueError:
+            width, height = 640, 480
+
+    geom = load_room_geometry(mp4, width, height, undistorted=False)
+    if geom is None:
+        # not an error — the clip simply can't be located (no extrinsics etc.)
+        _atomic_write_json(status_path, {
+            "schemaVersion": SCHEMA_VERSION, "status": "error", "model": MODEL_KEY,
+            "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
+            "error": "clip has no room geometry (extrinsics/intrinsics/tag height)"})
+        return False
+
+    native_fps = float(kp.get("nativeFps") or 30.0)
+
+    # --- depth plumbing (None for camera_main / missing depth) ---
+    depth = depth_stream_for(mp4)
+    depth_frames = {}
+    color_row_to_depth_idx = {}
+    slots = None
+    if depth is not None:
+        mkv, dcsv, depth_scale = depth
+        color_hw = read_csv_hw(mp4.parent / f"{mp4.stem}_timestamps.csv")
+        depth_hw = read_csv_hw(dcsv)
+        if color_hw and depth_hw:
+            try:
+                slots, _ = container_pts_slots(mp4)
+            except (subprocess.SubprocessError, OSError):
+                slots = None
+        if slots and color_hw and depth_hw:
+            dhw = np.array(depth_hw)
+            # container frame k lives at CSV row slots[k]
+            needed = {}
+            for fr in kp["frames"]:
+                k = round(float(fr["t"]) * native_fps)
+                if k >= len(slots):
+                    continue
+                row = slots[k]
+                if row >= len(color_hw):
+                    continue
+                j = int(np.argmin(np.abs(dhw - color_hw[row])))
+                if abs(dhw[j] - color_hw[row]) <= HW_PAIR_MAX_MS:
+                    needed[k] = j
+            color_row_to_depth_idx = needed
+            depth_frames = read_depth_frames(mkv, needed.values(), width, height)
+        else:
+            depth = None  # no hw timestamps — ray fallback only
+
+    # --- per sampled frame: localize every confident person ---
+    tracks = Tracks()
+    persons_out = {}
+    n_samples = 0
+    n_depth = n_ray = 0
+    for fr in kp["frames"]:
+        t = float(fr["t"])
+        n_samples += 1
+        k = round(t * native_fps)
+        dframe = None
+        if depth is not None and k in color_row_to_depth_idx:
+            dframe = depth_frames.get(color_row_to_depth_idx[k])
+
+        found = []  # (position (x,z), entry dict)
+        for person in fr.get("persons") or []:
+            hip = hip_point(person, width, height)
+            ank = ground_point(person, width, height)
+            pos = src = None
+            if dframe is not None and hip is not None:
+                z_mm = depth_at(dframe, hip[0], hip[1], depth[2])
+                if z_mm:
+                    p_room = backproject_room(hip[0], hip[1], z_mm, geom)
+                    if p_room is not None:
+                        pos, src = (float(p_room[0]), float(p_room[2])), "depth-hip"
+            if pos is None and ank is not None:
+                hit = pixel_to_floor(ank[0], ank[1], geom, ANKLE_JOINT_HEIGHT_MM)
+                if hit is not None:
+                    pos, src = hit, "ray-ankles"
+            if pos is None:
+                continue
+            px = hip or ank
+            found.append((pos, {
+                "t": round(t, 3),
+                "x": round(px[0], 1), "y": round(px[1], 1),
+                "room": [round(pos[0], 1), round(pos[1], 1)],
+                "src": src,
+            }))
+            if src == "depth-hip":
+                n_depth += 1
+            else:
+                n_ray += 1
+
+        ids = tracks.assign(t, [f[0] for f in found])
+        for tid, (_, entry) in zip(ids, found):
+            persons_out.setdefault(str(tid), []).append(entry)
+
+    duration = float(kp["frames"][-1]["t"]) if kp["frames"] else 0.0
+    _atomic_write_json(centroids_path, {
+        "schemaVersion": SCHEMA_VERSION,
+        "model": MODEL_KEY,
+        "source": mp4.name,
+        "sourceMtimeMs": source_mtime_ms,
+        "nativeFps": native_fps,
+        "persons": persons_out,
+        "roomFrame": {
+            "origin": "floor point directly under the AprilTag's center",
+            "axes": "X = tag's right (viewed facing the tag), Z = out of the wall; mm",
+            "tagId": geom.get("tag_id"),
+            "tagHeightMm": geom.get("tag_height_mm"),
+            "cameraPositionMm": [round(float(v), 1) for v in geom["cam_pos_mm"]],
+            "cameraId": geom.get("camera_id"),
+        },
+    })
+    _atomic_write_json(status_path, {
+        "schemaVersion": SCHEMA_VERSION, "status": "done", "model": MODEL_KEY,
+        "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
+        "hasAnnotated": False,
+        "framesAnalyzed": n_samples, "durationSec": round(duration, 2),
+        "samplesDepth": n_depth, "samplesRay": n_ray,
+        "tracks": len(persons_out),
+    })
+    print(f"  {mp4.parent.parent.parent.name}/{mp4.parent.parent.name}/{mp4.name}: "
+          f"{len(persons_out)} track(s), {n_depth} depth / {n_ray} ray samples",
+          file=sys.stderr)
+    return True
+
+
+# ------------------------------------------------------------------ main ---
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--force", action="store_true", help="re-run even when fresh")
+    ap.add_argument("--path", nargs="*", help="specific clips (relative to recordings root)")
+    args = ap.parse_args()
+
+    root = saved_root()
+    if not root.exists():
+        print(f"no recordings dir: {root}", file=sys.stderr)
+        return 0
+
+    lock_file = open(root / ".localize.lock", "w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        print("another localize run is in progress; exiting", file=sys.stderr)
+        return 0
+
+    SOURCES = ("camera_main.mp4", "camera_d455_color.mp4", "camera_d435_color.mp4")
+    if args.path:
+        clips = [root / p for p in args.path]
+    else:
+        clips = sorted((p for name in SOURCES for p in root.rglob(name)),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+    clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
+
+    todo = [c for c in clips if needs_processing(c, args.force)]
+    print(f"[{MODEL_KEY}] {len(todo)}/{len(clips)} clip(s) to localize", file=sys.stderr)
+    errors = 0
+    for mp4 in todo:
+        try:
+            if not process_clip(mp4):
+                errors += 1
+        except Exception as exc:  # noqa: BLE001 - keep the batch going
+            errors += 1
+            status_path, _ = sidecar_paths(mp4)
+            _atomic_write_json(status_path, {
+                "schemaVersion": SCHEMA_VERSION, "status": "error", "model": MODEL_KEY,
+                "source": mp4.name, "sourceMtimeMs": mp4.stat().st_mtime * 1000,
+                "error": f"{type(exc).__name__}: {exc}"})
+            print(f"  ERROR {mp4}: {exc}", file=sys.stderr)
+    return 1 if errors and errors == len(todo) else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
