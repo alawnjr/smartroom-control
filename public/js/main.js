@@ -35,3 +35,21 @@ const clock = document.getElementById("clock");
 const tick = () => (clock.textContent = new Date().toLocaleTimeString());
 tick();
 setInterval(tick, 1000);
+
+// Stale-tab guard: this SPA lives for days while new recordings poll in, so a
+// long-open tab can run week-old player code against fresh data. Watch the
+// module's ETag and reload once it changes (on focus + every 10 min).
+let jsTag = null;
+async function checkFresh() {
+  try {
+    const r = await fetch("/js/analytics.js", { method: "HEAD", cache: "no-store" });
+    const tag = r.headers.get("etag") || r.headers.get("last-modified");
+    if (jsTag === null) jsTag = tag;
+    else if (tag && tag !== jsTag) location.reload();
+  } catch {
+    /* server briefly down — retry on the next trigger */
+  }
+}
+checkFresh();
+window.addEventListener("focus", checkFresh);
+setInterval(checkFresh, 10 * 60 * 1000);
