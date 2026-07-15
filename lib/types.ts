@@ -57,6 +57,9 @@ export type SavedVideo = {
   mtime: number;
   startMs?: number; // stream's wall-clock start (epoch ms, from metadata.json) — aligns cameras on one timeline
   hwOffsetMs?: number; // measured inter-camera clock offset — subtract from this stream's hw timestamps
+  fps?: number; // measured delivery rate (from metadata.json)
+  nominalFps?: number; // the rate the camera was configured for
+  framesDropped?: number; // frames lost in the capture pipeline (holes → visible desync)
   detections?: Record<string, DetectionSummary>; // in-place per-model detection + action results
   validation?: ValidationSummary; // data-integrity checks (detect/validate.py sidecar)
   // Lens-corrected copy (undistort.py), when this clip is calibrated + processed:

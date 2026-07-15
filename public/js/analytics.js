@@ -74,6 +74,18 @@ function occupancySVG(timeline, max) {
   return div;
 }
 
+// Dropped-frame warning: holes in the stream mean the synced player holds a
+// stale frame there — the visible "one camera lags" desync. Flag clips that
+// lost more than ~2% of their frames.
+function dropsChip(v) {
+  const dropped = v.framesDropped ?? 0;
+  if (!dropped || !v.fps || !v.nominalFps || v.fps >= v.nominalFps * 0.98) return null;
+  return h("span", {
+    class: "chip chip-bad",
+    title: `${dropped} frames lost in the capture pipeline — expect this camera to trail the others during motion`,
+  }, `⚠ ${v.fps}fps · ${dropped} dropped`);
+}
+
 // ---------- validation ----------
 function validationChip(v) {
   const val = v.validation;
@@ -231,7 +243,7 @@ function analysisCard(v) {
   return h("div", { class: "card card-sm acard" },
     h("div", { class: "acard-hd" },
       h("label", { class: "who", title: "Select for re-analysis" }, checkbox, ` ${nameFor(v.node)} `, h("span", { class: "take" }, `· ${take}`)),
-      h("div", { class: "acts" }, validationChip(v), graphsBtn, reBtn, valBtn)),
+      h("div", { class: "acts" }, dropsChip(v), validationChip(v), graphsBtn, reBtn, valBtn)),
     validationPanel(v),
     picker,
     body);

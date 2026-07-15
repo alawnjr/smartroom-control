@@ -39,9 +39,17 @@ export async function GET() {
   const videos: SavedVideo[] = [];
   // Per-clip wall-clock start from the cam dir's metadata.json (streams are
   // keyed by the clip's stem). Cached per dir — several clips share one file.
-  type StreamMeta = { start_time?: string; hw_clock_offset_ms?: number };
+  type StreamMeta = {
+    start_time?: string;
+    hw_clock_offset_ms?: number;
+    fps?: number;
+    nominal_fps?: number;
+    frames_dropped?: number;
+  };
   const metaCache = new Map<string, { start_time?: string; streams?: Record<string, StreamMeta> } | null>();
-  const streamInfoFor = (abs: string): { startMs?: number; hwOffsetMs?: number } => {
+  const streamInfoFor = (
+    abs: string
+  ): { startMs?: number; hwOffsetMs?: number; fps?: number; nominalFps?: number; framesDropped?: number } => {
     const dir = path.dirname(abs);
     if (!metaCache.has(dir)) {
       try {
@@ -58,6 +66,9 @@ export async function GET() {
     return {
       startMs: Number.isFinite(ms) ? ms : undefined,
       hwOffsetMs: typeof entry?.hw_clock_offset_ms === "number" ? entry.hw_clock_offset_ms : undefined,
+      fps: typeof entry?.fps === "number" ? entry.fps : undefined,
+      nominalFps: typeof entry?.nominal_fps === "number" ? entry.nominal_fps : undefined,
+      framesDropped: typeof entry?.frames_dropped === "number" ? entry.frames_dropped : undefined,
     };
   };
 
