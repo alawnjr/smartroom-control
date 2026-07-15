@@ -311,6 +311,23 @@ RTMPOSE_BACKEND = os.environ.get("SMARTROOM_RTMPOSE_BACKEND", "onnxruntime")
 RTMPOSE_DEVICE = os.environ.get("SMARTROOM_RTMPOSE_DEVICE", "cpu")
 
 
+def _pick_device():
+    """Torch device for YOLO tracking + the mmaction recognizer: CUDA when
+    available, else CPU. Override with SMARTROOM_ACTION_DEVICE. (RTMPose runs
+    through onnxruntime and keeps its own RTMPOSE_DEVICE knob.)"""
+    dev = os.environ.get("SMARTROOM_ACTION_DEVICE", "auto")
+    if dev != "auto":
+        return dev
+    try:
+        import torch
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    except ImportError:
+        return "cpu"
+
+
+DEVICE = _pick_device()
+
+
 def _rtmpose_input_size():
     try:
         w, h = (int(x) for x in os.environ.get("SMARTROOM_RTMPOSE_INPUT", "192,256").split(","))
@@ -541,7 +558,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     centroids = defaultdict(list)   # per track: per-frame bbox centroid {t,x,y} (location tracking sidecar)
     seen = []
     idx = 0
-    for r in pose.track(str(src), stream=True, persist=True, classes=[0], device="cpu", verbose=False):
+    for r in pose.track(str(src), stream=True, persist=True, classes=[0], device=DEVICE, verbose=False):
         boxes = r.boxes
         kpts = r.keypoints
         perframe = []
@@ -750,7 +767,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
         "schemaVersion": SCHEMA_VERSION, "status": "done", "error": None,
         "model": key, "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
         "sourceVideo": "undistorted" if src != mp4 else "raw",
-        "device": "cpu", "classifier": variant["classifier"], "poseSource": pose_source,
+        "device": DEVICE, "classifier": variant["classifier"], "poseSource": pose_source,
         # Settings that produced this analysis (shown in the dashboard header).
         "stride": stride, "classifyEvery": classify_every,
         "samplesPerClassify": max(1, round(classify_every / stride)),
@@ -832,7 +849,7 @@ def main():
             print(f"{tag}: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
             if not todo:
                 continue
-            model = init_recognizer(variant_config(variant), variant_ckpt(variant), device="cpu")
+            model = init_recognizer(variant_config(variant), variant_ckpt(variant), device=DEVICE)
             label = (f"Actions ({'HMDB' if vkey == 'hmdb' else 'NTU'})"
                      + (" · RTMPose" if pose_source == "rtmpose" else ""))
             started = dt.datetime.now(dt.timezone.utc)

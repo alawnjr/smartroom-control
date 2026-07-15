@@ -47,15 +47,36 @@ def saved_root() -> Path:
     return Path(os.environ.get("SMARTROOM_SAVE_DIR") or (PROJECT_ROOT / "recordings"))
 
 
+def pick_device():
+    """Inference device: CUDA when a usable GPU is present, else OpenVINO CPU.
+    Override with SMARTROOM_DETECT_DEVICE (e.g. "0", "cuda:0", "intel:cpu")."""
+    dev = os.environ.get("SMARTROOM_DETECT_DEVICE", "auto")
+    if dev != "auto":
+        return dev
+    try:
+        import torch
+        return "0" if torch.cuda.is_available() else "intel:cpu"
+    except ImportError:
+        return "intel:cpu"
+
+
+DEVICE = pick_device()
+
+
 def model_specs():
-    """(key, openvino_dir) for each configured model."""
-    keys = os.environ.get(
+    """(key, model ref) for each configured model. On OpenVINO CPU the ref is
+    the exported <key>_openvino_model/ dir; on CUDA it's plain .pt weights
+    (the bench dir's copy when present, else the official name — ultralytics
+    downloads it on first use)."""
+    keys = [k.strip() for k in os.environ.get(
         # Only the large detector for object detection (nano/small/medium dropped);
         # the pose model stays (it's a separate skeleton task, not box detection).
         "SMARTROOM_YOLO_MODELS", "yolo26l,yolo26n-pose"
-    ).split(",")
+    ).split(",") if k.strip()]
     base = Path(os.environ.get("SMARTROOM_YOLO_DIR") or (Path.home() / "Code" / "yolo-bench"))
-    return [(k.strip(), base / f"{k.strip()}_openvino_model") for k in keys if k.strip()]
+    if DEVICE != "intel:cpu":
+        return [(k, p if (p := base / f"{k}.pt").exists() else Path(f"{k}.pt")) for k in keys]
+    return [(k, base / f"{k}_openvino_model") for k in keys]
 
 
 IMGSZ = int(os.environ.get("SMARTROOM_DETECT_IMGSZ", "640"))
@@ -163,7 +184,7 @@ def process_clip(model, key: str, mp4: Path):
         if idx % stride == 0:
             t = round(idx / native_fps, 3)
             if pose:
-                res = model.predict(frame, imgsz=IMGSZ, device="intel:cpu", verbose=False)[0]
+                res = model.predict(frame, imgsz=IMGSZ, device=DEVICE, verbose=False)[0]
                 kp = res.keypoints
                 xy = kp.xy.tolist() if kp is not None else []
                 xyn = kp.xyn.tolist() if kp is not None else []
@@ -182,7 +203,7 @@ def process_clip(model, key: str, mp4: Path):
                 })
             else:
                 res = model.predict(frame, imgsz=IMGSZ, classes=[PERSON_CLASS],
-                                    device="intel:cpu", verbose=False)[0]
+                                    device=DEVICE, verbose=False)[0]
                 last_boxes = [tuple(map(int, b)) for b in res.boxes.xyxy.tolist()] if res.boxes else []
                 timeline.append({"t": t, "count": len(last_boxes)})
         if writer is not None:
@@ -235,7 +256,7 @@ def process_clip(model, key: str, mp4: Path):
         "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms,
         "sourceVideo": "undistorted" if src != mp4 else "raw",
-        "device": "intel:cpu",
+        "device": DEVICE,
         "class": "person",
         "analyzedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "durationSec": round(total / native_fps, 3) if total else None,

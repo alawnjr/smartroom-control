@@ -11,11 +11,24 @@ export PATH="$HOME/.local/bin:$PATH"
 V=.venv-action
 
 uv venv --python 3.10 "$V"
+
+# CUDA when the box has a working NVIDIA driver, else CPU. cu118 covers Volta
+# (V100, sm_70) through Ampere (A100, sm_80) and is the newest CUDA with
+# torch 2.0.x wheels — which the mmcv 2.0.x matrix pins us to.
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+  TORCH_IDX="https://download.pytorch.org/whl/cu118"
+  MMCV_IDX="https://download.openmmlab.com/mmcv/dist/cu118/torch2.0.0/index.html"
+  echo ">> GPU detected — installing CUDA (cu118) torch/mmcv"
+else
+  TORCH_IDX="https://download.pytorch.org/whl/cpu"
+  MMCV_IDX="https://download.openmmlab.com/mmcv/dist/cpu/torch2.0.0/index.html"
+  echo ">> no GPU — installing CPU torch/mmcv"
+fi
+
 uv pip install --python "$V" "torch==2.0.1" "torchvision==0.15.2" \
-  --index-url https://download.pytorch.org/whl/cpu
+  --index-url "$TORCH_IDX"
 uv pip install --python "$V" "numpy<2" mmengine importlib-metadata lapx ultralytics
-uv pip install --python "$V" "mmcv==2.0.1" \
-  -f https://download.openmmlab.com/mmcv/dist/cpu/torch2.0.0/index.html
+uv pip install --python "$V" "mmcv==2.0.1" -f "$MMCV_IDX"
 uv pip install --python "$V" "mmaction2==1.2.0"
 
 # RTMPose — an optional alternative skeleton source for the action classifiers
