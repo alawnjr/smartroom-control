@@ -421,8 +421,38 @@ function render(force = false) {
         // instead of waiting for the next tick — keeps a slow-decoding video
         // from trailing the others
         x.el.addEventListener("seeked", () => { if (clock.timer) applyFrames(clock.t); });
+        attachHud(x.el, scheds.get(x.el));
       }
       clock.loading = false;
+    };
+
+    // Sync debug HUD (#debug in the URL): for every frame the browser ACTUALLY
+    // presents (requestVideoFrameCallback), show which schedule frame it is and
+    // how far behind the master clock it appeared. The data/schedule side is
+    // verified in sync, so any real on-screen offset must show up here as a
+    // per-video lag difference.
+    const attachHud = (el, sch) => {
+      if (!location.hash.includes("debug") || !el.requestVideoFrameCallback) return;
+      const wrap = el.closest(".vwrap") || el.parentElement;
+      const tag = h("div", { style: "position:absolute;left:6px;bottom:6px;background:#000c;color:#3f6;" +
+        "font:12px/1.4 monospace;padding:2px 7px;border-radius:6px;z-index:5;pointer-events:none" }, "sync: —");
+      wrap.appendChild(tag);
+      const lags = [];
+      const loop = (_, meta) => {
+        const n = sch.times.length;
+        const dur = el.duration || 1;
+        // invert the seek mapping: presented mediaTime -> schedule frame index
+        const j = Math.min(n - 1, Math.max(0, Math.round((meta.mediaTime / dur) * n - 0.4)));
+        if (clock.timer) {
+          const lag = (clock.t - sch.times[j]) * 1000;
+          lags.push(lag);
+          if (lags.length > 30) lags.shift();
+          const med = [...lags].sort((a, b) => a - b)[lags.length >> 1];
+          tag.textContent = `f${j}/${n} lag ${lag.toFixed(0)}ms med ${med.toFixed(0)}ms`;
+        }
+        el.requestVideoFrameCallback(loop);
+      };
+      el.requestVideoFrameCallback(loop);
     };
 
     const sessionEnd = () => {
