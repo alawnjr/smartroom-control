@@ -35,7 +35,9 @@
 set -euo pipefail
 
 # ---------------------------------------------------------------- config ----
-GW="${SMARTROOM_GW:-alawnjr@grid.cosmos-lab.org}"
+# ${VAR-default} (no colon): SMARTROOM_GW= (explicitly empty) disables the
+# gateway hop for directly-reachable nodes; unset still gets the default.
+GW="${SMARTROOM_GW-alawnjr@grid.cosmos-lab.org}"
 NODE="${SMARTROOM_NODE:-root@srv1}"
 LOCAL_REC="${SMARTROOM_LOCAL_REC:-$HOME/Code/smartroom-control/recordings}"
 REMOTE_DIR="${SMARTROOM_REMOTE_DIR:-/root/smartroom-control}"
