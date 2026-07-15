@@ -65,14 +65,23 @@ export function groupSessions(videos) {
     const { day, rec } = clips[0];
     const date = day.replace(/^day_\d+_/, "");
     const take = rec.split("_").pop() ?? rec;
+    // When the recording was MADE (metadata start_time), not when its files
+    // last changed on the laptop (mtime follows beam order and re-encodes).
+    const recordedMs = Math.max(0, ...clips.map((c) => c.startMs || 0)) || null;
+    const time = recordedMs
+      ? new Date(recordedMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })
+      : null;
     return {
       key,
-      label: `${date} · take ${take}`,
+      label: `${date}${time ? ` ${time}` : ""} · take ${take}`,
       clips: [...clips].sort((a, b) => a.node.localeCompare(b.node)),
       mtime: Math.max(...clips.map((c) => c.mtime)),
+      recordedMs,
     };
   });
-  sessions.sort((a, b) => b.mtime - a.mtime);
+  // Newest recording first, by recorded time; day/rec name (also dated) breaks
+  // ties and orders the rare session with no start_time in its metadata.
+  sessions.sort((a, b) => (b.recordedMs ?? 0) - (a.recordedMs ?? 0) || b.key.localeCompare(a.key));
   return sessions;
 }
 
