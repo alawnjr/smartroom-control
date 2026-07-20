@@ -1,18 +1,18 @@
-# smartroom-analyze.path — fire the analysis service when the recordings store
-# changes (a new clip finished uploading from the Pi). PathModified watches the
-# recordings root; uploads land as new day_/rec_ subdirs, which modifies it.
+# smartroom-analyze.path — fire the analysis service when a NEW recording has
+# finished uploading from the Pi.
 #
-# Note: a systemd .path unit watches one directory (not recursively), so it
-# triggers on changes to the recordings ROOT — new day/rec dirs appearing. The
-# analysis pass then scans the whole tree and processes whatever is complete
-# (idempotent), so mid-upload fires just no-op the not-yet-finished clips and a
-# later fire picks them up. A safety net timer is not required but can be added
-# if uploads ever land without touching the root mtime.
+# Watch the upload SENTINEL, not the recordings dir: the Pi's uploader touches
+# .last_upload after each successful upload, but the analysis pass writes many
+# sidecars back INTO the recordings tree — watching the dir made those writes
+# re-trigger analysis in a tight loop. The sentinel is only ever touched by the
+# uploader, so this fires once per upload and never on the analysis's own output.
+# (The pass is idempotent + guarded by a flock, so coalesced/queued fires are
+# safe.)
 [Unit]
-Description=Watch the smartroom recordings store and trigger analysis
+Description=Watch for new smartroom uploads and trigger analysis
 
 [Path]
-PathModified=/mnt/data4/intern26/recordings
+PathModified=/mnt/data4/intern26/recordings/.last_upload
 Unit=smartroom-analyze.service
 
 [Install]
