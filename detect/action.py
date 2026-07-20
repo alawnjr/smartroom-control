@@ -41,6 +41,79 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
+# Fast pose pass (default on): the classifier just needs, per frame, each
+# person's tracked id + COCO-17 keypoints. The original path used
+# ultralytics `.track()`, which runs YOLO pose ONE FRAME AT A TIME (poor GPU
+# batching — the Quadro sat ~idle) and is the dominant analysis cost. Instead run
+# BATCHED YOLO pose (multi-frame forward passes) and drive the SAME ByteTrack
+# tracker on the results, so track ids are identical to `.track()` — no accuracy
+# change — at ~2x the speed. Measured on the quad server: 7.5s -> ~4s per 30s
+# clip, single track preserved on the calibration clip. SMARTROOM_ACTION_FAST=0
+# restores the streaming path (also used automatically for RTMPose, whose
+# keypoints are swapped in per frame off the tracked boxes).
+FAST_ACTION = os.environ.get("SMARTROOM_ACTION_FAST", "1") != "0"
+ACTION_BATCH = int(os.environ.get("SMARTROOM_ACTION_BATCH", "16"))
+IMGSZ_ACTION = int(os.environ.get("SMARTROOM_ACTION_IMGSZ", "640"))
+
+
+def _make_bytetrack():
+    """A ByteTracker with ultralytics' default bytetrack.yaml parameters — the
+    same tracker `model.track()` builds, so ids match the streaming path."""
+    from types import SimpleNamespace
+
+    from ultralytics.trackers.byte_tracker import BYTETracker
+    args = SimpleNamespace(track_high_thresh=0.25, track_low_thresh=0.1,
+                           new_track_thresh=0.25, track_buffer=30,
+                           match_thresh=0.8, fuse_score=True,
+                           gmc_method="sparseOptFlow")
+    return BYTETracker(args)
+
+
+def _tracked_frames_fast(pose, src, device):
+    """Yield, per video frame, a list of (tid, xyxy, kpts_xy(17,2), conf(17,)) via
+    batched YOLO pose + ByteTrack. `out` rows are [x1,y1,x2,y2,id,conf,cls,det_idx];
+    det_idx maps a track back to its detection's keypoints in that frame."""
+    import cv2
+    import numpy as np
+
+    tracker = _make_bytetrack()
+    cap = cv2.VideoCapture(str(src))
+    frames_out = []
+    batch = []
+
+    def flush():
+        if not batch:
+            return
+        results = pose.predict(batch, imgsz=IMGSZ_ACTION, device=device,
+                               classes=[0], verbose=False)
+        for r in results:
+            r = r.cpu()
+            kp = r.keypoints
+            xy = kp.xy.numpy() if kp is not None else np.empty((0, 17, 2), "float32")
+            conf = (kp.conf.numpy() if (kp is not None and kp.conf is not None)
+                    else np.ones(xy.shape[:2], "float32"))
+            out = tracker.update(r.boxes, r.orig_img)
+            dets = []
+            for row in out:
+                di = int(row[7])
+                if di < 0 or di >= len(xy):
+                    continue
+                dets.append((int(row[4]), [int(row[0]), int(row[1]), int(row[2]), int(row[3])],
+                             xy[di], conf[di]))
+            frames_out.append(dets)
+        batch.clear()
+
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        batch.append(frame)
+        if len(batch) >= ACTION_BATCH:
+            flush()
+    flush()
+    cap.release()
+    return frames_out
+
 
 def _transcode_h264(src: Path, dst: Path) -> subprocess.CompletedProcess:
     """Re-encode to browser-friendly H.264 on the GPU (NVENC) — the annotated-
@@ -576,24 +649,45 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     win_pose = defaultdict(list)    # per track: one [[x,y,c]*17] pose per classified window (aligned with timeline)
     centroids = defaultdict(list)   # per track: per-frame bbox centroid {t,x,y} (location tracking sidecar)
     seen = []
-    idx = 0
-    for r in pose.track(str(src), stream=True, persist=True, classes=[0], device=DEVICE, verbose=False):
-        boxes = r.boxes
-        kpts = r.keypoints
-        perframe = []
-        if boxes is not None and boxes.id is not None and kpts is not None:
-            ids = boxes.id.int().tolist()
-            xyxy = boxes.xyxy.int().tolist()
-            if pose_source == "rtmpose" and rtm is not None and len(xyxy):
-                # Keep YOLO's tracked boxes + IDs; take keypoints from RTMPose instead.
-                # rtmlib returns (N,17,2) pixel keypoints + (N,17) scores in the SAME
-                # order as the input boxes, so row n still maps to ids[n].
-                xy, conf = rtm(r.orig_img, bboxes=np.asarray(xyxy, dtype="float32"))
-                xy = np.asarray(xy, dtype="float32")
-                conf = np.asarray(conf, dtype="float32")
+
+    # Per-frame detections as (ids, xyxy, xy, conf), from either the fast batched
+    # ByteTrack path (default, YOLO) or the original streaming .track() (RTMPose,
+    # or SMARTROOM_ACTION_FAST=0). The classify/window body below is identical.
+    def _frame_source():
+        if FAST_ACTION and pose_source != "rtmpose":
+            for dets in _tracked_frames_fast(pose, src, DEVICE):
+                if dets:
+                    ids = [d[0] for d in dets]
+                    xyxy = [d[1] for d in dets]
+                    xy = np.asarray([d[2] for d in dets], dtype="float32")
+                    conf = np.asarray([d[3] for d in dets], dtype="float32")
+                    yield ids, xyxy, xy, conf
+                else:
+                    yield [], [], np.empty((0, 17, 2), "float32"), np.empty((0, 17), "float32")
+            return
+        for r in pose.track(str(src), stream=True, persist=True, classes=[0], device=DEVICE, verbose=False):
+            boxes, kpts = r.boxes, r.keypoints
+            if boxes is not None and boxes.id is not None and kpts is not None:
+                ids = boxes.id.int().tolist()
+                xyxy = boxes.xyxy.int().tolist()
+                if pose_source == "rtmpose" and rtm is not None and len(xyxy):
+                    # Keep YOLO's tracked boxes + IDs; take keypoints from RTMPose instead.
+                    # rtmlib returns (N,17,2) pixel keypoints + (N,17) scores in the SAME
+                    # order as the input boxes, so row n still maps to ids[n].
+                    xy, conf = rtm(r.orig_img, bboxes=np.asarray(xyxy, dtype="float32"))
+                    xy = np.asarray(xy, dtype="float32")
+                    conf = np.asarray(conf, dtype="float32")
+                else:
+                    xy = kpts.xy.cpu().numpy()
+                    conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
+                yield ids, xyxy, xy, conf
             else:
-                xy = kpts.xy.cpu().numpy()
-                conf = kpts.conf.cpu().numpy() if kpts.conf is not None else np.ones(xy.shape[:2], "float32")
+                yield [], [], np.empty((0, 17, 2), "float32"), np.empty((0, 17), "float32")
+
+    idx = 0
+    for ids, xyxy, xy, conf in _frame_source():
+        perframe = []
+        if len(ids):
             for n, tid in enumerate(ids):
                 traj[tid].append((idx, xy[n], conf[n]))  # every frame (full vertical resolution)
                 entry = {"t": round(idx / native_fps, 3),
