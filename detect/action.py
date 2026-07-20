@@ -40,6 +40,25 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _transcode_h264(src: Path, dst: Path) -> subprocess.CompletedProcess:
+    """Re-encode to browser-friendly H.264 on the GPU (NVENC) — the annotated-
+    video encode dominates wall-clock, so keep it off the CPU. Fall back to
+    libx264 when NVENC is unavailable (no GPU / driver)."""
+    src_a = ["ffmpeg", "-y", "-i", str(src)]
+    tail = ["-pix_fmt", "yuv420p", "-movflags", "+faststart", str(dst)]
+    if os.environ.get("SMARTROOM_DETECT_ENCODER", "nvenc") != "cpu":
+        proc = subprocess.run(
+            src_a + ["-c:v", "h264_nvenc", "-preset", "p5", "-cq", "23"] + tail,
+            capture_output=True,
+        )
+        if proc.returncode == 0 and dst.exists():
+            return proc
+        dst.unlink(missing_ok=True)
+    return subprocess.run(src_a + ["-c:v", "libx264"] + tail, capture_output=True)
+
+
 # WINDOW samples (taken every STRIDE native frames) form the trailing skeleton
 # window fed to the classifier; it spans WINDOW*STRIDE/fps ≈ 3.2s. A label from a
 # trailing window describes the motion at the window's *center*, so the annotator
@@ -684,9 +703,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     has_annotated = False
     if tmp_raw.exists():
         final_tmp = annotated_path.with_suffix(".enc.mp4")
-        proc = subprocess.run(["ffmpeg", "-y", "-i", str(tmp_raw), "-c:v", "libx264",
-                               "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(final_tmp)],
-                              capture_output=True)
+        proc = _transcode_h264(tmp_raw, final_tmp)
         tmp_raw.unlink(missing_ok=True)
         if proc.returncode == 0 and final_tmp.exists():
             os.replace(final_tmp, annotated_path)
