@@ -54,6 +54,13 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FAST_ACTION = os.environ.get("SMARTROOM_ACTION_FAST", "1") != "0"
 ACTION_BATCH = int(os.environ.get("SMARTROOM_ACTION_BATCH", "16"))
 IMGSZ_ACTION = int(os.environ.get("SMARTROOM_ACTION_IMGSZ", "640"))
+# Produce the burned-in annotated action video? Off skips pass 2 entirely (a full
+# re-decode + draw + encode per clip). Shares the detect flag so the whole
+# pipeline is consistent; the 3D view / API don't need it.
+ANNOTATE = os.environ.get("SMARTROOM_DETECT_ANNOTATE", "1") != "0"
+# Half precision (fp16) for the YOLO pose forward pass — ~1.5-2x on GPU with
+# negligible keypoint change; ignored on CPU. Off via SMARTROOM_ACTION_HALF=0.
+ACTION_HALF = os.environ.get("SMARTROOM_ACTION_HALF", "1") != "0"
 
 
 def _make_bytetrack():
@@ -85,6 +92,7 @@ def _tracked_frames_fast(pose, src, device):
         if not batch:
             return
         results = pose.predict(batch, imgsz=IMGSZ_ACTION, device=device,
+                               half=(ACTION_HALF and str(device) != "cpu"),
                                classes=[0], verbose=False)
         for r in results:
             r = r.cpu()
@@ -761,40 +769,46 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     if jumps and "jumping" not in seen:
         seen.append("jumping")
 
-    # Pass 2 — re-decode and draw; frame g shows the label whose window was
-    # centered on g, i.e. the latest classification computed at or before g+offset.
-    tmp_raw = annotated_path.with_suffix(".raw.mp4")
-    writer = cv2.VideoWriter(str(tmp_raw), cv2.VideoWriter_fourcc(*"mp4v"), native_fps, (width, height))
-    cap = cv2.VideoCapture(str(src))  # same frames the keypoints were computed on
-    for g, perframe in enumerate(framedata):
-        ret, frame = cap.read()
-        if not ret:
-            break
-        fh, fw = frame.shape[:2]
-        for tid, (x1, y1), pts, cs in perframe:
-            for a, b in COCO_SKELETON:
-                if cs[a] > kp_conf and cs[b] > kp_conf:
-                    cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
-            # Only the classifier's labels go on this video; geometric jump events
-            # are kept separate (sidecar + the Analytics "Geometric" sub-view).
-            pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
-            text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
-            font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
-            (tw, th), base = cv2.getTextSize(text, font, scale, thick)
-            box_w, box_h = tw + 6, th + base + 4
-            # Keep the label fully on-screen: sit above the box normally, but flip
-            # below the box top when the person is near the top edge, and clamp
-            # horizontally so a wide label never runs off either side.
-            bx = max(0, min(x1, fw - box_w)) if fw >= box_w else 0
-            by = y1 - box_h if y1 - box_h >= 0 else y1
-            by = max(0, min(by, fh - box_h))
-            cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), (0, 200, 0), -1)
-            cv2.putText(frame, text, (bx + 3, by + th + 2), font, scale, (0, 0, 0), thick)
-        writer.write(frame)
-    cap.release()
-    writer.release()
-
+    # Pass 2 — re-decode and draw the annotated video. Skipped entirely when
+    # annotated videos are disabled (SMARTROOM_DETECT_ANNOTATE=0): it re-decodes
+    # the whole clip + draws + re-encodes, and the 3D view / API run on the JSON
+    # sidecars, not this overlay. This is the single biggest action-stage cost
+    # after the pose pass, so skipping it ~halves the stage when overlays aren't
+    # needed. Frame g shows the label whose window was centered on g (the latest
+    # classification computed at or before g+offset).
     has_annotated = False
+    tmp_raw = annotated_path.with_suffix(".raw.mp4")
+    if ANNOTATE:
+        writer = cv2.VideoWriter(str(tmp_raw), cv2.VideoWriter_fourcc(*"mp4v"), native_fps, (width, height))
+        cap = cv2.VideoCapture(str(src))  # same frames the keypoints were computed on
+        for g, perframe in enumerate(framedata):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            fh, fw = frame.shape[:2]
+            for tid, (x1, y1), pts, cs in perframe:
+                for a, b in COCO_SKELETON:
+                    if cs[a] > kp_conf and cs[b] > kp_conf:
+                        cv2.line(frame, tuple(map(int, pts[a])), tuple(map(int, pts[b])), (0, 200, 0), 2)
+                # Only the classifier's labels go on this video; geometric jump events
+                # are kept separate (sidecar + the Analytics "Geometric" sub-view).
+                pos = bisect.bisect_right(ev_idx[tid], g + offset_frames) - 1
+                text = f"#{tid} {ev_lab[tid][pos]}" if pos >= 0 else f"#{tid} ..."
+                font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1
+                (tw, th), base = cv2.getTextSize(text, font, scale, thick)
+                box_w, box_h = tw + 6, th + base + 4
+                # Keep the label fully on-screen: sit above the box normally, but flip
+                # below the box top when the person is near the top edge, and clamp
+                # horizontally so a wide label never runs off either side.
+                bx = max(0, min(x1, fw - box_w)) if fw >= box_w else 0
+                by = y1 - box_h if y1 - box_h >= 0 else y1
+                by = max(0, min(by, fh - box_h))
+                cv2.rectangle(frame, (bx, by), (bx + box_w, by + box_h), (0, 200, 0), -1)
+                cv2.putText(frame, text, (bx + 3, by + th + 2), font, scale, (0, 0, 0), thick)
+            writer.write(frame)
+        cap.release()
+        writer.release()
+
     if tmp_raw.exists():
         final_tmp = annotated_path.with_suffix(".enc.mp4")
         proc = _transcode_h264(tmp_raw, final_tmp)
