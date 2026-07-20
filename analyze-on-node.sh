@@ -87,9 +87,20 @@ command -v uv >/dev/null 2>&1 || { echo "uv install failed"; exit 1; }
 
 # --- detection venv (ultralytics / openvino / opencv) ---
 if [ ! -x detect/.venv-detect/bin/python ]; then
-  echo ">> building detect/.venv-detect (this pulls torch-cpu, a few min)"
+  echo ">> building detect/.venv-detect (torch + ultralytics, a few min)"
   rm -rf detect/.venv-detect
   uv venv --python 3.12 detect/.venv-detect
+  # Pin torch to a CUDA build the box's driver actually supports BEFORE
+  # ultralytics pulls the default PyPI wheel (currently cu13, which needs a very
+  # new driver). cu118 covers Volta..Ada incl. the Quadro RTX 6000 (sm_75);
+  # CPU wheel when there's no working GPU. Mirrors setup-action-env.sh.
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo ">> GPU detected — installing cu118 torch into detect venv"
+    uv pip install --python detect/.venv-detect torch torchvision --index-url https://download.pytorch.org/whl/cu118
+  else
+    echo ">> no GPU — installing CPU torch into detect venv"
+    uv pip install --python detect/.venv-detect torch torchvision --index-url https://download.pytorch.org/whl/cpu
+  fi
   uv pip install --python detect/.venv-detect -r detect/requirements.txt
 fi
 
