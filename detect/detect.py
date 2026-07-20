@@ -308,7 +308,11 @@ def main():
         print(f"no recordings dir: {root}", file=sys.stderr)
         return 0
 
-    lock_file = open(root / ".detect.lock", "w")
+    # Lock/pid names carry an optional suffix so multiple GPU-sharded workers can
+    # run concurrently (one per GPU, disjoint clip sets) without blocking on one
+    # global lock — the sharding orchestrator in run-analysis.sh sets it.
+    sfx = os.environ.get("SMARTROOM_LOCK_SUFFIX", "")
+    lock_file = open(root / f".detect.lock{sfx}", "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -322,7 +326,7 @@ def main():
         os.setpgrp()
     except OSError:
         pass
-    pid_path = root / ".detect.pid"
+    pid_path = root / f".detect.pid{sfx}"
     try:
         pid_path.write_text(str(os.getpid()))
     except OSError:

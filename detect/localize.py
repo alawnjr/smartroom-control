@@ -458,7 +458,9 @@ def main() -> int:
         print(f"no recordings dir: {root}", file=sys.stderr)
         return 0
 
-    lock_file = open(root / ".localize.lock", "w")
+    # Suffix lets GPU-sharded workers hold separate locks (see run-analysis.sh).
+    sfx = os.environ.get("SMARTROOM_LOCK_SUFFIX", "")
+    lock_file = open(root / f".localize.lock{sfx}", "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:

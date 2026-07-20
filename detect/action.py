@@ -924,7 +924,9 @@ def main():
         print(f"no recordings dir: {root}", file=sys.stderr)
         return 0
 
-    lock_file = open(root / ".action.lock", "w")
+    # Suffix lets GPU-sharded workers hold separate locks (see run-analysis.sh).
+    sfx = os.environ.get("SMARTROOM_LOCK_SUFFIX", "")
+    lock_file = open(root / f".action.lock{sfx}", "w")
     try:
         fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
@@ -934,7 +936,7 @@ def main():
         os.setpgrp()
     except OSError:
         pass
-    pid_path = root / ".action.pid"
+    pid_path = root / f".action.pid{sfx}"
     try:
         pid_path.write_text(str(os.getpid()))
     except OSError:
