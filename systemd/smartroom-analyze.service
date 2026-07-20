@@ -1,0 +1,25 @@
+# smartroom-analyze.service — run the full analysis pass over the recordings
+# store, in place, on the quad server (ortiz-lambda-quad). Fired by
+# smartroom-analyze.path when new recordings land. Oneshot; the pipeline is
+# idempotent (skips fresh clips) so overlapping fires are safe.
+#
+# Install (on the server, as intern26 — user units so no root needed):
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/smartroom-control/systemd/smartroom-analyze.service ~/.config/systemd/user/
+#   ln -sf ~/smartroom-control/systemd/smartroom-analyze.path    ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now smartroom-analyze.path
+#   loginctl enable-linger intern26     # keep it running without an active login
+[Unit]
+Description=Run smartroom GPU analysis over new recordings (in place)
+
+[Service]
+Type=oneshot
+# CODE lives in /home/intern26; DATA (recordings) live on /mnt/data4. Keep the
+# two separate per the server's storage rules.
+Environment=SMARTROOM_REMOTE_DIR=%h/smartroom-control
+Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
+WorkingDirectory=%h/smartroom-control
+ExecStart=%h/smartroom-control/run-analysis.sh
+# The runner exits nonzero if some clip/model failed; don't spam failed-state.
+SuccessExitStatus=0 1

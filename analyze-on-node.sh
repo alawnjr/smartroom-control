@@ -42,6 +42,11 @@ NODE="${SMARTROOM_NODE:-root@srv1}"
 LOCAL_REC="${SMARTROOM_LOCAL_REC:-$HOME/Code/smartroom-control/recordings}"
 REMOTE_DIR="${SMARTROOM_REMOTE_DIR:-/root/smartroom-control}"
 REMOTE_REC="$REMOTE_DIR/recordings"
+# Where the analysis reads/writes recordings ON THE NODE. Defaults to the repo's
+# own recordings/ (old COSMOS flow: push here, analyze in place, pull back). On
+# the Rutgers quad server this is the data volume, separate from the code dir:
+#   SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
+SAVE_DIR="${SMARTROOM_SAVE_DIR:-$REMOTE_REC}"
 YOLO_MODELS="${SMARTROOM_YOLO_MODELS:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose}"
 ACTION_VARIANTS="${SMARTROOM_ACTION_VARIANTS:-hmdb}"
 FORCE="${FORCE:-0}"
@@ -61,11 +66,11 @@ die()      { printf '\033[1;31m!! %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ------------------------------------------------------------- bootstrap ----
 bootstrap() {
-  log "Bootstrapping srv1 (ffmpeg, uv, detection venv, action venv) — idempotent"
-  node_ssh 'bash -s' <<'REMOTE'
+  log "Bootstrapping $NODE:$REMOTE_DIR (ffmpeg, uv, detection venv, action venv) — idempotent"
+  node_ssh 'bash -s' -- "$REMOTE_DIR" <<'REMOTE'
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-cd /root/smartroom-control
+cd "$1"
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
   echo ">> installing ffmpeg"
@@ -99,33 +104,14 @@ echo "bootstrap complete"
 REMOTE
 }
 
-# The detached runner the analyze step launches. (Re)written on EVERY analyze —
-# not just at bootstrap — so pass changes here reach already-bootstrapped nodes.
+# run-analysis.sh is a committed, env-driven script (not generated here) so the
+# server's smartroom-analyze.service can invoke the exact same runner. Push it up
+# fresh on every analyze so pass changes reach already-bootstrapped nodes.
 write_runner() {
-  node_ssh 'bash -s' <<'REMOTE'
-set -euo pipefail
-cd /root/smartroom-control
-cat > run-analysis.sh <<'RUNNER'
-#!/usr/bin/env bash
-set -uo pipefail
-cd /root/smartroom-control
-export PATH="$HOME/.local/bin:$PATH"
-export SMARTROOM_SAVE_DIR=/root/smartroom-control/recordings
-MODELS="${1:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose}"
-VARIANTS="${2:-hmdb}"
-FORCE_FLAG="${3:-}"
-rc=0
-echo "[$(date)] === object detection + pose: $MODELS ${FORCE_FLAG:+(force)} ==="
-SMARTROOM_YOLO_MODELS="$MODELS" detect/.venv-detect/bin/python detect/detect.py $FORCE_FLAG || rc=$?
-echo "[$(date)] === spatial localization (pose + depth -> room positions) ==="
-detect/.venv-detect/bin/python detect/localize.py $FORCE_FLAG || rc=$?
-echo "[$(date)] === action recognition: $VARIANTS ${FORCE_FLAG:+(force)} ==="
-.venv-action/bin/python detect/action.py --variant "$VARIANTS" $FORCE_FLAG || rc=$?
-echo "[$(date)] === finished, exit=$rc ==="
-echo "$rc" > /root/smartroom-control/analyze.done
-RUNNER
-chmod +x run-analysis.sh
-REMOTE
+  local script_dir; script_dir="$(cd "$(dirname "$0")" && pwd)"
+  [ -f "$script_dir/run-analysis.sh" ] || die "run-analysis.sh not found next to analyze-on-node.sh"
+  rsync -a -e "$RSYNC_RSH" "$script_dir/run-analysis.sh" "$NODE:$REMOTE_DIR/run-analysis.sh"
+  node_ssh "chmod +x '$REMOTE_DIR/run-analysis.sh'"
 }
 
 # --------------------------------------------------------------- push -------
@@ -140,9 +126,12 @@ push() {
   if [ -f "$script_dir/action-classes.json" ]; then
     rsync -a -e "$RSYNC_RSH" "$script_dir/action-classes.json" "$NODE:$REMOTE_DIR/"
   fi
-  log "Uploading recordings -> srv1:$REMOTE_REC"
-  node_ssh "mkdir -p '$REMOTE_REC'"
-  rsync -ah --info=progress2 -e "$RSYNC_RSH" "$LOCAL_REC/" "$NODE:$REMOTE_REC/"
+  # The committed runner (also invoked by the server's systemd unit).
+  rsync -a -e "$RSYNC_RSH" "$script_dir/run-analysis.sh" "$NODE:$REMOTE_DIR/run-analysis.sh"
+  node_ssh "chmod +x '$REMOTE_DIR/run-analysis.sh'"
+  log "Uploading recordings -> $NODE:$SAVE_DIR"
+  node_ssh "mkdir -p '$SAVE_DIR'"
+  rsync -ah --info=progress2 -e "$RSYNC_RSH" "$LOCAL_REC/" "$NODE:$SAVE_DIR/"
 }
 
 # -------------------------------------------------------------- analyze -----
@@ -151,20 +140,23 @@ analyze() {
     || die "node not bootstrapped — run: $0 bootstrap"
   write_runner
   local ff=""; [ "$FORCE" = "1" ] && ff="--force"
-  log "Launching analysis on srv1 (detached; survives disconnect)"
-  node_ssh bash -s -- "$YOLO_MODELS" "$ACTION_VARIANTS" "$ff" <<'REMOTE'
+  log "Launching analysis on $NODE (detached; survives disconnect) — recordings: $SAVE_DIR"
+  # Args: $1 workdir  $2 save-dir  $3 models  $4 variants  $5 force-flag
+  node_ssh bash -s -- "$REMOTE_DIR" "$SAVE_DIR" "$YOLO_MODELS" "$ACTION_VARIANTS" "$ff" <<'REMOTE'
 set -euo pipefail
-cd /root/smartroom-control
+cd "$1"
+export SMARTROOM_REMOTE_DIR="$1"
+export SMARTROOM_SAVE_DIR="$2"
 if [ -f analyze.pid ] && kill -0 "$(cat analyze.pid)" 2>/dev/null; then
   echo "analysis already running (pid $(cat analyze.pid)); attaching."
   exit 0
 fi
 rm -f analyze.done analyze.log
-# ${3:-}: ssh flattens the arg list, so an empty force-flag arg vanishes entirely
-nohup ./run-analysis.sh "$1" "$2" "${3:-}" >analyze.log 2>&1 &
+# ${5:-}: ssh flattens the arg list, so an empty force-flag arg vanishes entirely
+nohup ./run-analysis.sh "$3" "$4" "${5:-}" >analyze.log 2>&1 &
 echo $! >analyze.pid
 sleep 1
-echo "launched pid $(cat analyze.pid); log: /root/smartroom-control/analyze.log"
+echo "launched pid $(cat analyze.pid); log: $1/analyze.log"
 REMOTE
 }
 
@@ -193,8 +185,8 @@ wait_done() {
 # --------------------------------------------------------------- pull -------
 pull() {
   [ -d "$LOCAL_REC" ] || die "local recordings dir not found: $LOCAL_REC"
-  log "Fetching results srv1 -> $LOCAL_REC (new sidecars + annotated videos)"
-  rsync -ah --info=progress2 -e "$RSYNC_RSH" "$NODE:$REMOTE_REC/" "$LOCAL_REC/"
+  log "Fetching results $NODE:$SAVE_DIR -> $LOCAL_REC (new sidecars + annotated videos)"
+  rsync -ah --info=progress2 -e "$RSYNC_RSH" "$NODE:$SAVE_DIR/" "$LOCAL_REC/"
   log "Done. Reload the dashboard to see detections / actions / room maps."
 }
 
