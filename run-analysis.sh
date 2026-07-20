@@ -12,7 +12,7 @@
 # Config (all optional; defaults preserve the original COSMOS behaviour):
 #   SMARTROOM_REMOTE_DIR   repo/working dir to cd into   (default: /root/smartroom-control)
 #   SMARTROOM_SAVE_DIR     recordings root to analyze    (default: $SMARTROOM_REMOTE_DIR/recordings)
-#   SMARTROOM_YOLO_MODELS  detection models              (default: n,s,m,l + n-pose)
+#   SMARTROOM_YOLO_MODELS  detection models              (default: m + n-pose)
 #   SMARTROOM_ACTION_VARIANTS  action variants           (default: hmdb)
 # Positional args (override the env, for backward compat with the old runner):
 #   $1 models   $2 variants   $3 force-flag (e.g. --force)
@@ -23,7 +23,7 @@ cd "$WORK_DIR"
 export PATH="$HOME/.local/bin:$PATH"
 export SMARTROOM_SAVE_DIR="${SMARTROOM_SAVE_DIR:-$WORK_DIR/recordings}"
 
-MODELS="${1:-${SMARTROOM_YOLO_MODELS:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose}}"
+MODELS="${1:-${SMARTROOM_YOLO_MODELS:-yolo26m,yolo26n-pose}}"
 VARIANTS="${2:-${SMARTROOM_ACTION_VARIANTS:-hmdb}}"
 FORCE_FLAG="${3:-}"
 

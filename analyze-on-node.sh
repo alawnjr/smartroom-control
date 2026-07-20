@@ -27,7 +27,7 @@
 #
 # Handy env overrides:
 #   FORCE=1                 re-analyze clips even if results already exist
-#   SMARTROOM_YOLO_MODELS   detection models   (default: n,s,m,l + n-pose)
+#   SMARTROOM_YOLO_MODELS   detection models   (default: m + n-pose)
 #   SMARTROOM_ACTION_VARIANTS  action models   (default: hmdb — NTU retired)
 #   SMARTROOM_LOCAL_REC     local recordings dir
 #   SMARTROOM_GW / SMARTROOM_NODE   gateway / node ssh targets
@@ -47,7 +47,7 @@ REMOTE_REC="$REMOTE_DIR/recordings"
 # the Rutgers quad server this is the data volume, separate from the code dir:
 #   SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 SAVE_DIR="${SMARTROOM_SAVE_DIR:-$REMOTE_REC}"
-YOLO_MODELS="${SMARTROOM_YOLO_MODELS:-yolo26n,yolo26s,yolo26m,yolo26l,yolo26n-pose}"
+YOLO_MODELS="${SMARTROOM_YOLO_MODELS:-yolo26m,yolo26n-pose}"
 ACTION_VARIANTS="${SMARTROOM_ACTION_VARIANTS:-hmdb}"
 FORCE="${FORCE:-0}"
 
