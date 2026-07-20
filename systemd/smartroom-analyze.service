@@ -19,6 +19,12 @@ Type=oneshot
 # two separate per the server's storage rules.
 Environment=SMARTROOM_REMOTE_DIR=%h/smartroom-control
 Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
+# Skip burned-in annotated videos: they cost ~75% of analysis wall-clock (per-
+# frame draw + encode) and the 3D view / API run on the JSON sidecars, not the
+# overlay videos. The 2D player just shows raw video for the overlay tabs. Set
+# to 1 (or remove) if you want browser-playable boxes-burned-in videos back —
+# the encode now uses the GPU (NVENC), so it's much cheaper than before.
+Environment=SMARTROOM_DETECT_ANNOTATE=0
 WorkingDirectory=%h/smartroom-control
 ExecStart=%h/smartroom-control/run-analysis.sh
 # The runner exits nonzero if some clip/model failed; don't spam failed-state.
