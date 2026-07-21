@@ -66,6 +66,12 @@ AVA_SHORT = 256           # short-side the SlowFast-AVA clip is resized to
 AVA_BUF = 128             # rolling RGB frame buffer (a few seconds at any fps)
 AVA_PERIOD_S = 0.4        # how often to run the (heavier) AVA forward
 AVA_THR = float(os.environ.get("SMARTROOM_AVA_THR", "0.4"))  # multi-label: every class above this is output
+# Classes to suppress entirely (never output). ';'-separated (AVA names contain
+# commas), case-insensitive exact match. Override/extend via SMARTROOM_AVA_BLACKLIST.
+AVA_BLACKLIST = {s.strip().lower() for s in
+                 os.environ.get("SMARTROOM_AVA_BLACKLIST",
+                                "watch (a person);talk to (e.g., self, a person, a group)").split(";")
+                 if s.strip()}
 # SlowFast-AVA was trained on ~30fps clips where its 32x2 window ≈ 2.1s. Our live
 # feed is ~10fps, so taking the last 64 frames would span ~6.4s — too much motion
 # integrated per label (inertia) and 3x-stretched so dynamic actions look static.
@@ -560,7 +566,8 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
         for j, tid in enumerate(tids):
             labs = [(label_map[i], float(scores[j, i]))
                     for i in range(scores.shape[1])
-                    if i in label_map and float(scores[j, i]) > action_thr]
+                    if i in label_map and float(scores[j, i]) > action_thr
+                    and label_map[i].lower() not in AVA_BLACKLIST]
             labs.sort(key=lambda x: -x[1])
             # multi-label: keep EVERY class above the threshold, not just top-1
             shared.set_label(tid, labs[0][0] if labs else None,
