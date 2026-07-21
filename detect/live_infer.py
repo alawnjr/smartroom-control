@@ -73,6 +73,13 @@ AVA_THR = 0.4             # per-class action score threshold
 # to clip_len, matching the training time-span regardless of the live fps.
 AVA_SPAN_S = float(os.environ.get("SMARTROOM_AVA_SPAN_S", "2.1"))
 AVA_MIN_FRAMES = 8        # need at least this many frames in the span to classify
+# Geometric jump detector (ports action.py detect_jumps to a live streaming form,
+# independent of the ML classifier). A jump = the hip center-of-mass rising above
+# its rolling "standing" baseline by > JUMP_FRAC of body height. Distance-invariant.
+JUMP_FRAC = float(os.environ.get("SMARTROOM_JUMP_FRAC", "0.20"))
+JUMP_WINDOW_S = 1.5       # rolling baseline window
+JUMP_MIN_STREAK = 2       # consecutive airborne frames before firing (anti-jitter)
+JUMP_HOLD_S = 0.5         # keep showing "jump" this long after the last airborne frame
 
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
@@ -266,11 +273,59 @@ def _shoulder_point(person, w, h):
     return sum(pt[0] for pt in pts) / len(pts), sum(pt[1] for pt in pts) / len(pts)
 
 
+def _hip_com(person):
+    """(hip-midpoint y, body pixel height) from a person's pixel keypoints, for
+    jump detection. Either may be None if too few joints are confident."""
+    px, cf = person["px"], person["conf"]
+    ys = [px[j][1] for j in range(len(cf)) if cf[j] >= KP_CONF]
+    hips = [px[j][1] for j in (11, 12) if j < len(cf) and cf[j] >= KP_CONF]
+    comy = sum(hips) / len(hips) if hips else None
+    body_h = (max(ys) - min(ys)) if len(ys) >= 2 else None
+    return comy, body_h
+
+
+class JumpDetector:
+    """Per-track streaming jump detector. Image y grows downward, so airborne =
+    the hip CoM sitting ABOVE (smaller y than) its rolling-median standing
+    baseline by more than JUMP_FRAC of the person's pixel height."""
+
+    def __init__(self):
+        self.hist = defaultdict(deque)   # tid -> deque of (t, comy, body_h)
+        self.streak = defaultdict(int)
+        self.until = {}                  # tid -> monotonic t to keep showing "jump"
+
+    def update(self, tid, comy, body_h, t):
+        dq = self.hist[tid]
+        dq.append((t, comy, body_h))
+        while dq and t - dq[0][0] > JUMP_WINDOW_S:
+            dq.popleft()
+        comys = sorted(c for _, c, _ in dq if c is not None)
+        bhs = sorted(b for _, _, b in dq if b)
+        if comy is not None and len(comys) >= 4 and bhs:
+            baseline = comys[len(comys) // 2]          # median standing CoM
+            body = bhs[len(bhs) // 2] or 1.0
+            if (baseline - comy) / body >= JUMP_FRAC:   # CoM risen above baseline
+                self.streak[tid] += 1
+                if self.streak[tid] >= JUMP_MIN_STREAK:
+                    self.until[tid] = t + JUMP_HOLD_S
+            else:
+                self.streak[tid] = 0
+        return self.until.get(tid, 0.0) > t
+
+    def prune(self, live, t):
+        for tid in [k for k, dq in self.hist.items()
+                    if k not in live and (not dq or t - dq[-1][0] > 3)]:
+            self.hist.pop(tid, None)
+            self.streak.pop(tid, None)
+            self.until.pop(tid, None)
+
+
 def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool,
                mode: str):
     from ultralytics import YOLO
     model = YOLO(weights)
     tracker = _make_bytetrack()
+    jumps = JumpDetector()
     use_half = device not in ("cpu", "intel:cpu")
     last_id = 0
     ema_fps = 0.0
@@ -354,12 +409,19 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 ava_boxes.append((tid, p["box"]))
             lab = shared.get_label(tid) if (skeleton or ava) else None
             action = lab.get("action") if lab else None
+            aconf = lab["conf"] if (lab and action) else None
+            # geometric jump detector — independent of the classifier, wins when
+            # the person is airborne (the ML models are weak on brief jumps).
+            comy, body_h = _hip_com(p)
+            if jumps.update(tid, comy, body_h, t0):
+                action, aconf = "jump", 1.0
             entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1), "src": src}
             if action:
                 entry["action"] = action
-                entry["actionConf"] = lab["conf"]
+                entry["actionConf"] = aconf
             positions.append(entry)
             _draw_person(frame, p["px"], p["conf"], marker, tid, src, action)
+        jumps.prune({tid for tid, *_ in found}, t0)
         if ava:
             shared.push_ava(frame, ava_boxes, w, h)
 
