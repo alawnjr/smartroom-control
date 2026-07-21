@@ -63,6 +63,18 @@ DEPTH_MATCH_FRAC = 0.06   # a depth sample within this (fraction of frame) count
 # back-channel polls ~8Hz, so 0.35s keeps roughly the freshest sample and drops
 # the rest — better to skip a person this frame than to localize them wrongly.
 DEPTH_STALE_S = float(os.environ.get("SMARTROOM_DEPTH_STALE_S", "0.35"))
+# A depth camera measures the body SURFACE FACING IT, so each camera places a
+# person half a torso-depth toward itself. Viewed from different sides the two
+# cameras therefore disagree by roughly a whole torso depth — measured here as a
+# ~300mm systematic offset, almost entirely along the camera-separation axis.
+# Pushing each sample this far further along the viewing ray approximates the
+# body CENTRE. TESTED AND REJECTED (default 0): at 150mm the cross-camera
+# disagreement got WORSE, 300mm -> 480mm. The premise does not hold for this
+# layout — the D455 (x=-1952) and D435 (x=+296) sit on the SAME side of a person
+# at x~700, so they see the same-facing surface and there is no opposing bias to
+# cancel; pushing both along their differing rays just separates them. Kept as a
+# knob in case the cameras are ever repositioned to face each other.
+BODY_HALF_DEPTH_MM = float(os.environ.get("SMARTROOM_BODY_HALF_DEPTH_MM", "0"))
 ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); deque cap
 ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
 ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
@@ -703,7 +715,9 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             z_mm = shared.depth_near(anchor[0] / w, anchor[1] / h)
             if not z_mm:
                 continue
-            p_room = backproject_room(anchor[0], anchor[1], z_mm, geom)
+            # surface -> body centre (see BODY_HALF_DEPTH_MM)
+            p_room = backproject_room(anchor[0], anchor[1],
+                                      z_mm + BODY_HALF_DEPTH_MM, geom)
             if p_room is None:
                 continue
             found.append((tid, (float(p_room[0]), float(p_room[2])), anchor, p, src))
