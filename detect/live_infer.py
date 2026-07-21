@@ -36,6 +36,7 @@ import struct
 import sys
 import threading
 import time
+from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -58,6 +59,9 @@ JPEG_QUALITY = 75
 KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
 DEPTH_MATCH_FRAC = 0.06   # a depth sample within this (fraction of frame) counts as "this hip"
 DEPTH_STALE_S = 1.0       # ignore depth samples older than this
+ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); deque cap
+ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
+ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
 
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
@@ -113,6 +117,11 @@ class Shared:
         # back (D455 depth aligned to color). Both keyed in frame-fraction coords.
         self.hips = []               # [[u_frac, v_frac], ...] latest frame's hips
         self.depths = []             # [(u_frac, v_frac, metres, monotonic_t), ...]
+        # temporal action classification: a rolling skeleton window per track id
+        # (fed by the pose loop) and the latest label the action thread produced.
+        self.windows = defaultdict(lambda: deque(maxlen=ACTION_WINDOW))
+        self.win_seen = {}           # tid -> monotonic_t of last skeleton append
+        self.labels = {}             # tid -> {"action", "conf", "top", "t"}
 
     def put_in(self, jpeg):
         with self.cond:
@@ -132,6 +141,36 @@ class Shared:
         now = time.monotonic()
         with self.cond:
             self.depths = [(s[0], s[1], s[2], now) for s in samples]
+
+    def push_skeleton(self, tid, kpts, conf):
+        """Append one (kpts(17,2), conf(17)) sample to a track's rolling window."""
+        now = time.monotonic()
+        with self.cond:
+            self.windows[tid].append((kpts, conf))
+            self.win_seen[tid] = now
+
+    def snapshot_windows(self):
+        """{tid: list-of-samples} for tracks seen recently; prunes stale ones."""
+        now = time.monotonic()
+        out = {}
+        with self.cond:
+            stale = [t for t, s in self.win_seen.items() if now - s > ACTION_TRACK_TTL_S]
+            for t in stale:
+                self.windows.pop(t, None)
+                self.win_seen.pop(t, None)
+                self.labels.pop(t, None)
+            for t, dq in self.windows.items():
+                out[t] = list(dq)
+        return out
+
+    def set_label(self, tid, action, conf, top):
+        with self.cond:
+            self.labels[tid] = {"action": action, "conf": round(float(conf), 3),
+                                "top": top, "t": time.monotonic()}
+
+    def get_label(self, tid):
+        with self.cond:
+            return self.labels.get(tid)
 
     def depth_near(self, u_frac, v_frac):
         """Freshest metric depth (mm) sampled near this hip, or None."""
@@ -167,7 +206,8 @@ def _shoulder_point(person, w, h):
     return sum(pt[0] for pt in pts) / len(pts), sum(pt[1] for pt in pts) / len(pts)
 
 
-def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool):
+def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool,
+               action_on: bool):
     from ultralytics import YOLO
     model = YOLO(weights)
     tracks = Tracks()
@@ -234,11 +274,19 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
 
         positions = []
         for tid, (pos, marker, p, src) in zip(ids, found):
-            positions.append({"id": int(tid),
-                              "x": round(pos[0], 1),
-                              "z": round(pos[1], 1),
-                              "src": src})
-            _draw_person(frame, p["px"], p["conf"], marker, tid, src)
+            tid = int(tid)
+            if action_on:
+                shared.push_skeleton(tid,
+                                     np.asarray(p["px"], dtype="float32"),
+                                     np.asarray(p["conf"], dtype="float32"))
+            lab = shared.get_label(tid) if action_on else None
+            action = lab.get("action") if lab else None
+            entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1), "src": src}
+            if action:
+                entry["action"] = action
+                entry["actionConf"] = lab["conf"]
+            positions.append(entry)
+            _draw_person(frame, p["px"], p["conf"], marker, tid, src, action)
 
         dt = time.time() - t0
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
@@ -250,7 +298,56 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             shared.put_out(enc.tobytes(), positions, round(ema_fps, 1))
 
 
-def _draw_person(frame, px, conf, marker, tid, src):
+def action_loop(shared: Shared, width: int, height: int, variant_key: str):
+    """Temporal action classification. Reuses action.py's mmaction recognizer +
+    label maps + thresholds, run on each live track's trailing skeleton window
+    (front-padded until full). Runs in its own thread so it never slows pose."""
+    import torch
+    import action as A
+    from mmaction.apis import inference_skeleton, init_recognizer
+
+    variant = A.VARIANTS[variant_key]
+    class_names = variant["labels"]
+    temp = A.variant_temp(variant)
+    min_conf = A.variant_min_conf(variant, len(class_names))
+    disabled = A.load_disabled(variant["key"], class_names)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = init_recognizer(A.variant_config(variant), A.variant_ckpt(variant),
+                            device=device)
+    print(f"[live] action '{variant_key}' loaded: {len(class_names)} classes, "
+          f"WINDOW={A.WINDOW} MIN={A.MIN_WINDOW} min_conf={min_conf:.3f} device={device}",
+          flush=True)
+
+    while True:
+        for tid, win in shared.snapshot_windows().items():
+            if len(win) < A.MIN_WINDOW:
+                continue
+            win = ([win[0]] * (A.WINDOW - len(win)) + win) if len(win) < A.WINDOW \
+                else win[-A.WINDOW:]
+            pose_results = [{"keypoints": kp[None].astype("float32"),
+                             "keypoint_scores": sc[None].astype("float32")}
+                            for kp, sc in win]
+            try:
+                res = inference_skeleton(model, pose_results, (height, width))
+            except Exception as exc:  # noqa: BLE001
+                print(f"[live] action infer error: {exc}", flush=True)
+                continue
+            probs = (res.pred_score.clamp_min(1e-8).log() / temp).softmax(-1)
+            if disabled:
+                probs = probs.clone()
+                probs[disabled] = 0.0
+            k = min(A.TOPK, int(probs.numel()))
+            vals, idxs = probs.topk(k)
+            vals = [float(v) for v in vals.tolist()]
+            idxs = [int(i) for i in idxs.tolist()]
+            nm = lambda i: class_names[i] if i < len(class_names) else str(i)  # noqa: E731
+            top = [[nm(i), round(v, 3)] for v, i in zip(vals, idxs)]
+            c, i = vals[0], idxs[0]
+            shared.set_label(tid, nm(i) if c >= min_conf else None, c, top)
+        time.sleep(ACTION_SWEEP_S)
+
+
+def _draw_person(frame, px, conf, marker, tid, src, action=None):
     color = _track_color(tid)
     for a, b in SKELETON:
         if a < len(conf) and b < len(conf) and conf[a] > KP_CONF and conf[b] > KP_CONF:
@@ -260,11 +357,12 @@ def _draw_person(frame, px, conf, marker, tid, src):
     for j in range(len(conf)):
         if conf[j] > KP_CONF:
             cv2.circle(frame, (int(px[j][0]), int(px[j][1])), 3, color, -1)
-    # cyan ring at the hip when depth-ranged, orange at the ankle for the ray fallback
+    # cyan ring at the hip when depth-ranged, orange at the shoulder fallback
     mcol = (255, 255, 0) if src == "depth-hip" else (0, 165, 255)
     cv2.circle(frame, (int(marker[0]), int(marker[1])), 6, mcol, 2)
-    cv2.putText(frame, f"#{tid} {src}", (int(marker[0]) + 8, int(marker[1])),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+    tag = f"#{tid}" + (f" {action}" if action else "")
+    cv2.putText(frame, tag, (int(marker[0]) + 8, int(marker[1])),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
 
 def _track_color(tid):
@@ -447,15 +545,18 @@ function draw(pos){
     const col=(p.src==='depth-shoulder')?'#38bdf8':'#f59e0b';
     ctx.fillStyle=col;ctx.beginPath();ctx.arc(tx(p.x),tz(p.z),8,0,7);ctx.fill();
     ctx.fillStyle='#0c0a09';ctx.fillText('#'+p.id,tx(p.x)-6,tz(p.z)+4);
+    if(p.action){ctx.fillStyle='#fde68a';ctx.fillText(p.action,tx(p.x)+11,tz(p.z)+4);}
   }
   ctx.fillStyle='#f59e0b';ctx.fillText('● depth-hip',pad,H-8);
   ctx.fillStyle='#38bdf8';ctx.fillText('● depth-shoulder',pad+90,H-8);
 }
 async function poll(){
   try{const r=await fetch('/positions');const d=await r.json();
-    room=d.roomFrame;draw(d.positions||[]);
+    const pos=d.positions||[];room=d.roomFrame;draw(pos);
     document.getElementById('fps').textContent='inference '+(d.fps||0)+' fps';
-    document.getElementById('cnt').textContent=(d.positions||[]).length+' person(s) localized';
+    const acts=pos.map(p=>'#'+p.id+': '+(p.action?p.action+' ('+(p.actionConf||0).toFixed(2)+')':'…'));
+    document.getElementById('cnt').innerHTML=pos.length+' person(s) · '+
+      (acts.length?acts.join(' · '):'—');
   }catch(e){}
   setTimeout(poll,200);
 }
@@ -473,7 +574,10 @@ def main():
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--flip", action="store_true",
                     help="rotate incoming frames 180 (if the Pi serves unrotated)")
+    ap.add_argument("--action", default="ntu",
+                    help="temporal action variant (ntu|hmdb); 'off' disables")
     args = ap.parse_args()
+    action_on = args.action.lower() not in ("off", "none", "no", "0", "")
 
     weights = os.environ.get("SMARTROOM_LIVE_WEIGHTS") or str(
         Path.home() / "Code/yolo-bench/yolo26n-pose.pt")
@@ -507,12 +611,16 @@ def main():
 
     shared = Shared()
     threading.Thread(target=infer_loop,
-                     args=(shared, geom, weights, device, args.flip),
+                     args=(shared, geom, weights, device, args.flip, action_on),
                      daemon=True).start()
+    if action_on:
+        threading.Thread(target=action_loop,
+                         args=(shared, args.width, args.height, args.action.lower()),
+                         daemon=True).start()
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port),
                                 make_handler(shared, room_frame))
-    print(f"[live] serving on :{args.port}  (POST /ingest, GET /live.mjpg, /positions, /)",
+    print(f"[live] serving on :{args.port}  (action={args.action if action_on else 'off'})",
           flush=True)
     try:
         httpd.serve_forever()
