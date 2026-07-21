@@ -65,7 +65,7 @@ ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live track
 AVA_SHORT = 256           # short-side the SlowFast-AVA clip is resized to
 AVA_BUF = 128             # rolling RGB frame buffer (a few seconds at any fps)
 AVA_PERIOD_S = 0.4        # how often to run the (heavier) AVA forward
-AVA_THR = 0.4             # per-class action score threshold
+AVA_THR = float(os.environ.get("SMARTROOM_AVA_THR", "0.4"))  # multi-label: every class above this is output
 # SlowFast-AVA was trained on ~30fps clips where its 32x2 window ≈ 2.1s. Our live
 # feed is ~10fps, so taking the last 64 frames would span ~6.4s — too much motion
 # integrated per label (inertia) and 3x-stretched so dynamic actions look static.
@@ -408,19 +408,20 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             if ava and p.get("box") is not None:
                 ava_boxes.append((tid, p["box"]))
             lab = shared.get_label(tid) if (skeleton or ava) else None
-            action = lab.get("action") if lab else None
-            aconf = lab["conf"] if (lab and action) else None
-            # geometric jump detector — independent of the classifier, wins when
-            # the person is airborne (the ML models are weak on brief jumps).
+            # multi-label: every class the classifier put above threshold
+            acts = [list(a) for a in lab["top"]] if (lab and lab.get("top")) else []
+            # geometric jump detector — independent of the classifier; when airborne
+            # add "jump" to the set (at the front) rather than replacing it.
             comy, body_h = _hip_com(p)
             if jumps.update(tid, comy, body_h, t0):
-                action, aconf = "jump", 1.0
+                acts = [["jump", 1.0]] + [a for a in acts if a[0] != "jump"]
             entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1), "src": src}
-            if action:
-                entry["action"] = action
-                entry["actionConf"] = aconf
+            if acts:
+                entry["actions"] = acts               # full above-threshold set
+                entry["action"] = acts[0][0]          # primary, for the map dot
+                entry["actionConf"] = acts[0][1]
             positions.append(entry)
-            _draw_person(frame, p["px"], p["conf"], marker, tid, src, action)
+            _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts)
         jumps.prune({tid for tid, *_ in found}, t0)
         if ava:
             shared.push_ava(frame, ava_boxes, w, h)
@@ -561,14 +562,13 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
                     for i in range(scores.shape[1])
                     if i in label_map and float(scores[j, i]) > action_thr]
             labs.sort(key=lambda x: -x[1])
-            if labs:
-                shared.set_label(tid, labs[0][0], labs[0][1],
-                                 [[a, round(s, 3)] for a, s in labs[:6]])
-            else:
-                shared.set_label(tid, None, 0.0, [])
+            # multi-label: keep EVERY class above the threshold, not just top-1
+            shared.set_label(tid, labs[0][0] if labs else None,
+                             labs[0][1] if labs else 0.0,
+                             [[a, round(s, 3)] for a, s in labs])
 
 
-def _draw_person(frame, px, conf, marker, tid, src, action=None):
+def _draw_person(frame, px, conf, marker, tid, src, actions=None):
     color = _track_color(tid)
     for a, b in SKELETON:
         if a < len(conf) and b < len(conf) and conf[a] > KP_CONF and conf[b] > KP_CONF:
@@ -580,10 +580,14 @@ def _draw_person(frame, px, conf, marker, tid, src, action=None):
             cv2.circle(frame, (int(px[j][0]), int(px[j][1])), 3, color, -1)
     # cyan ring at the hip when depth-ranged, orange at the shoulder fallback
     mcol = (255, 255, 0) if src == "depth-hip" else (0, 165, 255)
+    mx, my = int(marker[0]) + 8, int(marker[1])
     cv2.circle(frame, (int(marker[0]), int(marker[1])), 6, mcol, 2)
-    tag = f"#{tid}" + (f" {action}" if action else "")
-    cv2.putText(frame, tag, (int(marker[0]) + 8, int(marker[1])),
+    cv2.putText(frame, f"#{tid}", (mx, my),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    # every above-threshold class, stacked below the id
+    for i, a in enumerate(actions or []):
+        cv2.putText(frame, f"{a[0]} {a[1]:.2f}", (mx, my + 16 * (i + 1)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 1)
 
 
 def _track_color(tid):
@@ -775,9 +779,10 @@ async function poll(){
   try{const r=await fetch('/positions');const d=await r.json();
     const pos=d.positions||[];room=d.roomFrame;draw(pos);
     document.getElementById('fps').textContent='inference '+(d.fps||0)+' fps';
-    const acts=pos.map(p=>'#'+p.id+': '+(p.action?p.action+' ('+(p.actionConf||0).toFixed(2)+')':'…'));
-    document.getElementById('cnt').innerHTML=pos.length+' person(s) · '+
-      (acts.length?acts.join(' · '):'—');
+    const acts=pos.map(p=>'#'+p.id+': '+((p.actions&&p.actions.length)?
+      p.actions.map(a=>a[0]+' '+a[1].toFixed(2)).join(', '):'…'));
+    document.getElementById('cnt').innerHTML=pos.length+' person(s)<br>'+
+      (acts.length?acts.join('<br>'):'—');
   }catch(e){}
   setTimeout(poll,200);
 }
