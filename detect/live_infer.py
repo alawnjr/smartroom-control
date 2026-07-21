@@ -48,7 +48,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from calib_utils import load_room_geometry  # noqa: E402
-from localize import Tracks, backproject_room, hip_point, joint_px  # noqa: E402
+from localize import backproject_room, hip_point, joint_px  # noqa: E402
 
 # COCO-17 shoulders (fallback anchor when the hips are occluded, e.g. seated at
 # a desk). Both anchors are ranged by real depth — no floor-ray, never the feet.
@@ -234,6 +234,21 @@ class Shared:
             self.cond.notify_all()
 
 
+def _make_bytetrack():
+    """ByteTracker with ultralytics' default bytetrack.yaml params — the same
+    tracker model.track() builds, so ids are stable across frames (mirrors
+    action.py's _make_bytetrack). Image-space, so it dedupes overlapping person
+    boxes that fragmented the old greedy room-space assigner."""
+    from types import SimpleNamespace
+
+    from ultralytics.trackers.byte_tracker import BYTETracker
+    args = SimpleNamespace(track_high_thresh=0.25, track_low_thresh=0.1,
+                           new_track_thresh=0.25, track_buffer=30,
+                           match_thresh=0.8, fuse_score=True,
+                           gmc_method="sparseOptFlow")
+    return BYTETracker(args)
+
+
 def _shoulder_point(person, w, h):
     """Mid-shoulder pixel (conf-gated), or None — fallback anchor when the hips
     are occluded. Mirrors localize.hip_point but on the shoulder joints."""
@@ -248,7 +263,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                mode: str):
     from ultralytics import YOLO
     model = YOLO(weights)
-    tracks = Tracks()
+    tracker = _make_bytetrack()
     use_half = device not in ("cpu", "intel:cpu")
     last_id = 0
     ema_fps = 0.0
@@ -269,32 +284,39 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             frame = cv2.rotate(frame, cv2.ROTATE_180)
         h, w = frame.shape[:2]
         try:
-            res = model.predict(frame, imgsz=640, device=device,
-                                half=use_half, verbose=False)[0]
+            res = model.predict(frame, imgsz=640, device=device, half=use_half,
+                                classes=[0], verbose=False)[0].cpu()
         except Exception as exc:  # noqa: BLE001
             print(f"[live] predict error: {exc}", flush=True)
             continue
 
-        persons = []
+        # Image-space ByteTrack for STABLE ids (the tracker model.track() uses),
+        # shared by localization and action — fixes greedy room-space
+        # fragmentation and dedupes overlapping person boxes. update() rows are
+        # [x1,y1,x2,y2,id,conf,cls,det_idx]; det_idx maps back to the keypoints.
+        persons = []        # (tid, person dict)
         kp = res.keypoints
-        if kp is not None and kp.xyn is not None:
-            xyn = kp.xyn.tolist()
-            xy = kp.xy.tolist()
-            conf = (kp.conf.tolist() if kp.conf is not None
-                    else [[1.0] * len(p) for p in xyn])
-            boxes = (res.boxes.xyxy.tolist()
-                     if res.boxes is not None and res.boxes.xyxy is not None else [])
-            for i in range(len(xyn)):
-                persons.append({"kpts": xyn[i], "conf": conf[i], "px": xy[i],
-                                "box": boxes[i] if i < len(boxes) else None})
+        if kp is not None and kp.xy is not None and res.boxes is not None:
+            xy = kp.xy.numpy()
+            xyn = kp.xyn.numpy()
+            conf = (kp.conf.numpy() if kp.conf is not None
+                    else np.ones(xy.shape[:2], "float32"))
+            for row in tracker.update(res.boxes, res.orig_img):
+                di = int(row[7])
+                if di < 0 or di >= len(xy):
+                    continue
+                persons.append((int(row[4]), {
+                    "kpts": xyn[di].tolist(), "conf": conf[di].tolist(),
+                    "px": xy[di].tolist(),
+                    "box": [float(row[0]), float(row[1]), float(row[2]), float(row[3])]}))
 
         # Localize each person by the D455's real depth at an upper-body anchor:
         # the mid-hip if visible, else the mid-shoulder (both survive occluded
         # feet / a desk). backproject_room needs no height assumption. Publish
         # the anchor pixels the depth back-channel should range.
-        found = []          # (pos_xz, marker_px, person, src)
+        found = []          # (tid, pos_xz, marker_px, person, src)
         anchors_frac = []
-        for p in persons:
+        for tid, p in persons:
             anchor = hip_point(p, w, h)   # mid-hip pixels, or None if low-conf
             src = "depth-hip"
             if anchor is None:
@@ -309,16 +331,14 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             p_room = backproject_room(anchor[0], anchor[1], z_mm, geom)
             if p_room is None:
                 continue
-            found.append(((float(p_room[0]), float(p_room[2])), anchor, p, src))
+            found.append((tid, (float(p_room[0]), float(p_room[2])), anchor, p, src))
         shared.set_hips(anchors_frac)
-        ids = tracks.assign(t0, [f[0] for f in found])
 
         skeleton = mode in ("ntu", "hmdb")
         ava = mode == "ava"
         positions = []
         ava_boxes = []
-        for tid, (pos, marker, p, src) in zip(ids, found):
-            tid = int(tid)
+        for tid, pos, marker, p, src in found:
             if skeleton:
                 shared.push_skeleton(tid,
                                      np.asarray(p["px"], dtype="float32"),
