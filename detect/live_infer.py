@@ -128,7 +128,11 @@ GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "600"))
 # requires appearance not to contradict. The bar is deliberately LOW: same-person
 # scores across these opposed viewpoints are weak, so a high bar would block every
 # genuine cross-camera match. Tune from `identities.geoMerge` in /positions.
-GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0.30"))
+# With a BAD D435 pose the candidate scores sat at p50 0.129 (garbage pairs, 94%
+# vetoed); once the pose was fixed they rose to p50 0.334 / p90 0.556 — a useful
+# signal that the calibration is sound. If this median collapses again, suspect
+# the extrinsics before touching the threshold.
+GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0.20"))
 GEO_MERGE_S = 0.5          # detections must be this close in time to fuse
 # A merge can be wrong (two people who were briefly close). The sticky map would
 # keep them fused forever, so re-check: if the other camera places this identity
