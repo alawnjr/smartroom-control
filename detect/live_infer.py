@@ -127,17 +127,27 @@ GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "600"))
 # brown shirt computed to within 256mm and were fused). So a geometric merge also
 # requires appearance not to contradict. The bar is deliberately LOW: same-person
 # scores across these opposed viewpoints are weak, so a high bar would block every
-# genuine cross-camera match. Tune from `identities.geoMerge` in /positions.
+# genuine cross-camera match. MEASURED RESULT: it does not work at all across
+# THESE two cameras. One person, alone in the room, seen by both, scored below
+# 0.20 — the D435 sees the back of his head close-up while the D455 sees him
+# side-on at distance, so same-person similarity is indistinguishable from two
+# strangers. The veto therefore blocked every legitimate cross-camera merge and
+# is disabled (0). The real guard is GEO_FUSE_PERSIST plus a correct calibration:
+# the false merges that motivated the veto were caused by the D435 pose flip
+# making unrelated people compute to the same point, not by geometry itself.
 # With a BAD D435 pose the candidate scores sat at p50 0.129 (garbage pairs, 94%
 # vetoed); once the pose was fixed they rose to p50 0.334 / p90 0.556 — a useful
 # signal that the calibration is sound. If this median collapses again, suspect
 # the extrinsics before touching the threshold.
-GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0.20"))
+GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0"))  # 0 = no veto
 GEO_MERGE_S = 0.5          # detections must be this close in time to fuse
 # A merge can be wrong (two people who were briefly close). The sticky map would
 # keep them fused forever, so re-check: if the other camera places this identity
 # implausibly far away at the same moment, break the mapping and re-match.
 GEO_SPLIT_MM = float(os.environ.get("SMARTROOM_GEO_SPLIT_MM", "1200"))
+# Consecutive co-located observations required before two identities are fused,
+# so two people passing each other are not merged on a single coincidence.
+GEO_FUSE_PERSIST = int(os.environ.get("SMARTROOM_GEO_FUSE_PERSIST", "5"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
@@ -357,6 +367,8 @@ class IdentityRegistry:
         self.impostor = []
         self.geo_sim = []      # appearance scores seen on candidate geo merges
         self.geo_vetoed = 0    # how many the veto blocked
+        self.pending = {}      # (gid_a, gid_b) -> consecutive co-located observations
+        self.fused = 0         # identities merged by the continuous fusion pass
 
     @staticmethod
     def _cos(a, b):
@@ -461,6 +473,54 @@ class IdentityRegistry:
             del self.genuine[:-400]
             del self.impostor[:-400]
 
+    def fuse(self, t):
+        """Continuously fuse identities that are the same person.
+
+        Merging only at track creation was not enough: each camera creates its
+        own track for a person independently (e.g. both at startup for someone
+        already seated), so two identities could sit on top of each other
+        forever and never combine. This re-checks every live identity pair, and
+        requires the agreement to PERSIST for a few observations so two people
+        merely passing each other are not fused."""
+        if GEO_MERGE_MM <= 0:
+            return
+        with self.lock:
+            live = [(g, e) for g, e in self.gallery.items() if t - e["t"] < GEO_MERGE_S]
+            seen = set()
+            for i in range(len(live)):
+                for j in range(i + 1, len(live)):
+                    ga, ea = live[i]
+                    gb, eb = live[j]
+                    if ea["cam"] == eb["cam"]:
+                        continue          # one camera cannot see one person twice
+                    key = (min(ga, gb), max(ga, gb))
+                    d = ((ea["pos"][0] - eb["pos"][0]) ** 2
+                         + (ea["pos"][1] - eb["pos"][1]) ** 2) ** 0.5
+                    ok = d <= GEO_MERGE_MM
+                    if ok and ea["emb"] is not None and eb["emb"] is not None:
+                        ok = self._cos(ea["emb"], eb["emb"]) >= GEO_REID_MIN
+                    if not ok:
+                        self.pending.pop(key, None)
+                        continue
+                    seen.add(key)
+                    n = self.pending.get(key, 0) + 1
+                    self.pending[key] = n
+                    if n < GEO_FUSE_PERSIST:
+                        continue
+                    keep, drop = key            # keep the older (lower) identity
+                    for k, v in list(self.map.items()):
+                        if v == drop:
+                            self.map[k] = keep
+                    if self.gallery.get(drop, {}).get("emb") is not None \
+                            and self.gallery.get(keep, {}).get("emb") is None:
+                        self.gallery[keep]["emb"] = self.gallery[drop]["emb"]
+                    self.gallery.pop(drop, None)
+                    self.pending.pop(key, None)
+                    self.fused += 1
+                    return                      # one fusion per pass; re-check next time
+            for k in [k for k in self.pending if k not in seen]:
+                self.pending.pop(k, None)
+
     def known(self, cam, tid):
         with self.lock:
             return (cam, tid) in self.map
@@ -474,6 +534,7 @@ class IdentityRegistry:
             return {"known": len(self.gallery), "tracks": len(self.map),
                     "thresh": REID_THRESH,
                     "geoMerge": {"reidMin": GEO_REID_MIN, "vetoed": self.geo_vetoed,
+                                 "fused": self.fused, "pending": len(self.pending),
                                  "n": len(gs),
                                  "p10": gs[len(gs) // 10] if gs else None,
                                  "p50": gs[len(gs) // 2] if gs else None,
@@ -671,6 +732,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                     print(f"[live] {cam_key}: ReID embed failed: {exc}", flush=True)
             if any(e is not None for e in embs):
                 ids.note(cam_key, [(t, e) for (t, *_), e in zip(found, embs)])
+            ids.fuse(t0)      # continuously combine co-located identities
             taken = set()
             for (tid, pos, _marker, _p, _src), emb in zip(found, embs):
                 gid, how = ids.assign(cam_key, tid, emb, pos, t0, taken)
