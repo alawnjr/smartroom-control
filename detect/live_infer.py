@@ -46,13 +46,18 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from calib_utils import (ANKLE_JOINT_HEIGHT_MM, load_room_geometry,  # noqa: E402
-                         pixel_to_floor)
-from localize import Tracks, ground_point  # noqa: E402
+from calib_utils import load_room_geometry  # noqa: E402
+from localize import Tracks, backproject_room, hip_point, joint_px  # noqa: E402
+
+# COCO-17 shoulders (fallback anchor when the hips are occluded, e.g. seated at
+# a desk). Both anchors are ranged by real depth — no floor-ray, never the feet.
+L_SHOULDER, R_SHOULDER = 5, 6
 
 BOUNDARY = "frame"
 JPEG_QUALITY = 75
 KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
+DEPTH_MATCH_FRAC = 0.06   # a depth sample within this (fraction of frame) counts as "this hip"
+DEPTH_STALE_S = 1.0       # ignore depth samples older than this
 
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
@@ -100,15 +105,47 @@ class Shared:
         self.in_id = 0
         self.out_jpeg = None         # latest annotated JPEG
         self.out_id = 0
-        self.positions = []          # [{id,x,z,conf}]
+        self.positions = []          # [{id,x,z,src}]
         self.updated_ms = 0
         self.fps = 0.0
+        # depth back-channel: the server publishes the latest hip pixels it wants
+        # ranged, the Pi forwarder samples its own /value there and posts metres
+        # back (D455 depth aligned to color). Both keyed in frame-fraction coords.
+        self.hips = []               # [[u_frac, v_frac], ...] latest frame's hips
+        self.depths = []             # [(u_frac, v_frac, metres, monotonic_t), ...]
 
     def put_in(self, jpeg):
         with self.cond:
             self.in_jpeg = jpeg
             self.in_id += 1
             self.cond.notify_all()
+
+    def set_hips(self, hips):
+        with self.cond:
+            self.hips = hips
+
+    def get_hips(self):
+        with self.cond:
+            return list(self.hips)
+
+    def put_depths(self, samples):
+        now = time.monotonic()
+        with self.cond:
+            self.depths = [(s[0], s[1], s[2], now) for s in samples]
+
+    def depth_near(self, u_frac, v_frac):
+        """Freshest metric depth (mm) sampled near this hip, or None."""
+        now = time.monotonic()
+        best, best_d = None, DEPTH_MATCH_FRAC
+        with self.cond:
+            samples = list(self.depths)
+        for su, sv, m, t in samples:
+            if now - t > DEPTH_STALE_S or not m or m <= 0:
+                continue
+            d = ((su - u_frac) ** 2 + (sv - v_frac) ** 2) ** 0.5
+            if d < best_d:
+                best, best_d = m * 1000.0, d
+        return best
 
     def put_out(self, jpeg, positions, fps):
         with self.cond:
@@ -118,6 +155,16 @@ class Shared:
             self.fps = fps
             self.updated_ms = int(time.time() * 1000)
             self.cond.notify_all()
+
+
+def _shoulder_point(person, w, h):
+    """Mid-shoulder pixel (conf-gated), or None — fallback anchor when the hips
+    are occluded. Mirrors localize.hip_point but on the shoulder joints."""
+    pts = [pt for pt in (joint_px(person, L_SHOULDER, w, h),
+                         joint_px(person, R_SHOULDER, w, h)) if pt]
+    if not pts:
+        return None
+    return sum(pt[0] for pt in pts) / len(pts), sum(pt[1] for pt in pts) / len(pts)
 
 
 def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool):
@@ -160,24 +207,38 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             for i in range(len(xyn)):
                 persons.append({"kpts": xyn[i], "conf": conf[i], "px": xy[i]})
 
-        # localize each person by the floor-ray through its ankle pixel
-        found = []
+        # Localize each person by the D455's real depth at an upper-body anchor:
+        # the mid-hip if visible, else the mid-shoulder (both survive occluded
+        # feet / a desk). backproject_room needs no height assumption. Publish
+        # the anchor pixels the depth back-channel should range.
+        found = []          # (pos_xz, marker_px, person, src)
+        anchors_frac = []
         for p in persons:
-            ank = ground_point(p, w, h)
-            if ank is None:
+            anchor = hip_point(p, w, h)   # mid-hip pixels, or None if low-conf
+            src = "depth-hip"
+            if anchor is None:
+                anchor = _shoulder_point(p, w, h)
+                src = "depth-shoulder"
+            if anchor is None:
                 continue
-            hit = pixel_to_floor(ank[0], ank[1], geom, ANKLE_JOINT_HEIGHT_MM)
-            if hit is None:
+            anchors_frac.append([anchor[0] / w, anchor[1] / h])
+            z_mm = shared.depth_near(anchor[0] / w, anchor[1] / h)
+            if not z_mm:
                 continue
-            found.append((hit, ank, p))
+            p_room = backproject_room(anchor[0], anchor[1], z_mm, geom)
+            if p_room is None:
+                continue
+            found.append(((float(p_room[0]), float(p_room[2])), anchor, p, src))
+        shared.set_hips(anchors_frac)
         ids = tracks.assign(t0, [f[0] for f in found])
 
         positions = []
-        for tid, (pos, ank, p) in zip(ids, found):
+        for tid, (pos, marker, p, src) in zip(ids, found):
             positions.append({"id": int(tid),
-                              "x": round(float(pos[0]), 1),
-                              "z": round(float(pos[1]), 1)})
-            _draw_person(frame, p["px"], p["conf"], ank, tid)
+                              "x": round(pos[0], 1),
+                              "z": round(pos[1], 1),
+                              "src": src})
+            _draw_person(frame, p["px"], p["conf"], marker, tid, src)
 
         dt = time.time() - t0
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
@@ -189,7 +250,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             shared.put_out(enc.tobytes(), positions, round(ema_fps, 1))
 
 
-def _draw_person(frame, px, conf, ank, tid):
+def _draw_person(frame, px, conf, marker, tid, src):
     color = _track_color(tid)
     for a, b in SKELETON:
         if a < len(conf) and b < len(conf) and conf[a] > KP_CONF and conf[b] > KP_CONF:
@@ -199,9 +260,11 @@ def _draw_person(frame, px, conf, ank, tid):
     for j in range(len(conf)):
         if conf[j] > KP_CONF:
             cv2.circle(frame, (int(px[j][0]), int(px[j][1])), 3, color, -1)
-    cv2.circle(frame, (int(ank[0]), int(ank[1])), 6, (0, 165, 255), 2)
-    cv2.putText(frame, f"#{tid}", (int(ank[0]) + 8, int(ank[1])),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+    # cyan ring at the hip when depth-ranged, orange at the ankle for the ray fallback
+    mcol = (255, 255, 0) if src == "depth-hip" else (0, 165, 255)
+    cv2.circle(frame, (int(marker[0]), int(marker[1])), 6, mcol, 2)
+    cv2.putText(frame, f"#{tid} {src}", (int(marker[0]) + 8, int(marker[1])),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
 
 
 def _track_color(tid):
@@ -223,6 +286,9 @@ def make_handler(shared: Shared, room_frame: dict):
 
         def do_POST(self):
             path = urlparse(self.path).path
+            if path == "/depths":
+                self._recv_depths()
+                return
             if path != "/ingest":
                 self.send_error(404)
                 return
@@ -257,16 +323,40 @@ def make_handler(shared: Shared, room_frame: dict):
                 buf += chunk
             return buf
 
+        def _recv_depths(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                samples = json.loads(self.rfile.read(length) or b"[]")
+                shared.put_depths([(float(s["u"]), float(s["v"]), float(s["m"]))
+                                   for s in samples])
+            except (ValueError, KeyError, TypeError):
+                pass
+            self.send_response(204)
+            self._cors()
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
         def do_GET(self):
             path = urlparse(self.path).path
             if path == "/":
                 self._page()
             elif path == "/positions":
                 self._positions()
+            elif path == "/hips":
+                self._hips()
             elif path == "/live.mjpg":
                 self._stream()
             else:
                 self.send_error(404)
+
+        def _hips(self):
+            body = json.dumps({"hips": shared.get_hips()}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
 
         def _positions(self):
             with shared.cond:
@@ -353,9 +443,13 @@ function draw(pos){
     ctx.fillStyle='#0ea5e9';ctx.beginPath();ctx.arc(tx(c[0]),tz(c[2]),5,0,7);ctx.fill();
     ctx.fillText('cam',tx(c[0])+7,tz(c[2]));}
   for(const p of pos){
-    ctx.fillStyle='#f59e0b';ctx.beginPath();ctx.arc(tx(p.x),tz(p.z),8,0,7);ctx.fill();
+    // both anchors are depth-ranged: amber = hip, sky = shoulder fallback
+    const col=(p.src==='depth-shoulder')?'#38bdf8':'#f59e0b';
+    ctx.fillStyle=col;ctx.beginPath();ctx.arc(tx(p.x),tz(p.z),8,0,7);ctx.fill();
     ctx.fillStyle='#0c0a09';ctx.fillText('#'+p.id,tx(p.x)-6,tz(p.z)+4);
   }
+  ctx.fillStyle='#f59e0b';ctx.fillText('● depth-hip',pad,H-8);
+  ctx.fillStyle='#38bdf8';ctx.fillText('● depth-shoulder',pad+90,H-8);
 }
 async function poll(){
   try{const r=await fetch('/positions');const d=await r.json();
