@@ -119,24 +119,21 @@ REID_ON = os.environ.get("SMARTROOM_REID", "1") != "0"
 # GEO_MERGE_MM), gated by an appearance check to stay safe.
 REID_THRESH = float(os.environ.get("SMARTROOM_REID_THRESH", "0.55"))  # cosine
 REID_EVERY = int(os.environ.get("SMARTROOM_REID_EVERY", "3"))         # frames
-# Location-based matching is DISABLED by default: room positions proved not
-# accurate enough to identify people (stale depth samples, anchors at the frame
-# edge), and it fused two visibly different people who computed to within 256mm
-# of each other. Appearance (ReID) is now the sole identity signal. Set
-# SMARTROOM_GEO_MERGE_MM > 0 to re-enable geometric fusion.
-GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "0"))  # 0 = off
+# Location proposes cross-camera merges (appearance alone cannot: the cameras see
+# opposite sides of people). 0 disables it entirely.
+GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "600"))
+# ...but location NEVER decides alone. Room positions proved inaccurate enough to
+# put two different people at the same point (a curly-haired woman and a man in a
+# brown shirt computed to within 256mm and were fused). So a geometric merge also
+# requires appearance not to contradict. The bar is deliberately LOW: same-person
+# scores across these opposed viewpoints are weak, so a high bar would block every
+# genuine cross-camera match. Tune from `identities.geoMerge` in /positions.
+GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0.30"))
 GEO_MERGE_S = 0.5          # detections must be this close in time to fuse
 # A merge can be wrong (two people who were briefly close). The sticky map would
 # keep them fused forever, so re-check: if the other camera places this identity
 # implausibly far away at the same moment, break the mapping and re-match.
 GEO_SPLIT_MM = float(os.environ.get("SMARTROOM_GEO_SPLIT_MM", "1200"))
-# Geometry alone MUST NOT fuse two people: localization error (stale depth, an
-# anchor at the frame edge) can put two different humans at the same room point,
-# which is exactly how a curly-haired woman and a man in a brown shirt became one
-# identity. Require appearance to at least not contradict — this bar sits above
-# the measured impostor median (~0.39) so obviously-different people are rejected,
-# while staying well below the genuine median (~0.95).
-GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0.5"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
@@ -354,6 +351,8 @@ class IdentityRegistry:
         # REID_THRESH sits between the two distributions.
         self.genuine = []
         self.impostor = []
+        self.geo_sim = []      # appearance scores seen on candidate geo merges
+        self.geo_vetoed = 0    # how many the veto blocked
 
     @staticmethod
     def _cos(a, b):
@@ -393,10 +392,15 @@ class IdentityRegistry:
                 d = ((pos[0] - e["pos"][0]) ** 2 + (pos[1] - e["pos"][1]) ** 2) ** 0.5
                 if d >= best_d:
                     continue
-                # appearance veto: same spot is not enough if they look nothing alike
-                if emb is not None and e["emb"] is not None \
-                        and self._cos(emb, e["emb"]) < GEO_REID_MIN:
-                    continue
+                # Appearance veto — same place is not enough if they look nothing
+                # alike. Record every candidate's score so the bar is tunable.
+                if emb is not None and e["emb"] is not None:
+                    sim = self._cos(emb, e["emb"])
+                    self.geo_sim.append(round(sim, 3))
+                    del self.geo_sim[:-100]
+                    if sim < GEO_REID_MIN:
+                        self.geo_vetoed += 1
+                        continue
                 best, best_d, how = g, d, "geometry"
             # 2) appearance: bridges gaps geometry can't (re-entry after absence)
             top_s = None
@@ -462,8 +466,14 @@ class IdentityRegistry:
             def pct(v, q):
                 if not v: return None
                 v = sorted(v); return v[min(len(v) - 1, int(q * len(v)))]
+            gs = sorted(self.geo_sim)
             return {"known": len(self.gallery), "tracks": len(self.map),
                     "thresh": REID_THRESH,
+                    "geoMerge": {"reidMin": GEO_REID_MIN, "vetoed": self.geo_vetoed,
+                                 "n": len(gs),
+                                 "p10": gs[len(gs) // 10] if gs else None,
+                                 "p50": gs[len(gs) // 2] if gs else None,
+                                 "p90": gs[min(len(gs) - 1, 9 * len(gs) // 10)] if gs else None},
                     "genuine": {"n": len(self.genuine), "p05": pct(self.genuine, .05),
                                 "p50": pct(self.genuine, .50), "p95": pct(self.genuine, .95)},
                     "impostor": {"n": len(self.impostor), "p50": pct(self.impostor, .50),
