@@ -139,6 +139,32 @@ def load_label_map(path):
     return out
 
 
+class TimestampLog:
+    """Per-camera frame-timestamp CSV on the server. One row per processed frame:
+    the sensor hw timestamp (librealsense global clock — the cross-camera sync
+    key, matchable to ±1-2ms between the D455 and D435), the server's receive
+    time, and how many people were localized. Lives under the DATA dir."""
+
+    HEADER = "frame,hw_timestamp_ms,server_ms,persons\n"
+
+    def __init__(self, cam_key: str, session: str):
+        d = Path(os.environ.get("SMARTROOM_LIVE_LOG_DIR")
+                 or (saved_root().parent / "live"))
+        d.mkdir(parents=True, exist_ok=True)
+        self.path = d / f"live_{session}_{cam_key}_timestamps.csv"
+        self.n = 0
+        self._fh = open(self.path, "w", buffering=1)   # line-buffered
+        self._fh.write(self.HEADER)
+        print(f"[live] {cam_key}: timestamps -> {self.path}", flush=True)
+
+    def write(self, hw_ts, persons):
+        self.n += 1
+        try:
+            self._fh.write(f"{self.n},{hw_ts:.3f},{time.time() * 1000:.3f},{persons}\n")
+        except OSError:
+            pass
+
+
 class Shared:
     """Newest-frame-wins slots shared across the ingest, inference and HTTP
     threads (mirrors realsense_depth_page.py's ViewCache pattern)."""
@@ -146,12 +172,14 @@ class Shared:
     def __init__(self):
         self.cond = threading.Condition()
         self.in_jpeg = None          # latest raw JPEG bytes from the Pi
+        self.in_hw_ts = 0.0          # its sensor timestamp (global clock, ms)
         self.in_id = 0
         self.out_jpeg = None         # latest annotated JPEG
         self.out_id = 0
-        self.positions = []          # [{id,x,z,src}]
+        self.positions = []          # [{id,x,z,src,cam,actions}]
         self.updated_ms = 0
         self.fps = 0.0
+        self.hw_ts = 0.0             # sensor timestamp of the newest output frame
         # depth back-channel: the server publishes the latest hip pixels it wants
         # ranged, the Pi forwarder samples its own /value there and posts metres
         # back (D455 depth aligned to color). Both keyed in frame-fraction coords.
@@ -166,9 +194,10 @@ class Shared:
         # — whole-frame clips + per-person proposals, classified together.
         self.ava_buf = deque(maxlen=AVA_BUF)
 
-    def put_in(self, jpeg):
+    def put_in(self, jpeg, hw_ts=0.0):
         with self.cond:
             self.in_jpeg = jpeg
+            self.in_hw_ts = hw_ts
             self.in_id += 1
             self.cond.notify_all()
 
@@ -244,12 +273,13 @@ class Shared:
                 best, best_d = m * 1000.0, d
         return best
 
-    def put_out(self, jpeg, positions, fps):
+    def put_out(self, jpeg, positions, fps, hw_ts=0.0):
         with self.cond:
             self.out_jpeg = jpeg
             self.out_id += 1
             self.positions = positions
             self.fps = fps
+            self.hw_ts = hw_ts
             self.updated_ms = int(time.time() * 1000)
             self.cond.notify_all()
 
@@ -327,7 +357,7 @@ class JumpDetector:
 
 
 def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool,
-               mode: str):
+               mode: str, cam_key: str = "", tslog: "TimestampLog | None" = None):
     from ultralytics import YOLO
     model = YOLO(weights)
     tracker = _make_bytetrack()
@@ -335,7 +365,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     use_half = device not in ("cpu", "intel:cpu")
     last_id = 0
     ema_fps = 0.0
-    print(f"[live] model loaded ({weights}) device={device} half={use_half}", flush=True)
+    print(f"[live] {cam_key}: pose model loaded ({weights}) device={device} "
+          f"half={use_half}", flush=True)
     while True:
         with shared.cond:
             while shared.in_id == last_id or shared.in_jpeg is None:
@@ -344,6 +375,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                     continue
             last_id = shared.in_id
             jpeg = shared.in_jpeg
+            hw_ts = shared.in_hw_ts
         t0 = time.time()
         frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
@@ -422,7 +454,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             comy, body_h = _hip_com(p)
             if jumps.update(tid, comy, body_h, t0):
                 acts = [["jump", 1.0]] + [a for a in acts if a[0] != "jump"]
-            entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1), "src": src}
+            entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1),
+                     "src": src, "cam": cam_key}
             if acts:
                 entry["actions"] = acts               # full above-threshold set
                 entry["action"] = acts[0][0]          # primary, for the map dot
@@ -433,14 +466,17 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         if ava:
             shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
 
+        if tslog is not None:
+            tslog.write(hw_ts, len(positions))
+
         dt = time.time() - t0
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
-        cv2.putText(frame, f"{len(positions)} person(s)  {ema_fps:4.1f} fps",
-                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+        cv2.putText(frame, f"{cam_key}  {len(positions)} person(s)  {ema_fps:4.1f} fps",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         ok, enc = cv2.imencode(".jpg", frame,
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if ok:
-            shared.put_out(enc.tobytes(), positions, round(ema_fps, 1))
+            shared.put_out(enc.tobytes(), positions, round(ema_fps, 1), hw_ts)
 
 
 def action_loop(shared: Shared, width: int, height: int, variant_key: str):
@@ -605,7 +641,12 @@ def _track_color(tid):
     return (int(b), int(g), int(r))
 
 
-def make_handler(shared: Shared, room_frame: dict):
+def make_handler(cams: dict):
+    """cams: {cam_key: {"shared": Shared, "roomFrame": {...}}} — every endpoint
+    selects a camera with ?cam=<key> (defaults to the first registered)."""
+
+    default_cam = next(iter(cams))
+
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -615,6 +656,11 @@ def make_handler(shared: Shared, room_frame: dict):
         def _cors(self):
             self.send_header("Access-Control-Allow-Origin", "*")
 
+        def _cam(self):
+            q = parse_qs(urlparse(self.path).query)
+            key = (q.get("cam") or [default_cam])[0]
+            return cams.get(key)
+
         def do_POST(self):
             path = urlparse(self.path).path
             if path == "/depths":
@@ -623,27 +669,33 @@ def make_handler(shared: Shared, room_frame: dict):
             if path != "/ingest":
                 self.send_error(404)
                 return
-            # length-prefixed JPEG stream over one persistent connection
+            entry = self._cam()
+            if entry is None:
+                self.send_error(404, "unknown cam")
+                return
+            shared = entry["shared"]
+            # length-prefixed JPEG stream over one persistent connection:
+            # [4B len][8B double hw_ts_ms][jpeg]
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             n = 0
             try:
                 while True:
-                    hdr = self._readn(4)
+                    hdr = self._readn(12)
                     if not hdr:
                         break
-                    (length,) = struct.unpack(">I", hdr)
+                    length, hw_ts = struct.unpack(">Id", hdr)
                     if length == 0 or length > 20_000_000:
                         break
                     jpeg = self._readn(length)
                     if jpeg is None:
                         break
-                    shared.put_in(jpeg)
+                    shared.put_in(jpeg, hw_ts)
                     n += 1
             except (ConnectionError, OSError):
                 pass
-            print(f"[live] ingest connection closed after {n} frames", flush=True)
+            print(f"[live] ingest closed after {n} frames", flush=True)
 
         def _readn(self, n):
             buf = b""
@@ -656,10 +708,13 @@ def make_handler(shared: Shared, room_frame: dict):
 
         def _recv_depths(self):
             length = int(self.headers.get("Content-Length") or 0)
+            entry = self._cam()
             try:
                 samples = json.loads(self.rfile.read(length) or b"[]")
-                shared.put_depths([(float(s["u"]), float(s["v"]), float(s["m"]))
-                                   for s in samples])
+                if entry is not None:
+                    entry["shared"].put_depths(
+                        [(float(s["u"]), float(s["v"]), float(s["m"]))
+                         for s in samples])
             except (ValueError, KeyError, TypeError):
                 pass
             self.send_response(204)
@@ -681,7 +736,9 @@ def make_handler(shared: Shared, room_frame: dict):
                 self.send_error(404)
 
         def _hips(self):
-            body = json.dumps({"hips": shared.get_hips()}).encode()
+            entry = self._cam()
+            hips = entry["shared"].get_hips() if entry else []
+            body = json.dumps({"hips": hips}).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._cors()
@@ -690,13 +747,25 @@ def make_handler(shared: Shared, room_frame: dict):
             self.wfile.write(body)
 
         def _positions(self):
-            with shared.cond:
-                body = json.dumps({
-                    "positions": shared.positions,
-                    "updatedMs": shared.updated_ms,
-                    "fps": shared.fps,
-                    "roomFrame": room_frame,
-                }).encode()
+            # merged across every camera — they share the tag-1 room frame, so
+            # one map shows everyone. Each entry carries its `cam`.
+            merged, per_cam = [], {}
+            for key, e in cams.items():
+                sh = e["shared"]
+                with sh.cond:
+                    merged.extend(sh.positions)
+                    per_cam[key] = {"fps": sh.fps, "updatedMs": sh.updated_ms,
+                                    "hwTimestampMs": round(sh.hw_ts, 3),
+                                    "persons": len(sh.positions),
+                                    "roomFrame": e["roomFrame"]}
+            first = cams[default_cam]["shared"]
+            body = json.dumps({
+                "positions": merged,
+                "cams": per_cam,
+                "updatedMs": first.updated_ms,
+                "fps": first.fps,
+                "roomFrame": cams[default_cam]["roomFrame"],
+            }).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self._cors()
@@ -705,6 +774,11 @@ def make_handler(shared: Shared, room_frame: dict):
             self.wfile.write(body)
 
         def _stream(self):
+            entry = self._cam()
+            if entry is None:
+                self.send_error(404, "unknown cam")
+                return
+            shared = entry["shared"]
             self.send_response(200)
             self.send_header("Content-Type",
                              f"multipart/x-mixed-replace; boundary={BOUNDARY}")
@@ -728,7 +802,7 @@ def make_handler(shared: Shared, room_frame: dict):
                 pass
 
         def _page(self):
-            body = PAGE_HTML.encode()
+            body = PAGE_HTML.replace("__CAMS__", json.dumps(list(cams))).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -750,13 +824,21 @@ PAGE_HTML = """<!doctype html><html><head><meta charset=utf-8>
  .meta{font-size:12px;color:#a8a29e;margin-top:6px}
 </style></head><body>
 <h1>smartroom — live pose + room localization</h1>
-<div class=wrap>
- <div class=card><div>Camera</div><img id=v src="/live.mjpg"><div class=meta id=fps></div></div>
- <div class=card><div>Top-down room map (mm)</div>
+<div class=wrap id=cards>
+ <div class=card><div>Top-down room map (mm) — all cameras</div>
    <canvas id=map width=420 height=420></canvas>
    <div class=meta id=cnt></div></div>
 </div>
 <script>
+const CAMS=__CAMS__;
+// one video card per camera, inserted before the map card
+const cards=document.getElementById('cards');
+CAMS.forEach(function(c){
+  const d=document.createElement('div');d.className='card';
+  d.innerHTML='<div>'+c+'</div><img src="/live.mjpg?cam='+c+'">'+
+              '<div class=meta id="fps_'+c+'"></div>';
+  cards.insertBefore(d,cards.firstChild);
+});
 const cv=document.getElementById('map'),ctx=cv.getContext('2d');
 let room=null;
 function draw(pos){
@@ -773,21 +855,24 @@ function draw(pos){
   if(room&&room.cameraPositionMm){const c=room.cameraPositionMm;
     ctx.fillStyle='#0ea5e9';ctx.beginPath();ctx.arc(tx(c[0]),tz(c[2]),5,0,7);ctx.fill();
     ctx.fillText('cam',tx(c[0])+7,tz(c[2]));}
+  // one colour per camera so you can see which camera saw whom
+  const CAMCOL={};CAMS.forEach(function(c,i){CAMCOL[c]=['#f59e0b','#38bdf8','#a3e635'][i%3];});
   for(const p of pos){
-    // both anchors are depth-ranged: amber = hip, sky = shoulder fallback
-    const col=(p.src==='depth-shoulder')?'#38bdf8':'#f59e0b';
-    ctx.fillStyle=col;ctx.beginPath();ctx.arc(tx(p.x),tz(p.z),8,0,7);ctx.fill();
+    ctx.fillStyle=CAMCOL[p.cam]||'#f59e0b';
+    ctx.beginPath();ctx.arc(tx(p.x),tz(p.z),8,0,7);ctx.fill();
     ctx.fillStyle='#0c0a09';ctx.fillText('#'+p.id,tx(p.x)-6,tz(p.z)+4);
     if(p.action){ctx.fillStyle='#fde68a';ctx.fillText(p.action,tx(p.x)+11,tz(p.z)+4);}
   }
-  ctx.fillStyle='#f59e0b';ctx.fillText('● depth-hip',pad,H-8);
-  ctx.fillStyle='#38bdf8';ctx.fillText('● depth-shoulder',pad+90,H-8);
+  CAMS.forEach(function(c,i){ctx.fillStyle=CAMCOL[c];ctx.fillText('● '+c,pad+i*130,H-8);});
 }
 async function poll(){
   try{const r=await fetch('/positions');const d=await r.json();
     const pos=d.positions||[];room=d.roomFrame;draw(pos);
-    document.getElementById('fps').textContent='inference '+(d.fps||0)+' fps';
-    const acts=pos.map(p=>'#'+p.id+': '+((p.actions&&p.actions.length)?
+    const cams=d.cams||{};
+    for(const c in cams){const el=document.getElementById('fps_'+c);
+      if(el)el.textContent='inference '+(cams[c].fps||0)+' fps · hw_ts '+
+        (cams[c].hwTimestampMs||0).toFixed(0)+' · '+cams[c].persons+' person(s)';}
+    const acts=pos.map(p=>'['+p.cam+'] #'+p.id+': '+((p.actions&&p.actions.length)?
       p.actions.map(a=>a[0]+' '+a[1].toFixed(2)).join(', '):'…'));
     document.getElementById('cnt').innerHTML=pos.length+' person(s)<br>'+
       (acts.length?acts.join('<br>'):'—');
@@ -801,7 +886,9 @@ poll();
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--cam", default="camera_d455_color",
-                    help="stream key to localize (finds calibration in recordings)")
+                    help="comma-separated stream keys to serve, e.g. "
+                         "camera_d455_color,camera_d435_color (calibration is "
+                         "found per camera in the uploaded recordings)")
     ap.add_argument("--clip", help="explicit recording mp4 for calibration (optional)")
     ap.add_argument("--port", type=int, default=8010)
     ap.add_argument("--width", type=int, default=640)
@@ -826,30 +913,41 @@ def main():
         except Exception:  # noqa: BLE001
             device = "cpu"
 
-    clip = Path(args.clip) if args.clip else find_calib_clip(args.cam)
-    if clip is None or not clip.exists():
-        print(f"[live] FATAL: no recording with calibration for '{args.cam}' "
-              f"under {saved_root()}", file=sys.stderr)
+    # One entry per camera: its own Shared buffers, geom, pose thread and
+    # timestamp log. They all share the tag-1 room frame, so /positions merges.
+    session = time.strftime("%Y%m%d_%H%M%S")
+    cams = {}
+    for cam_key in [c.strip() for c in args.cam.split(",") if c.strip()]:
+        clip = Path(args.clip) if (args.clip and len(cams) == 0) else find_calib_clip(cam_key)
+        if clip is None or not clip.exists():
+            print(f"[live] SKIP {cam_key}: no uploaded recording with calibration "
+                  f"under {saved_root()}", file=sys.stderr)
+            continue
+        geom = load_room_geometry(clip, args.width, args.height, undistorted=False)
+        if geom is None:
+            print(f"[live] SKIP {cam_key}: {clip} has no room geometry (extrinsics)",
+                  file=sys.stderr)
+            continue
+        room_frame = {
+            "cameraPositionMm": [round(float(v), 1) for v in geom["cam_pos_mm"]],
+            "tagId": geom.get("tag_id"),
+            "tagHeightMm": geom.get("tag_height_mm"),
+            "cameraId": geom.get("camera_id"),
+            "calibClip": str(clip.relative_to(saved_root())),
+        }
+        shared = Shared()
+        cams[cam_key] = {"shared": shared, "roomFrame": room_frame, "geom": geom}
+        print(f"[live] {cam_key}: geom from {clip}  "
+              f"cam_pos_mm={room_frame['cameraPositionMm']}", flush=True)
+        threading.Thread(
+            target=infer_loop,
+            args=(shared, geom, weights, device, args.flip, mode, cam_key,
+                  TimestampLog(cam_key, session)),
+            daemon=True).start()
+    if not cams:
+        print("[live] FATAL: no usable cameras", file=sys.stderr)
         return 2
-    geom = load_room_geometry(clip, args.width, args.height, undistorted=False)
-    if geom is None:
-        print(f"[live] FATAL: {clip} has no room geometry (extrinsics)",
-              file=sys.stderr)
-        return 2
-    room_frame = {
-        "cameraPositionMm": [round(float(v), 1) for v in geom["cam_pos_mm"]],
-        "tagId": geom.get("tag_id"),
-        "tagHeightMm": geom.get("tag_height_mm"),
-        "cameraId": geom.get("camera_id"),
-        "calibClip": str(clip.relative_to(saved_root())),
-    }
-    print(f"[live] geom from {clip}  cam_pos_mm={room_frame['cameraPositionMm']}",
-          flush=True)
 
-    shared = Shared()
-    threading.Thread(target=infer_loop,
-                     args=(shared, geom, weights, device, args.flip, mode),
-                     daemon=True).start()
     if mode == "ava":
         import mmaction
         cfg = os.environ.get("SMARTROOM_AVA_CONFIG") or os.path.join(
@@ -859,18 +957,29 @@ def main():
             Path.home() / "Code/yolo-bench/slowfast_ava.pth")
         lm = os.environ.get("SMARTROOM_AVA_LABELS") or str(
             Path(__file__).resolve().parent / "ava_label_map.txt")
-        adev = "cuda:0" if device not in ("cpu", "intel:cpu") else "cpu"
-        threading.Thread(target=ava_loop,
-                         args=(shared, cfg, ckpt, lm, adev, AVA_THR),
-                         daemon=True).start()
+        # one recognizer per camera, spread over the available GPUs so a second
+        # camera doesn't contend with the first (or with the pose loop on 0).
+        ngpu = 0
+        if device not in ("cpu", "intel:cpu"):
+            try:
+                import torch
+                ngpu = torch.cuda.device_count()
+            except Exception:  # noqa: BLE001
+                ngpu = 0
+        for i, (cam_key, e) in enumerate(cams.items()):
+            adev = f"cuda:{i % ngpu}" if ngpu else "cpu"
+            threading.Thread(target=ava_loop,
+                             args=(e["shared"], cfg, ckpt, lm, adev, AVA_THR),
+                             daemon=True).start()
     elif mode in ("ntu", "hmdb"):
-        threading.Thread(target=action_loop,
-                         args=(shared, args.width, args.height, mode),
-                         daemon=True).start()
+        for e in cams.values():
+            threading.Thread(target=action_loop,
+                             args=(e["shared"], args.width, args.height, mode),
+                             daemon=True).start()
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", args.port),
-                                make_handler(shared, room_frame))
-    print(f"[live] serving on :{args.port}  (action={mode})", flush=True)
+    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams))
+    print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}",
+          flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
