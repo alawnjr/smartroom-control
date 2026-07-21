@@ -58,7 +58,11 @@ BOUNDARY = "frame"
 JPEG_QUALITY = 75
 KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
 DEPTH_MATCH_FRAC = 0.06   # a depth sample within this (fraction of frame) counts as "this hip"
-DEPTH_STALE_S = 1.0       # ignore depth samples older than this
+# A 1s-old depth sample applied to a moving person puts them metres away and was
+# a source of bad room positions (and hence false cross-camera merges). The
+# back-channel polls ~8Hz, so 0.35s keeps roughly the freshest sample and drops
+# the rest — better to skip a person this frame than to localize them wrongly.
+DEPTH_STALE_S = float(os.environ.get("SMARTROOM_DEPTH_STALE_S", "0.35"))
 ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); deque cap
 ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
 ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
@@ -102,19 +106,37 @@ _MODEL_BUILD_LOCK = threading.Lock()
 #      bridge a long absence where geometry says nothing.
 REID_MODEL = os.environ.get("SMARTROOM_REID_MODEL", "yolo26n-reid.onnx")
 REID_ON = os.environ.get("SMARTROOM_REID", "1") != "0"
-# Calibrated on live data from this room (see IdentityRegistry.stats): same-person
-# cosine ~0.95 median, different-person ~0.39 median but with a p95 of 0.62 and a
-# p99 of 0.66. 0.70 therefore sits above the impostor tail (<1% false merges) while
-# still catching the bulk of genuine matches. Prefer fragmentation over a false
-# merge: a split identity is recoverable, two people fused into one is not.
-REID_THRESH = float(os.environ.get("SMARTROOM_REID_THRESH", "0.70"))  # cosine
+# Calibrated on live data from this room (see IdentityRegistry.stats). Measured
+# same-person cosine ~0.95 median (p05 0.88); different-person ~0.17 median with
+# p99 ~0.23-0.44 depending on who is in frame. Swept empirically: 0.70 gave 74
+# identities for ~4 people (severe fragmentation), 0.55 gave 17, 0.45 gave 13 but
+# put the threshold ON the impostor tail. 0.55 keeps a wide safety margin while
+# fixing most fragmentation. Prefer fragmentation over a false merge: a split
+# identity is recoverable, two people fused into one is not.
+# NOTE: no threshold makes appearance work ACROSS cameras here — they view
+# opposite sides of people, so same-person-cross-camera scores below
+# different-person-same-camera. Cross-camera fusion needs geometry (see
+# GEO_MERGE_MM), gated by an appearance check to stay safe.
+REID_THRESH = float(os.environ.get("SMARTROOM_REID_THRESH", "0.55"))  # cosine
 REID_EVERY = int(os.environ.get("SMARTROOM_REID_EVERY", "3"))         # frames
-GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "600")) # cross-cam
+# Location-based matching is DISABLED by default: room positions proved not
+# accurate enough to identify people (stale depth samples, anchors at the frame
+# edge), and it fused two visibly different people who computed to within 256mm
+# of each other. Appearance (ReID) is now the sole identity signal. Set
+# SMARTROOM_GEO_MERGE_MM > 0 to re-enable geometric fusion.
+GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "0"))  # 0 = off
 GEO_MERGE_S = 0.5          # detections must be this close in time to fuse
 # A merge can be wrong (two people who were briefly close). The sticky map would
 # keep them fused forever, so re-check: if the other camera places this identity
 # implausibly far away at the same moment, break the mapping and re-match.
 GEO_SPLIT_MM = float(os.environ.get("SMARTROOM_GEO_SPLIT_MM", "1200"))
+# Geometry alone MUST NOT fuse two people: localization error (stale depth, an
+# anchor at the frame edge) can put two different humans at the same room point,
+# which is exactly how a curly-haired woman and a man in a brown shirt became one
+# identity. Require appearance to at least not contradict — this bar sits above
+# the measured impostor median (~0.39) so obviously-different people are rejected,
+# while staying well below the genuine median (~0.95).
+GEO_REID_MIN = float(os.environ.get("SMARTROOM_GEO_REID_MIN", "0.5"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
@@ -351,7 +373,8 @@ class IdentityRegistry:
             gid = self.map.get(key)
             if gid is not None and gid in self.gallery and gid not in taken:
                 e = self.gallery[gid]
-                stale_merge = (e["cam"] != cam and t - e["t"] < GEO_MERGE_S
+                stale_merge = (GEO_MERGE_MM > 0 and e["cam"] != cam
+                               and t - e["t"] < GEO_MERGE_S
                                and ((pos[0] - e["pos"][0]) ** 2
                                     + (pos[1] - e["pos"][1]) ** 2) ** 0.5 > GEO_SPLIT_MM)
                 if not stale_merge:
@@ -363,11 +386,18 @@ class IdentityRegistry:
             # 1) cross-camera geometry: the other camera, right now, same spot
             best_d = GEO_MERGE_MM
             for g, e in self.gallery.items():
+                if GEO_MERGE_MM <= 0:
+                    break            # location matching disabled — appearance only
                 if g in taken or e["cam"] == cam or t - e["t"] > GEO_MERGE_S:
                     continue
                 d = ((pos[0] - e["pos"][0]) ** 2 + (pos[1] - e["pos"][1]) ** 2) ** 0.5
-                if d < best_d:
-                    best, best_d, how = g, d, "geometry"
+                if d >= best_d:
+                    continue
+                # appearance veto: same spot is not enough if they look nothing alike
+                if emb is not None and e["emb"] is not None \
+                        and self._cos(emb, e["emb"]) < GEO_REID_MIN:
+                    continue
+                best, best_d, how = g, d, "geometry"
             # 2) appearance: bridges gaps geometry can't (re-entry after absence)
             top_s = None
             if best is None and emb is not None:
