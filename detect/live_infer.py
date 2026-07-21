@@ -86,6 +86,37 @@ JUMP_FRAC = float(os.environ.get("SMARTROOM_JUMP_FRAC", "0.20"))
 JUMP_WINDOW_S = 1.5       # rolling baseline window
 JUMP_MIN_STREAK = 2       # consecutive airborne frames before firing (anti-jitter)
 JUMP_HOLD_S = 0.5         # keep showing "jump" this long after the last airborne frame
+# mmaction's registry isn't safe to populate from two threads at once (a second
+# concurrent build raced and failed with "MaxIoUAssignerAVA is not in the
+# registry"), so per-camera model construction is serialized.
+_MODEL_BUILD_LOCK = threading.Lock()
+
+# --- person re-identification (stable identity across gaps and cameras) -------
+# ByteTrack ids are per-camera and reset whenever a track is lost, so a person
+# who is occluded, leaves, or is seen by the other camera gets a fresh id. The
+# registry maps (cam, track id) -> a GLOBAL id using two signals:
+#   1. geometry — both cameras localize into the same tag-2 room frame with
+#      hw-synced timestamps (measured ~7cm agreement), so two detections at the
+#      same room point at the same moment are the same person. Cheap + strong.
+#   2. appearance — a ReID embedding (ultralytics' encoder), which is what can
+#      bridge a long absence where geometry says nothing.
+REID_MODEL = os.environ.get("SMARTROOM_REID_MODEL", "yolo26n-reid.onnx")
+REID_ON = os.environ.get("SMARTROOM_REID", "1") != "0"
+# Calibrated on live data from this room (see IdentityRegistry.stats): same-person
+# cosine ~0.95 median, different-person ~0.39 median but with a p95 of 0.62 and a
+# p99 of 0.66. 0.70 therefore sits above the impostor tail (<1% false merges) while
+# still catching the bulk of genuine matches. Prefer fragmentation over a false
+# merge: a split identity is recoverable, two people fused into one is not.
+REID_THRESH = float(os.environ.get("SMARTROOM_REID_THRESH", "0.70"))  # cosine
+REID_EVERY = int(os.environ.get("SMARTROOM_REID_EVERY", "3"))         # frames
+GEO_MERGE_MM = float(os.environ.get("SMARTROOM_GEO_MERGE_MM", "600")) # cross-cam
+GEO_MERGE_S = 0.5          # detections must be this close in time to fuse
+# A merge can be wrong (two people who were briefly close). The sticky map would
+# keep them fused forever, so re-check: if the other camera places this identity
+# implausibly far away at the same moment, break the mapping and re-match.
+GEO_SPLIT_MM = float(os.environ.get("SMARTROOM_GEO_SPLIT_MM", "1200"))
+GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
+EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
@@ -284,6 +315,131 @@ class Shared:
             self.cond.notify_all()
 
 
+class IdentityRegistry:
+    """Shared across camera threads: turns per-camera ByteTrack ids into stable
+    GLOBAL person ids, so the same human keeps one id across occlusions, across
+    re-entries, and across the two cameras."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.map = {}        # (cam, track_id) -> gid
+        self.gallery = {}    # gid -> {emb, pos, t, cam, seen}
+        self.next_gid = 1
+        self.misses = []     # recent best-but-rejected ReID scores (threshold tuning)
+        # Threshold calibration from live data: `genuine` = a track vs its own
+        # stored embedding (definitely the same person); `impostor` = two tracks
+        # visible in the SAME frame (definitely different people). The right
+        # REID_THRESH sits between the two distributions.
+        self.genuine = []
+        self.impostor = []
+
+    @staticmethod
+    def _cos(a, b):
+        if a is None or b is None:
+            return -1.0
+        na, nb = np.linalg.norm(a), np.linalg.norm(b)
+        if na == 0 or nb == 0:
+            return -1.0
+        return float(np.dot(a, b) / (na * nb))
+
+    def assign(self, cam, tid, emb, pos, t, taken):
+        """-> (gid, how). `taken` = gids already used by this camera this frame,
+        so one camera can never map two people onto the same identity."""
+        with self.lock:
+            self._prune(t)
+            key = (cam, tid)
+            gid = self.map.get(key)
+            if gid is not None and gid in self.gallery and gid not in taken:
+                e = self.gallery[gid]
+                stale_merge = (e["cam"] != cam and t - e["t"] < GEO_MERGE_S
+                               and ((pos[0] - e["pos"][0]) ** 2
+                                    + (pos[1] - e["pos"][1]) ** 2) ** 0.5 > GEO_SPLIT_MM)
+                if not stale_merge:
+                    self._touch(gid, emb, pos, t, cam)
+                    return gid, "track"
+                self.map.pop(key, None)   # bad fusion — fall through and re-match
+
+            best, how = None, "new"
+            # 1) cross-camera geometry: the other camera, right now, same spot
+            best_d = GEO_MERGE_MM
+            for g, e in self.gallery.items():
+                if g in taken or e["cam"] == cam or t - e["t"] > GEO_MERGE_S:
+                    continue
+                d = ((pos[0] - e["pos"][0]) ** 2 + (pos[1] - e["pos"][1]) ** 2) ** 0.5
+                if d < best_d:
+                    best, best_d, how = g, d, "geometry"
+            # 2) appearance: bridges gaps geometry can't (re-entry after absence)
+            top_s = None
+            if best is None and emb is not None:
+                best_s = REID_THRESH
+                for g, e in self.gallery.items():
+                    if g in taken:
+                        continue
+                    s = self._cos(emb, e["emb"])
+                    top_s = s if top_s is None else max(top_s, s)
+                    if s > best_s:
+                        best, best_s, how = g, s, "reid"
+
+            if best is None:
+                # log the near-miss so REID_THRESH can be tuned from real data
+                if top_s is not None:
+                    self.misses.append(round(top_s, 3))
+                    del self.misses[:-50]
+                best = self.next_gid
+                self.next_gid += 1
+                self.gallery[best] = {"emb": emb, "pos": pos, "t": t, "cam": cam, "seen": 0}
+            self.map[key] = best
+            self._touch(best, emb, pos, t, cam)
+            return best, how
+
+    def _touch(self, gid, emb, pos, t, cam):
+        e = self.gallery.setdefault(gid, {"emb": emb, "pos": pos, "t": t, "cam": cam, "seen": 0})
+        if emb is not None:
+            e["emb"] = emb if e["emb"] is None else (
+                EMB_MOMENTUM * e["emb"] + (1 - EMB_MOMENTUM) * emb)
+        e["pos"], e["t"], e["cam"] = pos, t, cam
+        e["seen"] += 1
+
+    def _prune(self, t):
+        dead = [g for g, e in self.gallery.items() if t - e["t"] > GALLERY_TTL_S]
+        for g in dead:
+            self.gallery.pop(g, None)
+        if dead:
+            for k, g in list(self.map.items()):
+                if g in dead:
+                    self.map.pop(k, None)
+
+    def note(self, cam, pairs):
+        """pairs: [(track_id, emb)] for one frame of one camera."""
+        with self.lock:
+            live = [(t, e) for t, e in pairs if e is not None]
+            for i in range(len(live)):
+                t_i, e_i = live[i]
+                gid = self.map.get((cam, t_i))
+                if gid in self.gallery and self.gallery[gid]["emb"] is not None:
+                    self.genuine.append(round(self._cos(e_i, self.gallery[gid]["emb"]), 3))
+                for j in range(i + 1, len(live)):
+                    self.impostor.append(round(self._cos(e_i, live[j][1]), 3))
+            del self.genuine[:-400]
+            del self.impostor[:-400]
+
+    def known(self, cam, tid):
+        with self.lock:
+            return (cam, tid) in self.map
+
+    def stats(self):
+        with self.lock:
+            def pct(v, q):
+                if not v: return None
+                v = sorted(v); return v[min(len(v) - 1, int(q * len(v)))]
+            return {"known": len(self.gallery), "tracks": len(self.map),
+                    "thresh": REID_THRESH,
+                    "genuine": {"n": len(self.genuine), "p05": pct(self.genuine, .05),
+                                "p50": pct(self.genuine, .50), "p95": pct(self.genuine, .95)},
+                    "impostor": {"n": len(self.impostor), "p50": pct(self.impostor, .50),
+                                 "p95": pct(self.impostor, .95), "p99": pct(self.impostor, .99)}}
+
+
 def _make_bytetrack():
     """ByteTracker with ultralytics' default bytetrack.yaml params — the same
     tracker model.track() builds, so ids are stable across frames (mirrors
@@ -357,11 +513,24 @@ class JumpDetector:
 
 
 def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool,
-               mode: str, cam_key: str = "", tslog: "TimestampLog | None" = None):
+               mode: str, cam_key: str = "", tslog: "TimestampLog | None" = None,
+               ids: "IdentityRegistry | None" = None):
     from ultralytics import YOLO
     model = YOLO(weights)
     tracker = _make_bytetrack()
     jumps = JumpDetector()
+    encoder = None
+    if ids is not None and REID_ON:
+        try:
+            with _MODEL_BUILD_LOCK:
+                from ultralytics.trackers.utils.reid import ReID
+                encoder = ReID(REID_MODEL,
+                               device=("cpu" if device in ("cpu", "intel:cpu") else 0))
+            print(f"[live] {cam_key}: ReID encoder {REID_MODEL} ready", flush=True)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] {cam_key}: ReID unavailable ({exc}) — geometry only",
+                  flush=True)
+    frame_n = 0
     use_half = device not in ("cpu", "intel:cpu")
     last_id = 0
     ema_fps = 0.0
@@ -435,6 +604,35 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             found.append((tid, (float(p_room[0]), float(p_room[2])), anchor, p, src))
         shared.set_hips(anchors_frac)
 
+        # Stable global identities: embed every localized person (throttled —
+        # appearance changes slowly), then resolve via geometry + appearance.
+        frame_n += 1
+        gids = {}
+        if ids is not None and found:
+            embs = [None] * len(found)
+            # Throttle the encoder, BUT never skip a frame containing an unseen
+            # track: a new track with no embedding could only ever match on
+            # geometry, so it would mint a fresh identity instead of being
+            # re-identified — the whole point of the gallery.
+            fresh = any(not ids.known(cam_key, t) for t, *_ in found)
+            if encoder is not None and (fresh or frame_n % REID_EVERY == 0):
+                try:
+                    dets = np.array([[(p["box"][0] + p["box"][2]) / 2,
+                                      (p["box"][1] + p["box"][3]) / 2,
+                                      p["box"][2] - p["box"][0],
+                                      p["box"][3] - p["box"][1]]
+                                     for *_, p, _ in found], dtype=np.float32)
+                    embs = encoder(clean, dets)      # xywh, on the CLEAN frame
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[live] {cam_key}: ReID embed failed: {exc}", flush=True)
+            if any(e is not None for e in embs):
+                ids.note(cam_key, [(t, e) for (t, *_), e in zip(found, embs)])
+            taken = set()
+            for (tid, pos, _marker, _p, _src), emb in zip(found, embs):
+                gid, how = ids.assign(cam_key, tid, emb, pos, t0, taken)
+                taken.add(gid)
+                gids[tid] = (gid, how)
+
         skeleton = mode in ("ntu", "hmdb")
         ava = mode == "ava"
         positions = []
@@ -454,14 +652,19 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             comy, body_h = _hip_com(p)
             if jumps.update(tid, comy, body_h, t0):
                 acts = [["jump", 1.0]] + [a for a in acts if a[0] != "jump"]
+            gid, how = gids.get(tid, (None, None))
             entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1),
                      "src": src, "cam": cam_key}
+            if gid is not None:
+                entry["gid"] = gid          # stable across gaps AND cameras
+                entry["idSrc"] = how        # track | geometry | reid | new
             if acts:
                 entry["actions"] = acts               # full above-threshold set
                 entry["action"] = acts[0][0]          # primary, for the map dot
                 entry["actionConf"] = acts[0][1]
             positions.append(entry)
-            _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts)
+            _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts,
+                         gid if gid is not None else tid)
         jumps.prune({tid for tid, *_ in found}, t0)
         if ava:
             shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
@@ -548,15 +751,16 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
     except Exception:  # noqa: BLE001
         pass
 
-    cfg = mmengine.Config.fromfile(config_path)
-    # equal bbox count across classes (demo does this); handle test_cfg.rcnn None
-    tc = cfg.model.get("test_cfg") or {}
-    tc["rcnn"] = dict(action_thr=0)
-    cfg.model["test_cfg"] = tc
-    cfg.model.backbone.pretrained = None
-    model = MODELS.build(cfg.model)
-    load_checkpoint(model, ckpt, map_location="cpu")
-    model.to(device).eval()
+    with _MODEL_BUILD_LOCK:
+        cfg = mmengine.Config.fromfile(config_path)
+        # equal bbox count across classes (demo does this); handle test_cfg.rcnn None
+        tc = cfg.model.get("test_cfg") or {}
+        tc["rcnn"] = dict(action_thr=0)
+        cfg.model["test_cfg"] = tc
+        cfg.model.backbone.pretrained = None
+        model = MODELS.build(cfg.model)
+        load_checkpoint(model, ckpt, map_location="cpu")
+        model.to(device).eval()
 
     sampler = [x for x in cfg.val_pipeline
                if str(x["type"]).endswith("SampleAVAFrames")][0]
@@ -612,8 +816,9 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
                              [[a, round(s, 3)] for a, s in labs])
 
 
-def _draw_person(frame, px, conf, marker, tid, src, actions=None):
-    color = _track_color(tid)
+def _draw_person(frame, px, conf, marker, tid, src, actions=None, label_id=None):
+    # colour by GLOBAL id so the same person keeps one colour across cameras
+    color = _track_color(label_id if label_id is not None else tid)
     for a, b in SKELETON:
         if a < len(conf) and b < len(conf) and conf[a] > KP_CONF and conf[b] > KP_CONF:
             pa = (int(px[a][0]), int(px[a][1]))
@@ -626,7 +831,7 @@ def _draw_person(frame, px, conf, marker, tid, src, actions=None):
     mcol = (255, 255, 0) if src == "depth-hip" else (0, 165, 255)
     mx, my = int(marker[0]) + 8, int(marker[1])
     cv2.circle(frame, (int(marker[0]), int(marker[1])), 6, mcol, 2)
-    cv2.putText(frame, f"#{tid}", (mx, my),
+    cv2.putText(frame, f"#{label_id if label_id is not None else tid}", (mx, my),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
     # every above-threshold class, stacked below the id
     for i, a in enumerate(actions or []):
@@ -641,7 +846,7 @@ def _track_color(tid):
     return (int(b), int(g), int(r))
 
 
-def make_handler(cams: dict):
+def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
     """cams: {cam_key: {"shared": Shared, "roomFrame": {...}}} — every endpoint
     selects a camera with ?cam=<key> (defaults to the first registered)."""
 
@@ -762,6 +967,7 @@ def make_handler(cams: dict):
             body = json.dumps({
                 "positions": merged,
                 "cams": per_cam,
+                "identities": ids.stats() if ids is not None else None,
                 "updatedMs": first.updated_ms,
                 "fps": first.fps,
                 "roomFrame": cams[default_cam]["roomFrame"],
@@ -860,7 +1066,8 @@ function draw(pos){
   for(const p of pos){
     ctx.fillStyle=CAMCOL[p.cam]||'#f59e0b';
     ctx.beginPath();ctx.arc(tx(p.x),tz(p.z),8,0,7);ctx.fill();
-    ctx.fillStyle='#0c0a09';ctx.fillText('#'+p.id,tx(p.x)-6,tz(p.z)+4);
+    // GLOBAL id: same human keeps this across gaps and across cameras
+    ctx.fillStyle='#0c0a09';ctx.fillText('#'+(p.gid!=null?p.gid:p.id),tx(p.x)-6,tz(p.z)+4);
     if(p.action){ctx.fillStyle='#fde68a';ctx.fillText(p.action,tx(p.x)+11,tz(p.z)+4);}
   }
   CAMS.forEach(function(c,i){ctx.fillStyle=CAMCOL[c];ctx.fillText('● '+c,pad+i*130,H-8);});
@@ -872,9 +1079,11 @@ async function poll(){
     for(const c in cams){const el=document.getElementById('fps_'+c);
       if(el)el.textContent='inference '+(cams[c].fps||0)+' fps · hw_ts '+
         (cams[c].hwTimestampMs||0).toFixed(0)+' · '+cams[c].persons+' person(s)';}
-    const acts=pos.map(p=>'['+p.cam+'] #'+p.id+': '+((p.actions&&p.actions.length)?
+    const acts=pos.map(p=>'#'+(p.gid!=null?p.gid:p.id)+' ['+p.cam.replace('camera_','').replace('_color','')+
+      (p.idSrc?'/'+p.idSrc:'')+']: '+((p.actions&&p.actions.length)?
       p.actions.map(a=>a[0]+' '+a[1].toFixed(2)).join(', '):'…'));
-    document.getElementById('cnt').innerHTML=pos.length+' person(s)<br>'+
+    const idn=d.identities?(' · '+d.identities.known+' known identities'):'';
+    document.getElementById('cnt').innerHTML=pos.length+' detection(s)'+idn+'<br>'+
       (acts.length?acts.join('<br>'):'—');
   }catch(e){}
   setTimeout(poll,200);
@@ -916,6 +1125,7 @@ def main():
     # One entry per camera: its own Shared buffers, geom, pose thread and
     # timestamp log. They all share the tag-1 room frame, so /positions merges.
     session = time.strftime("%Y%m%d_%H%M%S")
+    ids = IdentityRegistry()      # SHARED by every camera -> one id per person
     cams = {}
     for cam_key in [c.strip() for c in args.cam.split(",") if c.strip()]:
         clip = Path(args.clip) if (args.clip and len(cams) == 0) else find_calib_clip(cam_key)
@@ -942,7 +1152,7 @@ def main():
         threading.Thread(
             target=infer_loop,
             args=(shared, geom, weights, device, args.flip, mode, cam_key,
-                  TimestampLog(cam_key, session)),
+                  TimestampLog(cam_key, session), ids),
             daemon=True).start()
     if not cams:
         print("[live] FATAL: no usable cameras", file=sys.stderr)
@@ -977,7 +1187,7 @@ def main():
                              args=(e["shared"], args.width, args.height, mode),
                              daemon=True).start()
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams))
+    httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
     print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}",
           flush=True)
     try:
