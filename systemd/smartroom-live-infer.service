@@ -1,0 +1,37 @@
+# Live inference service on the quad server: receives pushed frames from the Pi,
+# runs pose + room localization + AVA actions + identity tracking, serves the
+# viewer/API on :8010, and continuously records 3-minute segments into the
+# recordings tree (empty ones auto-deleted).
+#
+# USER unit (no sudo), same pattern as smartroom-mirror.service. Install:
+#   mkdir -p ~/.config/systemd/user
+#   ln -sf ~/smartroom-control/systemd/smartroom-live-infer.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now smartroom-live-infer
+#   loginctl enable-linger intern26      # survive logout / start at boot
+
+[Unit]
+Description=smartroom live inference (pose, actions, identities, segment recording)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/smartroom-control
+# .venv-action has ultralytics + mmaction + mmdet together (NOT .venv-detect)
+ExecStart=%h/smartroom-control/.venv-action/bin/python detect/live_infer.py \
+    --cam camera_d455_color,camera_d435_color --port 8010 --action ava
+Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
+# 3-minute segments; a segment needs this many frames containing people to be kept
+Environment=SMARTROOM_SEGMENT_S=180
+Environment=SMARTROOM_SEGMENT_MIN_FRAMES=15
+Restart=always
+RestartSec=10
+# Model loading (two SlowFast + two pose + two ReID) takes a while; do not let
+# systemd consider a slow start a failure.
+TimeoutStartSec=300
+StandardOutput=append:/tmp/live_infer.log
+StandardError=inherit
+
+[Install]
+WantedBy=default.target
