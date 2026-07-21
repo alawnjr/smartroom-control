@@ -351,6 +351,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         if flip:
             frame = cv2.rotate(frame, cv2.ROTATE_180)
         h, w = frame.shape[:2]
+        clean = frame.copy()   # pristine RGB for the action model (frame gets overlays)
         try:
             res = model.predict(frame, imgsz=640, device=device, half=use_half,
                                 classes=[0], verbose=False)[0].cpu()
@@ -430,7 +431,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts)
         jumps.prune({tid for tid, *_ in found}, t0)
         if ava:
-            shared.push_ava(frame, ava_boxes, w, h)
+            shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
 
         dt = time.time() - t0
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
