@@ -62,6 +62,10 @@ DEPTH_STALE_S = 1.0       # ignore depth samples older than this
 ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); deque cap
 ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
 ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
+AVA_SHORT = 256           # short-side the SlowFast-AVA clip is resized to
+AVA_BUF = 80              # rolling RGB frame buffer (>= AVA window = clip_len*interval)
+AVA_PERIOD_S = 0.6        # how often to run the (heavier) AVA forward
+AVA_THR = 0.4             # per-class action score threshold
 
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
@@ -99,6 +103,22 @@ def find_calib_clip(cam_key: str) -> Path | None:
     return None
 
 
+def _resize_short(w, h, short):
+    """New (w, h) with the short side scaled to `short`, aspect preserved."""
+    scale = short / min(w, h)
+    return int(round(w * scale)), int(round(h * scale))
+
+
+def load_label_map(path):
+    """AVA label map: 'id: name' per line -> {int id: name} (same as the demo)."""
+    out = {}
+    for line in Path(path).read_text().splitlines():
+        if ": " in line:
+            i, name = line.split(": ", 1)
+            out[int(i)] = name.strip()
+    return out
+
+
 class Shared:
     """Newest-frame-wins slots shared across the ingest, inference and HTTP
     threads (mirrors realsense_depth_page.py's ViewCache pattern)."""
@@ -122,6 +142,9 @@ class Shared:
         self.windows = defaultdict(lambda: deque(maxlen=ACTION_WINDOW))
         self.win_seen = {}           # tid -> monotonic_t of last skeleton append
         self.labels = {}             # tid -> {"action", "conf", "top", "t"}
+        # SlowFast-AVA: a rolling buffer of (resized BGR frame, [(tid, box_resized)])
+        # — whole-frame clips + per-person proposals, classified together.
+        self.ava_buf = deque(maxlen=AVA_BUF)
 
     def put_in(self, jpeg):
         with self.cond:
@@ -172,6 +195,21 @@ class Shared:
         with self.cond:
             return self.labels.get(tid)
 
+    def push_ava(self, frame_bgr, boxes, w, h):
+        """Resize the frame to the AVA short side and scale each (tid, box) into
+        those coords, then buffer it. boxes: [(tid, [x1,y1,x2,y2])] in full res."""
+        nw, nh = _resize_short(w, h, AVA_SHORT)
+        small = cv2.resize(frame_bgr, (nw, nh))
+        rx, ry = nw / w, nh / h
+        scaled = [(tid, [b[0] * rx, b[1] * ry, b[2] * rx, b[3] * ry])
+                  for tid, b in boxes]
+        with self.cond:
+            self.ava_buf.append((small, scaled))
+
+    def snapshot_ava(self):
+        with self.cond:
+            return list(self.ava_buf)
+
     def depth_near(self, u_frac, v_frac):
         """Freshest metric depth (mm) sampled near this hip, or None."""
         now = time.monotonic()
@@ -207,7 +245,7 @@ def _shoulder_point(person, w, h):
 
 
 def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool,
-               action_on: bool):
+               mode: str):
     from ultralytics import YOLO
     model = YOLO(weights)
     tracks = Tracks()
@@ -244,8 +282,11 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             xy = kp.xy.tolist()
             conf = (kp.conf.tolist() if kp.conf is not None
                     else [[1.0] * len(p) for p in xyn])
+            boxes = (res.boxes.xyxy.tolist()
+                     if res.boxes is not None and res.boxes.xyxy is not None else [])
             for i in range(len(xyn)):
-                persons.append({"kpts": xyn[i], "conf": conf[i], "px": xy[i]})
+                persons.append({"kpts": xyn[i], "conf": conf[i], "px": xy[i],
+                                "box": boxes[i] if i < len(boxes) else None})
 
         # Localize each person by the D455's real depth at an upper-body anchor:
         # the mid-hip if visible, else the mid-shoulder (both survive occluded
@@ -272,14 +313,19 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         shared.set_hips(anchors_frac)
         ids = tracks.assign(t0, [f[0] for f in found])
 
+        skeleton = mode in ("ntu", "hmdb")
+        ava = mode == "ava"
         positions = []
+        ava_boxes = []
         for tid, (pos, marker, p, src) in zip(ids, found):
             tid = int(tid)
-            if action_on:
+            if skeleton:
                 shared.push_skeleton(tid,
                                      np.asarray(p["px"], dtype="float32"),
                                      np.asarray(p["conf"], dtype="float32"))
-            lab = shared.get_label(tid) if action_on else None
+            if ava and p.get("box") is not None:
+                ava_boxes.append((tid, p["box"]))
+            lab = shared.get_label(tid) if (skeleton or ava) else None
             action = lab.get("action") if lab else None
             entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1), "src": src}
             if action:
@@ -287,6 +333,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 entry["actionConf"] = lab["conf"]
             positions.append(entry)
             _draw_person(frame, p["px"], p["conf"], marker, tid, src, action)
+        if ava:
+            shared.push_ava(frame, ava_boxes, w, h)
 
         dt = time.time() - t0
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
@@ -345,6 +393,86 @@ def action_loop(shared: Shared, width: int, height: int, variant_key: str):
             c, i = vals[0], idxs[0]
             shared.set_label(tid, nm(i) if c >= min_conf else None, c, top)
         time.sleep(ACTION_SWEEP_S)
+
+
+def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
+             device: str, action_thr: float):
+    """SlowFast-AVA spatiotemporal detection. Reuses mmaction2's official demo
+    inference recipe: build the detection model, then per prediction step take
+    the trailing RGB clip + current person boxes as proposals and read per-box
+    multi-label action scores. One forward classifies everyone in the frame."""
+    import mmcv
+    import mmengine
+    import numpy as np
+    import torch
+    from mmengine.runner import load_checkpoint
+    from mmengine.structures import InstanceData
+    from mmaction.registry import MODELS
+    from mmaction.structures import ActionDataSample
+    try:
+        from mmaction.utils import register_all_modules
+        register_all_modules(True)
+    except Exception:  # noqa: BLE001
+        pass
+
+    cfg = mmengine.Config.fromfile(config_path)
+    # equal bbox count across classes (demo does this); handle test_cfg.rcnn None
+    tc = cfg.model.get("test_cfg") or {}
+    tc["rcnn"] = dict(action_thr=0)
+    cfg.model["test_cfg"] = tc
+    cfg.model.backbone.pretrained = None
+    model = MODELS.build(cfg.model)
+    load_checkpoint(model, ckpt, map_location="cpu")
+    model.to(device).eval()
+
+    sampler = [x for x in cfg.val_pipeline
+               if str(x["type"]).endswith("SampleAVAFrames")][0]
+    clip_len, interval = sampler["clip_len"], sampler["frame_interval"]
+    window = clip_len * interval
+    mean = np.array(cfg.model.data_preprocessor["mean"])
+    std = np.array(cfg.model.data_preprocessor["std"])
+    label_map = load_label_map(label_map_path)
+    print(f"[live] AVA model loaded: {len(label_map)} classes, clip_len={clip_len} "
+          f"interval={interval} window={window} thr={action_thr} device={device}",
+          flush=True)
+
+    while True:
+        time.sleep(AVA_PERIOD_S)
+        buf = shared.snapshot_ava()
+        if len(buf) < window:
+            continue
+        seg = buf[-window:]
+        _, boxes = seg[-1]                 # proposals = the newest frame's people
+        if not boxes:
+            continue
+        nh, nw = seg[-1][0].shape[:2]
+        imgs = [seg[i][0].astype(np.float32) for i in range(0, window, interval)]
+        for im in imgs:
+            mmcv.imnormalize_(im, mean, std, to_rgb=False)
+        arr = np.stack(imgs).transpose(3, 0, 1, 2)[np.newaxis]   # 1,C,T,H,W
+        inp = torch.from_numpy(arr).to(device)
+        tids = [t for t, _ in boxes]
+        prop = torch.tensor([b for _, b in boxes], dtype=torch.float32, device=device)
+        ds = ActionDataSample()
+        ds.proposals = InstanceData(bboxes=prop)
+        ds.set_metainfo(dict(img_shape=(nh, nw)))
+        try:
+            with torch.no_grad():
+                res = model(inp, [ds], mode="predict")
+            scores = res[0].pred_instances.scores    # (num_props, num_classes)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] AVA infer error: {exc}", flush=True)
+            continue
+        for j, tid in enumerate(tids):
+            labs = [(label_map[i], float(scores[j, i]))
+                    for i in range(scores.shape[1])
+                    if i in label_map and float(scores[j, i]) > action_thr]
+            labs.sort(key=lambda x: -x[1])
+            if labs:
+                shared.set_label(tid, labs[0][0], labs[0][1],
+                                 [[a, round(s, 3)] for a, s in labs[:6]])
+            else:
+                shared.set_label(tid, None, 0.0, [])
 
 
 def _draw_person(frame, px, conf, marker, tid, src, action=None):
@@ -574,10 +702,13 @@ def main():
     ap.add_argument("--height", type=int, default=480)
     ap.add_argument("--flip", action="store_true",
                     help="rotate incoming frames 180 (if the Pi serves unrotated)")
-    ap.add_argument("--action", default="ntu",
-                    help="temporal action variant (ntu|hmdb); 'off' disables")
+    ap.add_argument("--action", default="ava",
+                    help="action model: ava (SlowFast-AVA, per-person RGB) | "
+                         "ntu | hmdb (skeleton) | off")
     args = ap.parse_args()
-    action_on = args.action.lower() not in ("off", "none", "no", "0", "")
+    mode = args.action.lower()
+    if mode in ("none", "no", "0", ""):
+        mode = "off"
 
     weights = os.environ.get("SMARTROOM_LIVE_WEIGHTS") or str(
         Path.home() / "Code/yolo-bench/yolo26n-pose.pt")
@@ -611,17 +742,29 @@ def main():
 
     shared = Shared()
     threading.Thread(target=infer_loop,
-                     args=(shared, geom, weights, device, args.flip, action_on),
+                     args=(shared, geom, weights, device, args.flip, mode),
                      daemon=True).start()
-    if action_on:
+    if mode == "ava":
+        import mmaction
+        cfg = os.environ.get("SMARTROOM_AVA_CONFIG") or os.path.join(
+            os.path.dirname(mmaction.__file__), ".mim", "configs", "detection",
+            "slowfast", "slowfast_kinetics400-pretrained-r50_8xb8-8x8x1-20e_ava21-rgb.py")
+        ckpt = os.environ.get("SMARTROOM_AVA_CKPT") or str(
+            Path.home() / "Code/yolo-bench/slowfast_ava.pth")
+        lm = os.environ.get("SMARTROOM_AVA_LABELS") or str(
+            Path(__file__).resolve().parent / "ava_label_map.txt")
+        adev = "cuda:0" if device not in ("cpu", "intel:cpu") else "cpu"
+        threading.Thread(target=ava_loop,
+                         args=(shared, cfg, ckpt, lm, adev, AVA_THR),
+                         daemon=True).start()
+    elif mode in ("ntu", "hmdb"):
         threading.Thread(target=action_loop,
-                         args=(shared, args.width, args.height, args.action.lower()),
+                         args=(shared, args.width, args.height, mode),
                          daemon=True).start()
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port),
                                 make_handler(shared, room_frame))
-    print(f"[live] serving on :{args.port}  (action={args.action if action_on else 'off'})",
-          flush=True)
+    print(f"[live] serving on :{args.port}  (action={mode})", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

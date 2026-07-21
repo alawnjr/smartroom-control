@@ -30,6 +30,9 @@ uv pip install --python "$V" "torch==2.0.1" "torchvision==0.15.2" \
 uv pip install --python "$V" "numpy<2" mmengine importlib-metadata lapx ultralytics
 uv pip install --python "$V" "mmcv==2.0.1" -f "$MMCV_IDX"
 uv pip install --python "$V" "mmaction2==1.2.0"
+# mmdet supplies the ROI head used by the SlowFast-AVA spatiotemporal detector
+# (live_infer.py --action ava). 3.2.0 pins mmcv <2.2 so it keeps the 2.0.1 above.
+uv pip install --python "$V" "mmdet==3.2.0"
 
 # RTMPose — an optional alternative skeleton source for the action classifiers
 # (selectable per analysis). Pure onnxruntime wheels, no mmpose/mmcv, so they don't
@@ -57,6 +60,13 @@ HMDB_CKPT="${SMARTROOM_HMDB_CKPT:-$HOME/Code/yolo-bench/posec3d_hmdb51.pth}"
 if [ ! -f "$HMDB_CKPT" ]; then
   mkdir -p "$(dirname "$HMDB_CKPT")"
   curl -sL -o "$HMDB_CKPT" "https://download.openmmlab.com/mmaction/v1.0/skeleton/posec3d/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint/slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint_20220815-17eaa484.pth"
+fi
+
+# SlowFast-AVA (per-person RGB spatiotemporal detection) for live_infer.py --action ava.
+AVA_CKPT="${SMARTROOM_AVA_CKPT:-$HOME/Code/yolo-bench/slowfast_ava.pth}"
+if [ ! -f "$AVA_CKPT" ]; then
+  mkdir -p "$(dirname "$AVA_CKPT")"
+  curl -sL -o "$AVA_CKPT" "https://download.openmmlab.com/mmaction/v1.0/detection/slowfast/slowfast_kinetics400-pretrained-r50_8xb8-8x8x1-20e_ava21-rgb/slowfast_kinetics400-pretrained-r50_8xb8-8x8x1-20e_ava21-rgb_20220906-39133ec7.pth"
 fi
 
 # Pre-seed the RTMPose COCO-17 body model so the first analysis run needs no network
