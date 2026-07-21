@@ -63,9 +63,16 @@ ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); dequ
 ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
 ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
 AVA_SHORT = 256           # short-side the SlowFast-AVA clip is resized to
-AVA_BUF = 80              # rolling RGB frame buffer (>= AVA window = clip_len*interval)
-AVA_PERIOD_S = 0.6        # how often to run the (heavier) AVA forward
+AVA_BUF = 128             # rolling RGB frame buffer (a few seconds at any fps)
+AVA_PERIOD_S = 0.4        # how often to run the (heavier) AVA forward
 AVA_THR = 0.4             # per-class action score threshold
+# SlowFast-AVA was trained on ~30fps clips where its 32x2 window ≈ 2.1s. Our live
+# feed is ~10fps, so taking the last 64 frames would span ~6.4s — too much motion
+# integrated per label (inertia) and 3x-stretched so dynamic actions look static.
+# Instead pick frames from the last AVA_SPAN_S seconds (wall clock) and resample
+# to clip_len, matching the training time-span regardless of the live fps.
+AVA_SPAN_S = float(os.environ.get("SMARTROOM_AVA_SPAN_S", "2.1"))
+AVA_MIN_FRAMES = 8        # need at least this many frames in the span to classify
 
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
@@ -204,7 +211,7 @@ class Shared:
         scaled = [(tid, [b[0] * rx, b[1] * ry, b[2] * rx, b[3] * ry])
                   for tid, b in boxes]
         with self.cond:
-            self.ava_buf.append((small, scaled))
+            self.ava_buf.append((small, scaled, time.monotonic()))
 
     def snapshot_ava(self):
         with self.cond:
@@ -448,25 +455,29 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
     sampler = [x for x in cfg.val_pipeline
                if str(x["type"]).endswith("SampleAVAFrames")][0]
     clip_len, interval = sampler["clip_len"], sampler["frame_interval"]
-    window = clip_len * interval
     mean = np.array(cfg.model.data_preprocessor["mean"])
     std = np.array(cfg.model.data_preprocessor["std"])
     label_map = load_label_map(label_map_path)
     print(f"[live] AVA model loaded: {len(label_map)} classes, clip_len={clip_len} "
-          f"interval={interval} window={window} thr={action_thr} device={device}",
-          flush=True)
+          f"span={AVA_SPAN_S}s thr={action_thr} device={device}", flush=True)
 
     while True:
         time.sleep(AVA_PERIOD_S)
         buf = shared.snapshot_ava()
-        if len(buf) < window:
+        if len(buf) < AVA_MIN_FRAMES:
             continue
-        seg = buf[-window:]
-        _, boxes = seg[-1]                 # proposals = the newest frame's people
+        # frames from the last AVA_SPAN_S seconds, resampled to clip_len so the
+        # clip covers the training time-span regardless of the live fps.
+        t_now = buf[-1][2]
+        seg = [e for e in buf if t_now - e[2] <= AVA_SPAN_S]
+        if len(seg) < AVA_MIN_FRAMES:
+            continue
+        _, boxes, _ = seg[-1]              # proposals = the newest frame's people
         if not boxes:
             continue
         nh, nw = seg[-1][0].shape[:2]
-        imgs = [seg[i][0].astype(np.float32) for i in range(0, window, interval)]
+        idx = np.linspace(0, len(seg) - 1, clip_len).round().astype(int)
+        imgs = [seg[i][0].astype(np.float32) for i in idx]
         for im in imgs:
             mmcv.imnormalize_(im, mean, std, to_rgb=False)
         arr = np.stack(imgs).transpose(3, 0, 1, 2)[np.newaxis]   # 1,C,T,H,W
