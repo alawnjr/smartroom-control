@@ -75,6 +75,12 @@ DEPTH_STALE_S = float(os.environ.get("SMARTROOM_DEPTH_STALE_S", "0.35"))
 # cancel; pushing both along their differing rays just separates them. Kept as a
 # knob in case the cameras are ever repositioned to face each other.
 BODY_HALF_DEPTH_MM = float(os.environ.get("SMARTROOM_BODY_HALF_DEPTH_MM", "0"))
+# The depth back-channel polls at ~8Hz while the pose loop runs 30-60fps, and a
+# sample must land near the anchor to match. A person who is STILL matches every
+# frame; a MOVING one outruns the last sample, and the person used to be dropped
+# from that frame entirely — vanishing from the overlay and the map, which reads
+# as flicker. Hold their last known room position briefly instead.
+POS_HOLD_S = float(os.environ.get("SMARTROOM_POS_HOLD_S", "0.7"))
 ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); deque cap
 ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
 ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
@@ -160,6 +166,11 @@ GEO_SPLIT_MM = float(os.environ.get("SMARTROOM_GEO_SPLIT_MM", "1200"))
 # Consecutive co-located observations required before two identities are fused,
 # so two people passing each other are not merged on a single coincidence.
 GEO_FUSE_PERSIST = int(os.environ.get("SMARTROOM_GEO_FUSE_PERSIST", "5"))
+# The split rule must be as reluctant as the fuse rule, or the two fight: a single
+# frame where the cameras disagreed split an identity, fuse() immediately re-merged
+# it, and one stable track oscillated 1 -> 10 -> 1 -> 11. Require the disagreement
+# to persist before believing it.
+GEO_SPLIT_PERSIST = int(os.environ.get("SMARTROOM_GEO_SPLIT_PERSIST", "8"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
@@ -380,6 +391,8 @@ class IdentityRegistry:
         self.geo_sim = []      # appearance scores seen on candidate geo merges
         self.geo_vetoed = 0    # how many the veto blocked
         self.pending = {}      # (gid_a, gid_b) -> consecutive co-located observations
+        self.split_pending = {}  # (cam, tid) -> consecutive far-apart observations
+        self.splits = 0
         self.fused = 0         # identities merged by the continuous fusion pass
 
     @staticmethod
@@ -405,9 +418,20 @@ class IdentityRegistry:
                                and ((pos[0] - e["pos"][0]) ** 2
                                     + (pos[1] - e["pos"][1]) ** 2) ** 0.5 > GEO_SPLIT_MM)
                 if not stale_merge:
+                    self.split_pending.pop(key, None)
                     self._touch(gid, emb, pos, t, cam)
                     return gid, "track"
-                self.map.pop(key, None)   # bad fusion — fall through and re-match
+                # Disagreement seen — but do not split on a single frame (that
+                # oscillated against fuse()). Only break the mapping once it has
+                # persisted, otherwise ride it out.
+                n = self.split_pending.get(key, 0) + 1
+                self.split_pending[key] = n
+                if n < GEO_SPLIT_PERSIST:
+                    self._touch(gid, emb, pos, t, cam)
+                    return gid, "track"
+                self.split_pending.pop(key, None)
+                self.splits += 1
+                self.map.pop(key, None)   # sustained mismatch — re-match below
 
             best, how = None, "new"
             # 1) cross-camera geometry: the other camera, right now, same spot
@@ -547,6 +571,7 @@ class IdentityRegistry:
                     "thresh": REID_THRESH,
                     "geoMerge": {"reidMin": GEO_REID_MIN, "vetoed": self.geo_vetoed,
                                  "fused": self.fused, "pending": len(self.pending),
+                                 "splits": self.splits,
                                  "n": len(gs),
                                  "p10": gs[len(gs) // 10] if gs else None,
                                  "p50": gs[len(gs) // 2] if gs else None,
@@ -636,6 +661,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     model = YOLO(weights)
     tracker = _make_bytetrack()
     jumps = JumpDetector()
+    held = {}          # tid -> (pos, t) last good room position, for POS_HOLD_S
     encoder = None
     if ids is not None and REID_ON:
         try:
@@ -713,14 +739,22 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 continue
             anchors_frac.append([anchor[0] / w, anchor[1] / h])
             z_mm = shared.depth_near(anchor[0] / w, anchor[1] / h)
-            if not z_mm:
-                continue
-            # surface -> body centre (see BODY_HALF_DEPTH_MM)
-            p_room = backproject_room(anchor[0], anchor[1],
-                                      z_mm + BODY_HALF_DEPTH_MM, geom)
-            if p_room is None:
-                continue
-            found.append((tid, (float(p_room[0]), float(p_room[2])), anchor, p, src))
+            pos = None
+            if z_mm:
+                p_room = backproject_room(anchor[0], anchor[1],
+                                          z_mm + BODY_HALF_DEPTH_MM, geom)
+                if p_room is not None:
+                    pos = (float(p_room[0]), float(p_room[2]))
+                    held[tid] = (pos, t0)
+            if pos is None:
+                # no fresh depth this frame — hold the last known position rather
+                # than dropping the person (that is what caused the flicker).
+                prev = held.get(tid)
+                if prev and t0 - prev[1] <= POS_HOLD_S:
+                    pos, src = prev[0], src + "-hold"
+                else:
+                    continue
+            found.append((tid, pos, anchor, p, src))
         shared.set_hips(anchors_frac)
 
         # Stable global identities: embed every localized person (throttled —
@@ -786,6 +820,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts,
                          gid if gid is not None else tid)
         jumps.prune({tid for tid, *_ in found}, t0)
+        for _t in [k for k, v in held.items() if t0 - v[1] > 5]:
+            held.pop(_t, None)
         if ava:
             shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
 
