@@ -30,9 +30,13 @@ Usage:
 """
 
 import argparse
+import datetime as dt
 import json
 import os
+import re
+import shutil
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -174,6 +178,182 @@ GEO_SPLIT_PERSIST = int(os.environ.get("SMARTROOM_GEO_SPLIT_PERSIST", "8"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
+# --- continuous segment recording -------------------------------------------
+# Always-on archival of the live feed in fixed-length segments, written straight
+# into the recordings tree so the existing API/website list them with no extra
+# plumbing. Segments containing nobody are deleted on close — an empty room is
+# the overwhelming majority of wall-clock time and is not worth the disk.
+SEGMENT_ON = os.environ.get("SMARTROOM_SEGMENT", "1") != "0"
+SEGMENT_S = float(os.environ.get("SMARTROOM_SEGMENT_S", "180"))     # 3 minutes
+# A couple of stray detections should not preserve an otherwise empty segment.
+SEGMENT_MIN_PEOPLE_FRAMES = int(os.environ.get("SMARTROOM_SEGMENT_MIN_FRAMES", "15"))
+# Encode on the GPU: two continuous libx264 streams alongside pose + AVA + a
+# CPU-fallback ReID saturated the CPU and starved the HTTP server (requests
+# queued behind a 190%-CPU process). NVENC is effectively free here.
+SEGMENT_ENCODER = os.environ.get("SMARTROOM_SEGMENT_ENCODER", "h264_nvenc")
+
+
+def _day_dir(root: Path, when: dt.datetime) -> Path:
+    """day_NN_YYYY-MM-DD, reusing today's folder and continuing the NN sequence."""
+    date = when.strftime("%Y-%m-%d")
+    best = None
+    for d in (root.iterdir() if root.exists() else []):
+        m = re.match(r"day_(\d+)_(\d{4}-\d{2}-\d{2})$", d.name)
+        if not m:
+            continue
+        if m.group(2) == date:
+            return d
+        best = max(best or 0, int(m.group(1)))
+    return root / f"day_{(best or 0) + 1:02d}_{date}"
+
+
+class SegmentRecorder:
+    """Encodes the incoming JPEG stream to fixed-length mp4 segments.
+
+    Frames are handed off to a writer thread so a slow encoder can never stall
+    inference. Segments align to wall-clock boundaries, so both cameras land in
+    the SAME recording folder without needing to coordinate.
+    """
+
+    def __init__(self, cam_key: str, root: Path, stream_meta: dict, node: str,
+                 room_frame: dict | None = None):
+        self.cam, self.root, self.node = cam_key, root, node
+        self.stream_meta = stream_meta or {}
+        self.room_frame = room_frame
+        self.q = deque()
+        self.cond = threading.Condition()
+        self.proc = None
+        self.dir = None
+        self.idx = None          # wall-clock segment index
+        self.frames = 0
+        self.people_frames = 0
+        self.started = None
+        self.rows = []           # (frame_no, hw_ts)
+        self.kept = self.dropped = 0
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def add(self, jpeg: bytes, hw_ts: float, has_people: bool):
+        with self.cond:
+            if len(self.q) < 240:          # ~8s at 30fps; never block inference
+                self.q.append((jpeg, hw_ts, has_people))
+                self.cond.notify()
+
+    def _run(self):
+        while True:
+            with self.cond:
+                while not self.q:
+                    self.cond.wait(timeout=1.0)
+                    if not self.q and self.proc and time.time() // SEGMENT_S != self.idx:
+                        self._rotate(int(time.time() // SEGMENT_S))
+                item = self.q.popleft()
+            jpeg, hw_ts, people = item
+            idx = int(time.time() // SEGMENT_S)
+            if self.proc is None or idx != self.idx:
+                self._rotate(idx)
+            try:
+                self.proc.stdin.write(jpeg)
+                self.frames += 1
+                self.rows.append((self.frames, hw_ts))
+                if people:
+                    self.people_frames += 1
+            except (BrokenPipeError, OSError) as exc:
+                print(f"[live] {self.cam}: segment write failed: {exc}", flush=True)
+                self.proc = None
+
+    def _rotate(self, idx: int):
+        self._close()
+        self.idx, self.frames, self.people_frames, self.rows = idx, 0, 0, []
+        self.started = dt.datetime.now().astimezone()
+        rec = "rec_" + self.started.strftime("%Y%m%d_%H%M%S")
+        self.dir = _day_dir(self.root, self.started) / rec / "streams" / "cam2"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        out = self.dir / f"{self.cam}.mp4"
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-f", "image2pipe",
+               "-vcodec", "mjpeg", "-r", "30", "-i", "-",
+               "-c:v", SEGMENT_ENCODER, "-pix_fmt", "yuv420p"]
+        cmd += (["-cq", "26", "-preset", "p5"] if "nvenc" in SEGMENT_ENCODER
+                else ["-crf", "26", "-preset", "veryfast"])
+        cmd += [str(out)]
+        try:
+            self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                         stdout=subprocess.DEVNULL,
+                                         stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            print(f"[live] {self.cam}: cannot start ffmpeg: {exc}", flush=True)
+            self.proc = None
+
+    def _close(self):
+        """Finish the current segment: keep it only if somebody was in it."""
+        if self.proc is None or self.dir is None:
+            return
+        try:
+            self.proc.stdin.close()
+            self.proc.wait(timeout=30)
+        except Exception:  # noqa: BLE001
+            try: self.proc.kill()
+            except Exception: pass
+        self.proc = None
+        rec_dir = self.dir.parent.parent          # .../rec_x
+        mp4 = self.dir / f"{self.cam}.mp4"
+        if self.people_frames < SEGMENT_MIN_PEOPLE_FRAMES:
+            # nobody in it — discard, and remove the folder if the other camera
+            # did not keep anything either.
+            mp4.unlink(missing_ok=True)
+            (self.dir / f"{self.cam}_timestamps.csv").unlink(missing_ok=True)
+            self.dropped += 1
+            # tidy up: cam dir -> streams dir -> rec dir. Stops as soon as one is
+            # non-empty (i.e. the other camera kept its clip).
+            for d in (self.dir, self.dir.parent, rec_dir):
+                try: d.rmdir()
+                except OSError: break
+            return
+        dur = max(1.0, self.frames / 30.0)
+        with open(self.dir / f"{self.cam}_timestamps.csv", "w") as fh:
+            fh.write("frame,hw_timestamp_ms\n")
+            for n, ts in self.rows:
+                fh.write(f"{n},{ts:.3f}\n")
+        self._write_metadata(dur)
+        self.kept += 1
+        print(f"[live] {self.cam}: kept {rec_dir.name} "
+              f"({self.frames} frames, {self.people_frames} with people)", flush=True)
+
+    def _write_metadata(self, dur: float):
+        """Merge this camera's stream into the shared metadata.json (both cameras
+        write the same file, so read-modify-write under a lock)."""
+        path = self.dir / "metadata.json"
+        with _SEG_META_LOCK:
+            try:
+                meta = json.loads(path.read_text())
+            except (OSError, ValueError):
+                meta = {}
+            meta.setdefault("recording_id", self.dir.parent.parent.name)
+            meta.setdefault("node", self.node)
+            meta.setdefault("start_time", self.started.isoformat())
+            meta.setdefault("source", "live_segment_recorder")
+            # carry the room frame so a segment is a self-contained, calibrated
+            # recording (tag height lives here; without it geometry cannot load)
+            if self.room_frame and "room_frame" not in meta:
+                meta["room_frame"] = self.room_frame
+            meta["duration_seconds"] = round(max(dur, meta.get("duration_seconds", 0)), 2)
+            entry = dict(self.stream_meta)        # calibration + extrinsics
+            entry.update({"path": f"{self.cam}.mp4",
+                          "start_time": self.started.isoformat(),
+                          "frame_count": self.frames,
+                          "people_frames": self.people_frames})
+            meta.setdefault("streams", {})[self.cam] = entry
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(meta, indent=2))
+            tmp.replace(path)
+
+    def stats(self):
+        return {"kept": self.kept, "dropped": self.dropped,
+                "frames": self.frames, "peopleFrames": self.people_frames,
+                "segment": self.dir.parent.parent.name if self.dir else None}
+
+
+_SEG_META_LOCK = threading.Lock()
+
+
 # COCO-17 skeleton edges (for drawing) + a color per limb group.
 SKELETON = [
     (5, 7), (7, 9), (6, 8), (8, 10),          # arms
@@ -187,11 +367,18 @@ def saved_root() -> Path:
     return Path(os.environ.get("SMARTROOM_SAVE_DIR") or (PROJECT_ROOT / "recordings"))
 
 
-def find_calib_clip(cam_key: str) -> Path | None:
-    """Newest uploaded <cam_key>.mp4 whose sibling metadata.json has extrinsics."""
+def find_calib_clips(cam_key: str) -> list:
+    """Uploaded <cam_key>.mp4 clips with calibration+extrinsics, newest first.
+
+    Returns every candidate, not just the newest: a clip can carry calibration
+    yet still fail load_room_geometry (e.g. a recorded segment with no
+    room_frame/tag height), and picking only the newest made startup fail
+    outright instead of falling back to a usable one.
+    """
     root = saved_root()
+    out = []
     if not root.exists():
-        return None
+        return out
     clips = sorted(root.rglob(f"{cam_key}.mp4"),
                    key=lambda p: p.stat().st_mtime, reverse=True)
     for mp4 in clips:
@@ -204,10 +391,10 @@ def find_calib_clip(cam_key: str) -> Path | None:
             streams = json.loads(md.read_text()).get("streams", {})
             entry = streams.get(mp4.stem, {})
             if entry.get("calibration") and entry.get("extrinsics"):
-                return mp4
+                out.append(mp4)
         except (OSError, ValueError):
             continue
-    return None
+    return out
 
 
 def _resize_short(w, h, short):
@@ -656,7 +843,8 @@ class JumpDetector:
 
 def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool,
                mode: str, cam_key: str = "", tslog: "TimestampLog | None" = None,
-               ids: "IdentityRegistry | None" = None):
+               ids: "IdentityRegistry | None" = None,
+               recorder: "SegmentRecorder | None" = None):
     from ultralytics import YOLO
     model = YOLO(weights)
     tracker = _make_bytetrack()
@@ -825,6 +1013,9 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         if ava:
             shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
 
+        if recorder is not None:
+            # archive the ORIGINAL jpeg (no re-encode) with this frame's verdict
+            recorder.add(jpeg, hw_ts, bool(positions))
         if tslog is not None:
             tslog.write(hw_ts, len(positions))
 
@@ -1118,7 +1309,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                     per_cam[key] = {"fps": sh.fps, "updatedMs": sh.updated_ms,
                                     "hwTimestampMs": round(sh.hw_ts, 3),
                                     "persons": len(sh.positions),
-                                    "roomFrame": e["roomFrame"]}
+                                    "roomFrame": e["roomFrame"],
+                                    "recording": (e["recorder"].stats()
+                                                  if e.get("recorder") else None)}
             first = cams[default_cam]["shared"]
             body = json.dumps({
                 "positions": merged,
@@ -1284,14 +1477,19 @@ def main():
     ids = IdentityRegistry()      # SHARED by every camera -> one id per person
     cams = {}
     for cam_key in [c.strip() for c in args.cam.split(",") if c.strip()]:
-        clip = Path(args.clip) if (args.clip and len(cams) == 0) else find_calib_clip(cam_key)
-        if clip is None or not clip.exists():
-            print(f"[live] SKIP {cam_key}: no uploaded recording with calibration "
-                  f"under {saved_root()}", file=sys.stderr)
-            continue
-        geom = load_room_geometry(clip, args.width, args.height, undistorted=False)
+        candidates = ([Path(args.clip)] if (args.clip and len(cams) == 0)
+                      else find_calib_clips(cam_key))
+        clip = geom = None
+        for cand in candidates:
+            if not cand.exists():
+                continue
+            g = load_room_geometry(cand, args.width, args.height, undistorted=False)
+            if g is not None:
+                clip, geom = cand, g
+                break
         if geom is None:
-            print(f"[live] SKIP {cam_key}: {clip} has no room geometry (extrinsics)",
+            print(f"[live] SKIP {cam_key}: no recording with usable room geometry "
+                  f"under {saved_root()} ({len(candidates)} candidate(s) tried)",
                   file=sys.stderr)
             continue
         room_frame = {
@@ -1301,14 +1499,28 @@ def main():
             "cameraId": geom.get("camera_id"),
             "calibClip": str(clip.relative_to(saved_root())),
         }
+        # reuse the calibration/extrinsics from the clip we took geom from, so
+        # recorded segments are themselves calibrated (and analysable later).
+        stream_meta = {}
+        try:
+            src_meta = json.loads((clip.parent / "metadata.json").read_text())
+            e = (src_meta.get("streams") or {}).get(cam_key) or {}
+            stream_meta = {k: e[k] for k in ("calibration", "extrinsics") if k in e}
+            node_name = src_meta.get("node") or "smartroom2"
+            room_frame_meta = src_meta.get("room_frame")
+        except (OSError, ValueError):
+            node_name, room_frame_meta = "smartroom2", None
+        recorder = (SegmentRecorder(cam_key, saved_root(), stream_meta, node_name,
+                                    room_frame_meta) if SEGMENT_ON else None)
         shared = Shared()
-        cams[cam_key] = {"shared": shared, "roomFrame": room_frame, "geom": geom}
+        cams[cam_key] = {"shared": shared, "roomFrame": room_frame, "geom": geom,
+                         "recorder": recorder}
         print(f"[live] {cam_key}: geom from {clip}  "
               f"cam_pos_mm={room_frame['cameraPositionMm']}", flush=True)
         threading.Thread(
             target=infer_loop,
             args=(shared, geom, weights, device, args.flip, mode, cam_key,
-                  TimestampLog(cam_key, session), ids),
+                  TimestampLog(cam_key, session), ids, recorder),
             daemon=True).start()
     if not cams:
         print("[live] FATAL: no usable cameras", file=sys.stderr)
@@ -1344,8 +1556,8 @@ def main():
                              daemon=True).start()
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
-    print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}",
-          flush=True)
+    print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}  "
+          f"segments={'on (%gs)' % SEGMENT_S if SEGMENT_ON else 'off'}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
