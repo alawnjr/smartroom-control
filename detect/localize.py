@@ -45,7 +45,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from calib_utils import (ANKLE_JOINT_HEIGHT_MM, MAX_FLOOR_RANGE_MM,  # noqa: E402
                          load_room_geometry, pixel_to_floor, stream_entry)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3   # v3: per-person `joints` (full 3D skeleton from depth)
 MODEL_KEY = "geo"
 KEYPOINTS_MODEL = "yolo26n-pose"
 ROOM_KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
@@ -53,11 +53,20 @@ ROOM_KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
 # COCO-17 joint indices
 L_HIP, R_HIP = 11, 12
 L_ANKLE, R_ANKLE = 15, 16
+# Trunk joints (shoulders + hips): the body's core, least likely to be all
+# occluded at once, and the depths that best define its true range.
+TRUNK = (5, 6, 11, 12)
+N_KPTS = 17
 
 DEPTH_PATCH = 3            # half-size: (2*3+1)^2 = 7x7 median patch
 HW_PAIR_MAX_MS = 50.0      # color<->depth hw-timestamp pairing tolerance
 PERSON_HEIGHT_MIN_MM = -200.0   # sanity band for the mid-hip point's room height
 PERSON_HEIGHT_MAX_MM = 2200.0
+# A joint whose depth is more than this NEARER than the body's median range is
+# reading an occluder in front of the person, not the person — half a body
+# thickness plus slack. Used both to find the robust range and to reject a
+# joint's own depth in favour of the billboard fallback.
+BODY_DEPTH_TOL_MM = 450.0
 TRACK_GATE_MM_PER_S = 4000.0    # association gate grows with the sample gap
 TRACK_GATE_MIN_MM = 500.0
 TRACK_DEAD_S = 1.0
@@ -179,18 +188,83 @@ def depth_at(depth, u, v, depth_scale_m):
 
 # ------------------------------------------------------------ geometry ---
 
-def backproject_room(u, v, z_mm, geom):
-    """Depth pixel -> room-frame point. Returns (x,y,z) mm or None."""
-    pt = np.array([[[float(u), float(v)]]], dtype=np.float64)
+def _ray_room(u, v, geom):
+    """Unit-ish camera ray for pixel (u,v), in room-frame direction."""
     import cv2
+    pt = np.array([[[float(u), float(v)]]], dtype=np.float64)
     n = cv2.undistortPoints(pt, geom["K"], geom["dist"]).reshape(2)
-    p_cam = z_mm * np.array([n[0], n[1], 1.0])
-    p_room = geom["R"] @ p_cam + geom["cam_pos_mm"]
+    return geom["R"] @ np.array([n[0], n[1], 1.0])
+
+
+def backproject_cam(u, v, z_mm, geom):
+    """Depth pixel + range -> room-frame point (mm), no sanity band. The range
+    is along the camera's optical (Z) axis, matching how RealSense reports it."""
+    d = _ray_room(u, v, geom)               # d[2 in cam] == 1 before rotation
+    # d was built from [nx, ny, 1]; scaling by z_mm puts the point at optical
+    # depth z_mm, then rotate+translate is already folded into d and cam_pos.
+    return z_mm * d + geom["cam_pos_mm"]
+
+
+def backproject_room(u, v, z_mm, geom):
+    """Depth pixel -> room-frame point within the plausible person-height band,
+    or None. Used for the footprint anchor (not per joint)."""
+    p_room = backproject_cam(u, v, z_mm, geom)
     if not (PERSON_HEIGHT_MIN_MM <= p_room[1] <= PERSON_HEIGHT_MAX_MM):
         return None
-    if float(np.linalg.norm(p_cam)) > MAX_FLOOR_RANGE_MM:
+    if z_mm > MAX_FLOOR_RANGE_MM:
         return None
     return p_room
+
+
+def billboard_joint(u, v, geom, anchor_room):
+    """Room point where the joint's ray meets the vertical plane through
+    `anchor_room` (normal = horizontal camera->anchor). The occlusion-robust
+    fallback for a joint with no trustworthy depth: it keeps the joint at the
+    body's measured RANGE instead of collapsing it toward a nearer occluder."""
+    cam = geom["cam_pos_mm"]
+    horiz = np.array([anchor_room[0] - cam[0], 0.0, anchor_room[2] - cam[2]])
+    ln = float(np.linalg.norm(horiz))
+    if ln < 1e-6:
+        return None
+    nrm = horiz / ln
+    d = _ray_room(u, v, geom)
+    den = float(d @ nrm)
+    if abs(den) < 1e-9:
+        return None
+    s = float((anchor_room - cam) @ nrm) / den
+    if s <= 0:
+        return None
+    return cam + s * d
+
+
+def joint_depths(person, dframe, depth_scale, width, height):
+    """{joint idx: optical range mm} for every confident joint with valid depth."""
+    out = {}
+    for i in range(N_KPTS):
+        px = joint_px(person, i, width, height)
+        if px is None:
+            continue
+        z = depth_at(dframe, px[0], px[1], depth_scale)
+        if z:
+            out[i] = z
+    return out
+
+
+def robust_body_range(zj):
+    """The body's true optical range (mm) from its joint depths, rejecting
+    joints that read an occluder in front of it, or None when too few land.
+
+    Prefers the trunk (shoulders+hips); a person's core is rarely all occluded
+    and its depth is the cleanest. Takes the median, drops anything more than a
+    body-thickness off it, and re-medians — so a single hip reading a desk edge
+    can't drag the range toward the camera."""
+    trunk = [zj[i] for i in TRUNK if i in zj]
+    pool = trunk if len(trunk) >= 2 else list(zj.values())
+    if not pool:
+        return None
+    med = float(np.median(pool))
+    inliers = [z for z in pool if abs(z - med) <= BODY_DEPTH_TOL_MM]
+    return float(np.median(inliers)) if inliers else med
 
 
 def joint_px(person, idx, width, height):
@@ -385,27 +459,56 @@ def process_clip(mp4: Path) -> bool:
         for person in fr.get("persons") or []:
             hip = hip_point(person, width, height)
             ank = ground_point(person, width, height)
-            pos = src = None
-            if dframe is not None and hip is not None:
-                z_mm = depth_at(dframe, hip[0], hip[1], depth[2])
-                if z_mm:
-                    p_room = backproject_room(hip[0], hip[1], z_mm, geom)
-                    if p_room is not None:
-                        pos, src = (float(p_room[0]), float(p_room[2])), "depth-hip"
+            zj = (joint_depths(person, dframe, depth[2], width, height)
+                  if dframe is not None else {})
+            rng = robust_body_range(zj)
+
+            # Anchor: the body's ground point. First choice is the robust
+            # depth range along the mid-hip ray (true distance, occlusion-proof);
+            # otherwise the ankle floor-ray. Everything hangs off this, so a bad
+            # anchor is what used to shrink an occluded person to a dot.
+            pos = src = anchor_room = None
+            if rng is not None and hip is not None:
+                a = backproject_room(hip[0], hip[1], rng, geom)
+                if a is not None:
+                    anchor_room, pos, src = a, (float(a[0]), float(a[2])), "depth-body"
             if pos is None and ank is not None:
                 hit = pixel_to_floor(ank[0], ank[1], geom, ANKLE_JOINT_HEIGHT_MM)
                 if hit is not None:
+                    anchor_room = np.array([hit[0], ANKLE_JOINT_HEIGHT_MM, hit[1]])
                     pos, src = hit, "ray-ankles"
             if pos is None:
                 continue
+
+            # Full 3D skeleton: each confident joint gets its OWN depth when that
+            # depth is consistent with the body's range, and a billboard point at
+            # the body range when it's occluded, missing, or reading an occluder.
+            joints3d = [None] * N_KPTS
+            n_joint_depth = 0
+            for i in range(N_KPTS):
+                jp = joint_px(person, i, width, height)
+                if jp is None:
+                    continue
+                z = zj.get(i)
+                if z is not None and rng is not None and abs(z - rng) <= BODY_DEPTH_TOL_MM:
+                    p = backproject_cam(jp[0], jp[1], z, geom)
+                    n_joint_depth += 1
+                else:
+                    p = billboard_joint(jp[0], jp[1], geom, anchor_room)
+                if p is not None:
+                    joints3d[i] = [round(float(p[0]), 1), round(float(p[1]), 1),
+                                   round(float(p[2]), 1)]
+
             px = hip or ank
             found.append((pos, {
                 "t": round(t, 3),
                 "x": round(px[0], 1), "y": round(px[1], 1),
                 "room": [round(pos[0], 1), round(pos[1], 1)],
                 "src": src,
+                "joints": joints3d,           # 17 x [x,y,z] mm (room frame) or null
+                "jointsWithDepth": n_joint_depth,
             }))
-            if src == "depth-hip":
+            if src == "depth-body":
                 n_depth += 1
             else:
                 n_ray += 1
