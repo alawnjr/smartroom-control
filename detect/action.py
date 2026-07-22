@@ -574,7 +574,16 @@ def needs_action(mp4: Path, force: bool, key: str) -> bool:
     if force:
         return True
     json_path, _, annotated = sidecars(mp4, key)
-    if not json_path.exists() or not annotated.exists():
+    # The annotated mp4 only counts as missing work when we were asked to make
+    # one. Without the ANNOTATE guard (which detect.py's needs_processing has
+    # had all along) this test could never be satisfied under
+    # SMARTROOM_DETECT_ANNOTATE=0, which is how the analyze service runs: the
+    # file is never written, so every clip looked unfinished forever. Observed
+    # as "action[ava]: 62/62 clip(s) to process" on every single trigger while
+    # yolo26m and yolo26n-pose correctly reported 4/62 — a full ~25min re-run of
+    # the entire corpus each time, so with a new segment landing every 90s the
+    # newest clips never reached the front of the queue and never got labels.
+    if not json_path.exists() or (ANNOTATE and not annotated.exists()):
         return True
     try:
         data = json.loads(json_path.read_text())
@@ -583,6 +592,24 @@ def needs_action(mp4: Path, force: bool, key: str) -> bool:
     if data.get("status") != "done":
         return True
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
+
+
+_AVA_DET = None
+
+
+def _ava_detector():
+    """The process-wide SlowFast-AVA detector, built on first use.
+
+    Cached because it was previously constructed per clip: one run logged 185
+    "Loads checkpoint ... slowfast_ava.pth" lines for 185 clips. The weights are
+    identical every time and the model is stateless across clips, so the reload
+    bought nothing.
+    """
+    global _AVA_DET
+    if _AVA_DET is None:
+        from ava_model import AvaDetector
+        _AVA_DET = AvaDetector(device=DEVICE)
+    return _AVA_DET
 
 
 def _ava_pass(src, framedata, boxes_by_frame, width, height, native_fps,
@@ -598,9 +625,9 @@ def _ava_pass(src, framedata, boxes_by_frame, width, height, native_fps,
     overlay and dashboard view is unchanged."""
     import cv2
 
-    from ava_model import AvaDetector, resize_short
+    from ava_model import resize_short
 
-    det = AvaDetector(device=DEVICE)
+    det = _ava_detector()
     nw, nh = resize_short(width, height)
     rx, ry = nw / width, nh / height
     span = max(AVA_MIN_FRAMES, int(round(AVA_SPAN_S * native_fps)))
