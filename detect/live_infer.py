@@ -187,7 +187,12 @@ SEGMENT_MIN_PEOPLE_FRAMES = int(os.environ.get("SMARTROOM_SEGMENT_MIN_FRAMES", "
 # queued behind a 190%-CPU process). NVENC is effectively free here.
 SEGMENT_ENCODER = os.environ.get("SMARTROOM_SEGMENT_ENCODER", "h264_nvenc")
 # Consecutive pose-predict failures before we give up and let systemd restart us.
-PREDICT_FAIL_LIMIT = int(os.environ.get("SMARTROOM_PREDICT_FAIL_LIMIT", "60"))
+# Two failure modes are real here: a TRANSIENT burst of CUDA "misaligned address"
+# around startup that clears itself (~100 observed, then clean), and a STUCK one
+# where the context is poisoned and every later kernel fails forever (10.5M
+# errors over hours). The limit has to sit above the transient burst so a normal
+# start isn't restarted, and far below "forever".
+PREDICT_FAIL_LIMIT = int(os.environ.get("SMARTROOM_PREDICT_FAIL_LIMIT", "300"))
 
 
 def _day_dir(root: Path, when: dt.datetime) -> Path:
@@ -878,7 +883,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             res = model.predict(frame, imgsz=640, device=device, half=use_half,
                                 classes=[0], verbose=False)[0].cpu()
         except Exception as exc:  # noqa: BLE001
-            print(f"[live] predict error: {exc}", flush=True)
+            print(f"[live] {cam_key}: predict error: {exc}", flush=True)
             # A CUDA fault ("misaligned address") poisons the whole context: every
             # later kernel fails the same way, so the service stays *active* while
             # silently producing zero detections. Bail out and let systemd give us
