@@ -246,10 +246,11 @@ class SegmentRecorder:
     """
 
     def __init__(self, cam_key: str, root: Path, stream_meta: dict, node: str,
-                 room_frame: dict | None = None):
+                 room_frame: dict | None = None, geom: dict | None = None):
         self.cam, self.root, self.node = cam_key, root, node
         self.stream_meta = stream_meta or {}
         self.room_frame = room_frame
+        self.geom = geom or {}
         self.q = deque()
         self.cond = threading.Condition()
         self.proc = None
@@ -259,13 +260,19 @@ class SegmentRecorder:
         self.people_frames = 0
         self.started = None
         self.rows = []           # (frame_no, hw_ts)
+        self.geo_rows = []       # (frame_no, [{id, px, room, src}]) — depth-measured
         self.kept = self.dropped = 0
         threading.Thread(target=self._run, daemon=True).start()
 
-    def add(self, jpeg: bytes, hw_ts: float, has_people: bool):
+    def add(self, jpeg: bytes, hw_ts: float, positions):
+        """positions: this frame's people as [{id, px:[u,v], room:[x,z], src}] —
+        the depth-measured room positions the live map already computed. Saving
+        them makes an RGB-only segment as localizable as a depth recording; the
+        offline pass can't (no depth) and would otherwise floor-ray it into the
+        walls."""
         with self.cond:
             if len(self.q) < 240:          # ~8s at 30fps; never block inference
-                self.q.append((jpeg, hw_ts, has_people))
+                self.q.append((jpeg, hw_ts, positions))
                 self.cond.notify()
 
     def _run(self):
@@ -276,7 +283,7 @@ class SegmentRecorder:
                     if not self.q and self.proc and time.time() // SEGMENT_S != self.idx:
                         self._rotate(int(time.time() // SEGMENT_S))
                 item = self.q.popleft()
-            jpeg, hw_ts, people = item
+            jpeg, hw_ts, positions = item
             idx = int(time.time() // SEGMENT_S)
             if self.proc is None or idx != self.idx:
                 self._rotate(idx)
@@ -284,8 +291,9 @@ class SegmentRecorder:
                 self.proc.stdin.write(jpeg)
                 self.frames += 1
                 self.rows.append((self.frames, hw_ts))
-                if people:
+                if positions:
                     self.people_frames += 1
+                    self.geo_rows.append((self.frames, positions))
             except (BrokenPipeError, OSError) as exc:
                 print(f"[live] {self.cam}: segment write failed: {exc}", flush=True)
                 self.proc = None
@@ -293,6 +301,7 @@ class SegmentRecorder:
     def _rotate(self, idx: int):
         self._close()
         self.idx, self.frames, self.people_frames, self.rows = idx, 0, 0, []
+        self.geo_rows = []
         # Name the segment after the wall-clock BOUNDARY, not the instant we
         # happened to rotate. The two cameras rotate a fraction of a second
         # apart, and datetime.now() straddling a second boundary produced
@@ -351,6 +360,7 @@ class SegmentRecorder:
             for n, ts in self.rows:
                 fh.write(f"{n},{ts:.3f}\n")
         self._write_metadata(dur)
+        self._write_geo()
         self.kept += 1
         # Trigger the analysis pass (smartroom-analyze.path watches this
         # sentinel). It was only ever touched by the Pi's uploader, so segments
@@ -392,6 +402,54 @@ class SegmentRecorder:
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(meta, indent=2))
             tmp.replace(path)
+
+    def _write_geo(self):
+        """Emit the depth-measured room positions as the geo sidecars the mirror
+        and LAN API read — the SAME schema localize.py produces (per-person
+        {t, x, y (anchor pixel), room:[x,z], src}). Flagged `live` so the offline
+        localize pass leaves it alone (it has no depth to do better)."""
+        gi = self.geom
+        if gi.get("cam_pos_mm") is None:
+            return
+        persons: dict = {}
+        for frame_no, poslist in self.geo_rows:
+            t = round(frame_no / 30.0, 3)
+            for e in poslist:
+                persons.setdefault(str(e["id"]), []).append({
+                    "t": t,
+                    "x": round(float(e["px"][0]), 1), "y": round(float(e["px"][1]), 1),
+                    "room": [round(float(e["room"][0]), 1), round(float(e["room"][1]), 1)],
+                    "src": e["src"],
+                })
+        stem = self.cam
+        mp4 = self.dir / f"{stem}.mp4"
+        try:
+            mtime_ms = mp4.stat().st_mtime * 1000
+        except OSError:
+            mtime_ms = 0
+        cam_pos = [round(float(v), 1) for v in gi.get("cam_pos_mm", [])]
+        room_frame = {
+            "origin": "floor point directly under the AprilTag's center",
+            "axes": "X = tag's right (viewed facing the tag), Z = out of the wall; mm",
+            "tagId": gi.get("tag_id"), "tagHeightMm": gi.get("tag_height_mm"),
+            "cameraPositionMm": cam_pos, "cameraId": gi.get("camera_id"),
+        }
+        common = {"schemaVersion": 3, "model": "geo", "source": f"{stem}.mp4",
+                  "sourceMtimeMs": mtime_ms, "live": True}
+
+        def _atomic(path: Path, data: dict):
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            tmp.replace(path)
+
+        try:
+            _atomic(self.dir / f"{stem}.centroids.geo.json",
+                    {**common, "nativeFps": 30.0, "persons": persons, "roomFrame": room_frame})
+            _atomic(self.dir / f"{stem}.detections.geo.json",
+                    {**common, "status": "done", "framesAnalyzed": self.frames,
+                     "durationSec": round(self.frames / 30.0, 2), "tracks": len(persons)})
+        except OSError as exc:
+            print(f"[live] {self.cam}: cannot write geo sidecar: {exc}", flush=True)
 
     def stats(self):
         return {"kept": self.kept, "dropped": self.dropped,
@@ -1094,8 +1152,14 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
 
         if recorder is not None:
-            # archive the ORIGINAL jpeg (no re-encode) with this frame's verdict
-            recorder.add(jpeg, hw_ts, bool(positions))
+            # archive the ORIGINAL jpeg (no re-encode) with this frame's
+            # depth-measured room positions, so the segment is localizable
+            # offline without a depth track. marker = the anchor pixel that was
+            # depth-ranged; pos = its room (x,z).
+            geo_frame = [{"id": tid, "px": [float(marker[0]), float(marker[1])],
+                          "room": [float(pos[0]), float(pos[1])], "src": src}
+                         for tid, pos, marker, p, src in found]
+            recorder.add(jpeg, hw_ts, geo_frame)
         if tslog is not None:
             tslog.write(hw_ts, len(positions))
 
@@ -1765,7 +1829,7 @@ def main():
         except (OSError, ValueError):
             node_name, room_frame_meta = "smartroom2", None
         recorder = (SegmentRecorder(cam_key, saved_root(), stream_meta, node_name,
-                                    room_frame_meta) if SEGMENT_ON else None)
+                                    room_frame_meta, geom=geom) if SEGMENT_ON else None)
         shared = Shared()
         cams[cam_key] = {"shared": shared, "roomFrame": room_frame, "geom": geom,
                          "recorder": recorder}

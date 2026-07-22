@@ -98,7 +98,23 @@ def sidecar_paths(mp4: Path):
             mp4.parent / f"{stem}.centroids.{MODEL_KEY}.json")
 
 
+def is_live_geo(mp4: Path) -> bool:
+    """True when the geo sidecar was written live by the segment recorder from
+    real depth. That is the best this clip can get — it has no depth track for
+    the offline pass to use — so we must never overwrite it with a floor-ray
+    guess."""
+    _, centroids_path = sidecar_paths(mp4)
+    try:
+        return bool(json.loads(centroids_path.read_text()).get("live"))
+    except (OSError, ValueError):
+        return False
+
+
 def needs_processing(mp4: Path, force: bool) -> bool:
+    # Never clobber a live, depth-measured geo sidecar — not even on --force;
+    # there is no depth track here to do better, only worse.
+    if is_live_geo(mp4):
+        return False
     if force:
         return True
     status_path, centroids_path = sidecar_paths(mp4)
