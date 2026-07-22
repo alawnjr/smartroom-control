@@ -12,6 +12,7 @@ Config (env): SMARTROOM_AVA_CONFIG, SMARTROOM_AVA_CKPT, SMARTROOM_AVA_LABELS,
 SMARTROOM_AVA_THR, SMARTROOM_AVA_BLACKLIST.
 """
 
+import contextlib
 import os
 import threading
 from pathlib import Path
@@ -60,6 +61,33 @@ def default_paths():
     return cfg, ckpt, labels
 
 
+@contextlib.contextmanager
+def _on_device(device):
+    """Make `device` the calling thread's CURRENT cuda device for the block.
+
+    Putting tensors on a device is not the same as making it current. cuDNN and
+    cuBLAS handles are cached per device but acquired against whatever device
+    the *thread* currently has selected, which defaults to cuda:0 for every new
+    thread. Running a model that lives on cuda:2 from a thread still pointed at
+    cuda:0 therefore hands cuDNN a handle from the wrong device — reported as
+    CUDNN_STATUS_MAPPING_ERROR — and corrupts cuda:0's context in the process.
+    That is not a local failure: every later kernel on cuda:0 dies with "CUDA
+    error: misaligned address", including the pose model of an unrelated
+    camera, and a poisoned context never recovers. It is what took the live
+    service down.
+    """
+    try:
+        import torch
+    except Exception:  # noqa: BLE001
+        yield
+        return
+    if not isinstance(device, str) or not device.startswith("cuda"):
+        yield
+        return
+    with torch.cuda.device(torch.device(device)):
+        yield
+
+
 class AvaDetector:
     """A loaded SlowFast-AVA model. Build once, call `infer` per clip window."""
 
@@ -80,7 +108,9 @@ class AvaDetector:
         ckpt = ckpt or d_ckpt
         label_map_path = label_map_path or d_lm
 
-        with _BUILD_LOCK:
+        # Everything below must run with THIS device current, not just with the
+        # tensors on it — see the note on `infer`.
+        with _BUILD_LOCK, _on_device(device):
             cfg = mmengine.Config.fromfile(config_path)
             # equal bbox count across classes (as the demo does); test_cfg.rcnn
             # may be None in the config, so build the dict rather than index it.
@@ -135,7 +165,7 @@ class AvaDetector:
         ds = ActionDataSample()
         ds.proposals = InstanceData(bboxes=prop)
         ds.set_metainfo(dict(img_shape=(nh, nw)))
-        with torch.no_grad():
+        with torch.no_grad(), _on_device(self.device):
             res = self.model(inp, [ds], mode="predict")
         scores = res[0].pred_instances.scores    # (num_proposals, num_classes)
 

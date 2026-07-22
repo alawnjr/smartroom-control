@@ -886,6 +886,17 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                   flush=True)
     frame_n = 0
     use_half = device not in ("cpu", "intel:cpu")
+    if use_half:
+        # Pin THIS thread's current cuda device to the one its models live on.
+        # A new thread always starts pointed at cuda:0 no matter where its
+        # tensors are, and the mismatch corrupts the context — see _on_device()
+        # in ava_model.py for the full mechanism.
+        try:
+            import torch
+            torch.cuda.set_device(int(device))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] {cam_key}: cannot pin cuda device {device}: {exc}",
+                  flush=True)
     last_id = 0
     ema_fps = 0.0
     predict_fails = 0
@@ -1120,6 +1131,13 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
     keypoints — the skeletons are still drawn, they just don't drive the label."""
     from ava_model import AvaDetector
 
+    if device.startswith("cuda"):
+        # same reason as the pose loop: a fresh thread defaults to cuda:0
+        try:
+            import torch
+            torch.cuda.set_device(torch.device(device))
+        except Exception as exc:  # noqa: BLE001
+            print(f"[live] AVA: cannot pin cuda device {device}: {exc}", flush=True)
     det = AvaDetector(config_path, ckpt, label_map_path, device, action_thr)
     print(f"[live] AVA model loaded: {len(det.label_map)} classes, "
           f"clip_len={det.clip_len} span={AVA_SPAN_S}s thr={action_thr} "
