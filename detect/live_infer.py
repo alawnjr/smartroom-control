@@ -802,17 +802,41 @@ class IdentityRegistry:
 
 
 def _make_bytetrack():
-    """ByteTracker with ultralytics' default bytetrack.yaml params — the same
-    tracker model.track() builds, so ids are stable across frames (mirrors
-    action.py's _make_bytetrack). Image-space, so it dedupes overlapping person
-    boxes that fragmented the old greedy room-space assigner."""
+    """ByteTracker, tuned for a fixed camera watching a small room.
+
+    NOT ultralytics' stock bytetrack.yaml any more. Those defaults are set for
+    short benchmark clips with a moving camera, and measured here they were the
+    direct cause of identity flicker: the track-id counter advanced 284 in 40
+    seconds for 6 people (~7 new tracks/second), and ~276 global identities had
+    been minted for the same 6 humans. Every death of a ByteTrack track forces
+    the global registry to re-match that person by appearance, and the genuine
+    match distribution (p05 0.617 vs REID_THRESH 0.55) loses its tail — a failed
+    re-match mints a new identity, which is the flicker you see.
+
+    Two defaults did it, both fixed below. Note the global-ID layer was NOT at
+    fault: over the same 40s a global id changed under a stable track exactly
+    once.
+    """
     from types import SimpleNamespace
 
     from ultralytics.trackers.byte_tracker import BYTETracker
-    args = SimpleNamespace(track_high_thresh=0.25, track_low_thresh=0.1,
-                           new_track_thresh=0.25, track_buffer=30,
-                           match_thresh=0.8, fuse_score=True,
-                           gmc_method="sparseOptFlow")
+    args = SimpleNamespace(
+        # Stock 0.25 starts a track off almost any weak detection, which is
+        # where ~7 spurious tracks/second came from. A real person in this room
+        # detects far above this.
+        new_track_thresh=float(os.environ.get("SMARTROOM_NEW_TRACK_THRESH", "0.55")),
+        track_high_thresh=float(os.environ.get("SMARTROOM_TRACK_HIGH_THRESH", "0.4")),
+        track_low_thresh=0.1,
+        # Frames a lost track stays alive. Ultralytics scales this by
+        # frame_rate/30, so stock 30 = about ONE SECOND — shorter than any real
+        # occlusion in a room with furniture and people walking past each other.
+        # 90 gives ~3s, long enough to survive a pass-behind without being so
+        # long that a stale track gets handed to a different person.
+        track_buffer=int(os.environ.get("SMARTROOM_TRACK_BUFFER", "90")),
+        match_thresh=0.8, fuse_score=True)
+    # (No gmc_method: it is inert here. Only BOTSORT constructs self.gmc;
+    # BYTETracker checks hasattr(self, "gmc") and never sets it. The camera is
+    # bolted to the wall anyway.)
     return BYTETracker(args)
 
 
