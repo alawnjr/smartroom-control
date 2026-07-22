@@ -1226,20 +1226,6 @@ def _reid_worker(conn, model_path: str, device):
     """
     import cv2 as _cv2
     import numpy as _np
-    # ONNX Runtime sizes its intra-op pool to the machine's core count (36 here)
-    # and busy-waits between batches. It ignores OMP_NUM_THREADS in this build,
-    # and the pool is fixed at session creation so it cannot be resized after
-    # ultralytics has built it — measured at 506% and 246% CPU for the two
-    # encoders. Affinity is the one bound that works from outside. Each worker
-    # takes a different slice so the two do not fight over the same cores.
-    try:
-        n = int(os.environ.get("SMARTROOM_REID_CPUS", "4"))
-        cpus = sorted(os.sched_getaffinity(0))
-        if 0 < n < len(cpus):
-            k = os.getpid() % max(1, len(cpus) // n)
-            os.sched_setaffinity(0, set(cpus[k * n:(k + 1) * n]))
-    except (OSError, AttributeError, ValueError):
-        pass
     try:
         from ultralytics.trackers.utils.reid import ReID
         enc = ReID(model_path, device=device)
