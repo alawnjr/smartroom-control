@@ -31,10 +31,12 @@ Usage:
 
 import argparse
 import datetime as dt
+import faulthandler
 import json
 import os
 import re
 import shutil
+import signal
 import struct
 import subprocess
 import sys
@@ -193,6 +195,20 @@ SEGMENT_ENCODER = os.environ.get("SMARTROOM_SEGMENT_ENCODER", "h264_nvenc")
 # errors over hours). The limit has to sit above the transient burst so a normal
 # start isn't restarted, and far below "forever".
 PREDICT_FAIL_LIMIT = int(os.environ.get("SMARTROOM_PREDICT_FAIL_LIMIT", "300"))
+# Seconds a camera may go without producing an annotated frame *while the Pi is
+# still pushing frames at it* before we treat the process as wedged.
+#
+# PREDICT_FAIL_LIMIT above only catches the failure mode that RAISES. The one
+# that actually took the service down catches nothing: a CUDA call that never
+# returns. Both pose threads sat in state R burning 100% CPU for 8.5 hours,
+# GPU 0 pegged at 100% util with no progress, no exception, no log line — and
+# systemd happily reported `active` the whole time because the HTTP server and
+# the segment recorder were still ticking. A hang produces no error to count,
+# so the only possible detector is absence of PROGRESS, checked from outside
+# the wedged thread. A poisoned/hung CUDA context also cannot be recovered
+# in-process (there is no CUDA API to reset it from the faulting process), so
+# exiting for a fresh one is the fix, not a workaround.
+STALL_S = float(os.environ.get("SMARTROOM_STALL_S", "60"))
 
 
 def _day_dir(root: Path, when: dt.datetime) -> Path:
@@ -859,8 +875,11 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         try:
             with _MODEL_BUILD_LOCK:
                 from ultralytics.trackers.utils.reid import ReID
+                # follow THIS camera's GPU, not a hardcoded 0 — otherwise every
+                # camera's ReID piles back onto cuda:0 and undoes the split.
                 encoder = ReID(REID_MODEL,
-                               device=("cpu" if device in ("cpu", "intel:cpu") else 0))
+                               device=("cpu" if device in ("cpu", "intel:cpu")
+                                       else int(device)))
             print(f"[live] {cam_key}: ReID encoder {REID_MODEL} ready", flush=True)
         except Exception as exc:  # noqa: BLE001
             print(f"[live] {cam_key}: ReID unavailable ({exc}) — geometry only",
@@ -1129,6 +1148,53 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
             # multi-label: keep EVERY class above the threshold, not just top-1
             shared.set_label(tid, labs[0][0] if labs else None,
                              labs[0][1] if labs else 0.0, labs)
+
+
+def stall_watchdog(cams: dict):
+    """Exit the process when a camera stops producing frames although the Pi is
+    still feeding it.
+
+    Deliberately compares two counters rather than watching a clock: `in_id`
+    advances every time the ingest handler receives a frame from the Pi, and
+    `updated_ms` advances every time the pose loop finishes one. An idle Pi (or
+    a dropped uplink) freezes both and is NOT a stall — that is the Pi's problem
+    and restarting here would only hide it. Only ingest advancing while output
+    does not means *we* are stuck.
+
+    On detection it dumps every thread's Python stack before exiting, so the
+    hang leaves behind the one piece of evidence needed to fix it at source: a
+    wedged process is otherwise un-introspectable (`ptrace_scope=1` blocks
+    py-spy/gdb from another session, and /proc/<pid>/syscall reads back empty).
+    """
+    last_out = {k: -1 for k in cams}
+    last_in = {k: -1 for k in cams}
+    stalled_for = {k: 0.0 for k in cams}
+    period = 5.0
+    while True:
+        time.sleep(period)
+        for key, e in cams.items():
+            sh = e["shared"]
+            with sh.cond:
+                in_id, out_id = sh.in_id, sh.out_id
+            feeding = in_id != last_in[key]
+            producing = out_id != last_out[key]
+            last_in[key], last_out[key] = in_id, out_id
+            if producing or not feeding:
+                stalled_for[key] = 0.0
+                continue
+            stalled_for[key] += period
+            if stalled_for[key] < STALL_S:
+                continue
+            print(f"[live] WEDGED: {key} produced no frame in "
+                  f"{stalled_for[key]:.0f}s while ingest advanced to {in_id}. "
+                  f"Dumping all thread stacks, then exiting for a restart.",
+                  flush=True)
+            sys.stdout.flush()
+            faulthandler.dump_traceback(file=sys.stdout, all_threads=True)
+            sys.stdout.flush()
+            # _exit, not sys.exit: the wedged thread never returns, so a clean
+            # shutdown would block on it forever.
+            os._exit(3)
 
 
 def _draw_person(frame, px, conf, marker, tid, src, actions=None, label_id=None):
@@ -1429,15 +1495,22 @@ def main():
     if mode in ("none", "no", "0", ""):
         mode = "off"
 
+    # `kill -USR1 <pid>` dumps every thread's Python stack. The service is
+    # otherwise a black box once a thread wedges inside a native call.
+    faulthandler.register(signal.SIGUSR1, file=sys.stdout, all_threads=True)
+
     weights = os.environ.get("SMARTROOM_LIVE_WEIGHTS") or str(
         Path.home() / "Code/yolo-bench/yolo26n-pose.pt")
     device = os.environ.get("SMARTROOM_DETECT_DEVICE")
-    if not device:
+    ngpu = 0
+    if device not in ("cpu", "intel:cpu"):
         try:
             import torch
-            device = "0" if torch.cuda.is_available() else "cpu"
+            ngpu = torch.cuda.device_count()
         except Exception:  # noqa: BLE001
-            device = "cpu"
+            ngpu = 0
+    if not device:
+        device = "0" if ngpu else "cpu"
 
     # One entry per camera: its own Shared buffers, geom, pose thread and
     # timestamp log. They all share the tag-1 room frame, so /positions merges.
@@ -1483,11 +1556,19 @@ def main():
         shared = Shared()
         cams[cam_key] = {"shared": shared, "roomFrame": room_frame, "geom": geom,
                          "recorder": recorder}
+        # One GPU per camera. Everything used to share cuda:0 — two pose models,
+        # two ReID encoders and an AVA recognizer issuing kernels concurrently
+        # into ONE context — while GPUs 1 and 2 sat idle. A context is
+        # per-device, so splitting the cameras across devices means a hang on
+        # one camera's GPU can no longer stall the other's, and the pose models
+        # stop contending for the same streams.
+        cam_device = str((len(cams) - 1) % ngpu) if ngpu else device
         print(f"[live] {cam_key}: geom from {clip}  "
-              f"cam_pos_mm={room_frame['cameraPositionMm']}", flush=True)
+              f"cam_pos_mm={room_frame['cameraPositionMm']}  gpu={cam_device}",
+              flush=True)
         threading.Thread(
             target=infer_loop,
-            args=(shared, geom, weights, device, args.flip, mode, cam_key,
+            args=(shared, geom, weights, cam_device, args.flip, mode, cam_key,
                   TimestampLog(cam_key, session), ids, recorder),
             daemon=True).start()
     if not cams:
@@ -1503,17 +1584,12 @@ def main():
             Path.home() / "Code/yolo-bench/slowfast_ava.pth")
         lm = os.environ.get("SMARTROOM_AVA_LABELS") or str(
             Path(__file__).resolve().parent / "ava_label_map.txt")
-        # one recognizer per camera, spread over the available GPUs so a second
-        # camera doesn't contend with the first (or with the pose loop on 0).
-        ngpu = 0
-        if device not in ("cpu", "intel:cpu"):
-            try:
-                import torch
-                ngpu = torch.cuda.device_count()
-            except Exception:  # noqa: BLE001
-                ngpu = 0
+        # AVA goes on the LAST GPU, off the pose devices. Pose is the critical
+        # path (it drives /positions, the MJPEG and the segment recorder); AVA
+        # is best-effort. Keeping the heavy SlowFast forward out of the pose
+        # contexts means it cannot wedge them.
         for i, (cam_key, e) in enumerate(cams.items()):
-            adev = f"cuda:{i % ngpu}" if ngpu else "cpu"
+            adev = f"cuda:{ngpu - 1}" if ngpu else "cpu"
             threading.Thread(target=ava_loop,
                              args=(e["shared"], cfg, ckpt, lm, adev, AVA_THR),
                              daemon=True).start()
@@ -1522,6 +1598,8 @@ def main():
             threading.Thread(target=action_loop,
                              args=(e["shared"], args.width, args.height, mode),
                              daemon=True).start()
+
+    threading.Thread(target=stall_watchdog, args=(cams,), daemon=True).start()
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
     print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}  "
