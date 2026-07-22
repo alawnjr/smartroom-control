@@ -25,6 +25,25 @@ Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 # 3-minute segments; a segment needs this many frames containing people to be kept
 Environment=SMARTROOM_SEGMENT_S=180
 Environment=SMARTROOM_SEGMENT_MIN_FRAMES=15
+# Stop the CPU thread pools busy-waiting. ONNX Runtime (the ReID encoder, which
+# falls back to CPU here) and OpenMP both default to one worker per core — 36 on
+# this box — and both SPIN rather than sleep between batches. Measured: ~7
+# threads pinned near 74% each and 1724% total process CPU, ~17 of 36 cores, to
+# do 2x30fps of nano-model pose. The work itself is small-batch and single-image,
+# so wide pools buy nothing and only add scheduling noise on a shared machine.
+#
+# Note the deliberate choice NOT to fix this by installing onnxruntime-gpu: that
+# would load a THIRD compiled CUDA runtime into the pose process alongside
+# ultralytics/torchvision, which is the exact hazard that took this service down
+# (see the AVA worker split in detect/live_infer.py). CPU cycles are cheap here;
+# CUDA context corruption is not.
+Environment=OMP_NUM_THREADS=4
+Environment=OMP_WAIT_POLICY=PASSIVE
+Environment=MKL_NUM_THREADS=4
+# ...and stop ultralytics trying to pip-install onnxruntime-gpu on every start.
+# It cannot succeed (this venv has no pip) and it burns ~20s of startup in
+# retries before falling back to CPU anyway.
+Environment=YOLO_AUTOINSTALL=false
 Restart=always
 RestartSec=10
 # Model loading (two SlowFast + two pose + two ReID) takes a while; do not let
