@@ -290,6 +290,67 @@ def propagate_recording(meta_path, corrections, apply):
     return lines
 
 
+def load_authoritative(rec_meta_path):
+    """Per-camera extrinsics blocks + the room_frame from a reference recording,
+    keyed by camera serial. The reference should be a clip recorded straight
+    after a good calibration."""
+    meta = json.loads(Path(rec_meta_path).read_text())
+    by_serial = {}
+    for stream in meta.get("streams", {}).values():
+        ext = stream.get("extrinsics")
+        if ext and ext.get("camera_id"):
+            by_serial[ext["camera_id"]] = ext
+    return by_serial, meta.get("room_frame")
+
+
+def restamp_recording(meta_path, authoritative, room_frame, apply):
+    """Overwrite each stream's extrinsics with the current calibration for that
+    camera.
+
+    A bolted camera has ONE physical pose; the newest good calibration is the
+    best estimate of it for EVERY clip, whenever it was recorded. This is the
+    only fix for a camera whose own clips can't be re-levelled (the D435 sees
+    too little floor/ceiling) or for segments a stale live process wrote after a
+    re-level pass. Only touches clips whose embedded pose differs from the
+    authoritative one, and never downgrades a clip already stamped from the same
+    calibration epoch."""
+    meta = json.loads(meta_path.read_text())
+    lines, changed = [], False
+    for name, stream in meta.get("streams", {}).items():
+        ext = stream.get("extrinsics")
+        if not ext:
+            continue
+        serial = ext.get("camera_id")
+        good = authoritative.get(serial)
+        if good is None:
+            lines.append(f"    {name}: no authoritative calibration for {serial}")
+            continue
+        if ext.get("calibrated_at") == good.get("calibrated_at"):
+            continue                       # already the current calibration
+        old = [round(v) for v in ext.get("camera_position_mm", [])]
+        new = [round(v) for v in good.get("camera_position_mm", [])]
+        lines.append(f"    {name}: {old} -> {new}  (calib {(ext.get('calibrated_at') or '?')[:16]}"
+                     f" -> {(good.get('calibrated_at') or '?')[:16]})"
+                     + ("" if apply else "  [dry run]"))
+        if apply:
+            stream["extrinsics"] = json.loads(json.dumps(good))  # deep copy
+            changed = True
+    if changed and room_frame is not None and meta.get("room_frame") is not None:
+        # carry the measured level (tag tilt) too, but keep this clip's own
+        # tag_center_above_floor_mm — that is a physical fact, not a calibration
+        for key in ("level",):
+            if key in room_frame:
+                meta["room_frame"][key] = room_frame[key]
+    if changed:
+        backup = meta_path.with_suffix(".json.prestamp")
+        if not backup.exists():
+            shutil.copy2(meta_path, backup)
+        tmp = meta_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(meta, indent=2))
+        os.replace(tmp, meta_path)
+    return lines
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -300,6 +361,10 @@ def main():
                          "their camera's calibration epoch")
     ap.add_argument("--learn-from", nargs="*", default=None,
                     help="days to learn epoch corrections from (default: --days)")
+    ap.add_argument("--restamp-from", default=None, metavar="REC/metadata.json",
+                    help="overwrite every clip's extrinsics with the calibration embedded "
+                         "in this reference recording — for bolted cameras whose pose is "
+                         "fixed but whose old clips carry stale/un-levellable extrinsics")
     args = ap.parse_args()
 
     root = save_dir()
@@ -313,6 +378,23 @@ def main():
     if not metas:
         print(f"no recordings under {root} matching {args.days}", file=sys.stderr)
         return 1
+
+    if args.restamp_from:
+        authoritative, room_frame = load_authoritative(args.restamp_from)
+        for serial, ext in authoritative.items():
+            print(f"  authoritative: {serial} calibrated {(ext.get('calibrated_at') or '?')[:16]} "
+                  f"pos={[round(v) for v in ext.get('camera_position_mm', [])]}")
+        print(f"\nRestamping {len(metas)} recordings under {root}\n")
+        for meta_path in metas:
+            rec = meta_path.parent.parent.parent
+            lines = restamp_recording(meta_path, authoritative, room_frame, args.apply)
+            if lines:
+                print(f"  {rec.parent.name}/{rec.name}")
+                print("\n".join(lines))
+        if not args.apply:
+            print("\n(dry run — pass --apply to write, then rerun detect/localize.py --force)")
+        return 0
+
     print(f"{'Re-levelling' if args.apply else 'Checking'} {len(metas)} recordings under {root}\n")
 
     corrections = {}
