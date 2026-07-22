@@ -25,6 +25,9 @@ Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 # to 1 (or remove) if you want browser-playable boxes-burned-in videos back —
 # the encode now uses the GPU (NVENC), so it's much cheaper than before.
 Environment=SMARTROOM_DETECT_ANNOTATE=0
+# Action classification from RGB pixels (SlowFast-AVA), not skeletons — the same
+# model the live service runs. See detect/ava_model.py.
+Environment=SMARTROOM_ACTION_VARIANTS=ava
 WorkingDirectory=%h/smartroom-control
 ExecStart=%h/smartroom-control/run-analysis.sh
 # The runner exits nonzero if some clip/model failed; don't spam failed-state.

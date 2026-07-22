@@ -324,6 +324,16 @@ class SegmentRecorder:
                 fh.write(f"{n},{ts:.3f}\n")
         self._write_metadata(dur)
         self.kept += 1
+        # Trigger the analysis pass (smartroom-analyze.path watches this
+        # sentinel). It was only ever touched by the Pi's uploader, so segments
+        # written locally by this recorder were never analyzed — they had no
+        # pose, location or action sidecars at all. Touch it exactly as the
+        # uploader does: the path unit deliberately watches the sentinel rather
+        # than the recordings tree, so analysis output can't re-trigger itself.
+        try:
+            (self.root / ".last_upload").touch()
+        except OSError as exc:
+            print(f"[live] {self.cam}: cannot touch analysis sentinel: {exc}", flush=True)
         print(f"[live] {self.cam}: kept {rec_dir.name} "
               f"({self.frames} frames, {self.people_frames} with people)", flush=True)
 
