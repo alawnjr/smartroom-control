@@ -33,6 +33,7 @@ import argparse
 import datetime as dt
 import faulthandler
 import json
+import multiprocessing as mp
 import os
 import re
 import shutil
@@ -209,6 +210,10 @@ PREDICT_FAIL_LIMIT = int(os.environ.get("SMARTROOM_PREDICT_FAIL_LIMIT", "300"))
 # in-process (there is no CUDA API to reset it from the faulting process), so
 # exiting for a fresh one is the fix, not a workaround.
 STALL_S = float(os.environ.get("SMARTROOM_STALL_S", "60"))
+# How long to wait for the AVA worker process to answer one clip before giving
+# up on it and respawning. Generous: a forward is ~70ms, but the worker may be
+# serving the other camera and queueing behind a cold CUDA context.
+AVA_TIMEOUT_S = float(os.environ.get("SMARTROOM_AVA_TIMEOUT_S", "20"))
 
 
 def _day_dir(root: Path, when: dt.datetime) -> Path:
@@ -1123,25 +1128,104 @@ def action_loop(shared: Shared, width: int, height: int, variant_key: str):
         time.sleep(ACTION_SWEEP_S)
 
 
+def _ava_worker(conn, config_path: str, ckpt: str, label_map_path: str,
+                device: str, thr: float):
+    """Subprocess entry point: one SlowFast-AVA model answering infer requests.
+
+    AVA runs in its own process because mmaction/mmcv's compiled CUDA ops and
+    ultralytics/torchvision's cannot coexist in one. Measured on the quad
+    server, 180s each: AVA alone 2605 forwards / 0 failures; pose alone clean
+    over thousands of predicts at fp16 on real frames with real detections;
+    the two together in one process fail catastrophically — every pose predict
+    dead from iteration 26 with "CUDA error: misaligned address", preceded by
+    cuDNN CUDNN_STATUS_MAPPING_ERROR / _INTERNAL_ERROR from AVA. GPU layout is
+    irrelevant: splitting them across separate GPUs only delays it (iteration
+    4411 instead of 26) and a single shared GPU is the fastest to die. Nothing
+    inside one process avoids it, and a corrupted CUDA context never recovers,
+    which is how the service silently served zero people for 8.5 hours.
+
+    Requests are (jpegs, boxes); frames cross as JPEG rather than raw arrays —
+    ~15KB instead of ~350KB each, so a 32-frame clip is ~0.5MB per call
+    instead of 11MB.
+    """
+    import cv2 as _cv2
+    import numpy as _np
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from ava_model import AvaDetector
+    try:
+        det = AvaDetector(config_path, ckpt, label_map_path, device, thr)
+        conn.send(("ready", len(det.label_map)))
+    except Exception as exc:  # noqa: BLE001
+        conn.send(("fatal", str(exc)))
+        return
+    while True:
+        try:
+            msg = conn.recv()
+        except (EOFError, OSError):
+            return
+        if msg is None:
+            return
+        jpegs, boxes = msg
+        try:
+            frames = [_cv2.imdecode(_np.frombuffer(j, _np.uint8), _cv2.IMREAD_COLOR)
+                      for j in jpegs]
+            conn.send(("ok", det.infer([f for f in frames if f is not None], boxes)))
+        except Exception as exc:  # noqa: BLE001
+            conn.send(("error", str(exc)))
+
+
 def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
              device: str, action_thr: float):
     """SlowFast-AVA spatiotemporal detection: per prediction step, hand the
-    trailing RGB clip + the current person boxes to the shared AvaDetector and
+    trailing RGB clip + the current person boxes to the AVA worker PROCESS and
     publish each track's above-threshold labels. The model reads pixels, not
-    keypoints — the skeletons are still drawn, they just don't drive the label."""
-    from ava_model import AvaDetector
+    keypoints — the skeletons are still drawn, they just don't drive the label.
 
-    if device.startswith("cuda"):
-        # same reason as the pose loop: a fresh thread defaults to cuda:0
-        try:
-            import torch
-            torch.cuda.set_device(torch.device(device))
-        except Exception as exc:  # noqa: BLE001
-            print(f"[live] AVA: cannot pin cuda device {device}: {exc}", flush=True)
-    det = AvaDetector(config_path, ckpt, label_map_path, device, action_thr)
-    print(f"[live] AVA model loaded: {len(det.label_map)} classes, "
-          f"clip_len={det.clip_len} span={AVA_SPAN_S}s thr={action_thr} "
-          f"device={device}", flush=True)
+    This thread now only marshals; the model itself lives in `_ava_worker`,
+    see there for why."""
+    ctx = mp.get_context("spawn")
+    conn = proc = None
+
+    def start():
+        """(Re)spawn the worker. Returns False if it could not be brought up."""
+        nonlocal conn, proc
+        stop()
+        parent, child = ctx.Pipe()
+        p = ctx.Process(target=_ava_worker, daemon=True,
+                        args=(child, config_path, ckpt, label_map_path,
+                              device, action_thr))
+        p.start()
+        child.close()
+        # model build is slow (checkpoint load); wait, but not forever
+        if not parent.poll(300) :
+            print("[live] AVA worker did not become ready", flush=True)
+            p.kill()
+            parent.close()
+            return False
+        kind, payload = parent.recv()
+        if kind != "ready":
+            print(f"[live] AVA worker failed to load: {payload}", flush=True)
+            p.kill()
+            parent.close()
+            return False
+        conn, proc = parent, p
+        print(f"[live] AVA worker up (pid {p.pid}): {payload} classes, "
+              f"span={AVA_SPAN_S}s thr={action_thr} device={device}", flush=True)
+        return True
+
+    def stop():
+        nonlocal conn, proc
+        if conn is not None:
+            try:
+                conn.close()
+            except OSError:
+                pass
+        if proc is not None and proc.is_alive():
+            proc.kill()
+        conn = proc = None
+
+    while not start():
+        time.sleep(30)
 
     while True:
         time.sleep(AVA_PERIOD_S)
@@ -1157,12 +1241,29 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
         _, boxes, _ = seg[-1]              # proposals = the newest frame's people
         if not boxes:
             continue
-        try:
-            labels = det.infer([e[0] for e in seg], boxes)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[live] AVA infer error: {exc}", flush=True)
+        jpegs = []
+        for e in seg:
+            ok, enc = cv2.imencode(".jpg", e[0], [cv2.IMWRITE_JPEG_QUALITY, 90])
+            if ok:
+                jpegs.append(enc.tobytes())
+        if len(jpegs) < AVA_MIN_FRAMES:
             continue
-        for tid, labs in labels.items():
+        try:
+            conn.send((jpegs, boxes))
+            # A wedged worker must not wedge us too: give up on this clip and
+            # respawn rather than block the loop forever.
+            if not conn.poll(AVA_TIMEOUT_S):
+                raise TimeoutError(f"no reply in {AVA_TIMEOUT_S}s")
+            kind, payload = conn.recv()
+        except (OSError, EOFError, TimeoutError) as exc:
+            print(f"[live] AVA worker lost ({exc}) — respawning", flush=True)
+            while not start():
+                time.sleep(30)
+            continue
+        if kind != "ok":
+            print(f"[live] AVA infer error: {payload}", flush=True)
+            continue
+        for tid, labs in payload.items():
             # multi-label: keep EVERY class above the threshold, not just top-1
             shared.set_label(tid, labs[0][0] if labs else None,
                              labs[0][1] if labs else 0.0, labs)
@@ -1594,18 +1695,18 @@ def main():
         return 2
 
     if mode == "ava":
-        import mmaction
-        cfg = os.environ.get("SMARTROOM_AVA_CONFIG") or os.path.join(
-            os.path.dirname(mmaction.__file__), ".mim", "configs", "detection",
-            "slowfast", "slowfast_kinetics400-pretrained-r50_8xb8-8x8x1-20e_ava21-rgb.py")
+        # Deliberately NOT importing mmaction here to resolve the config path:
+        # this process must stay free of mmcv/mmaction entirely. The worker
+        # resolves its own defaults (ava_model.default_paths) inside its own
+        # interpreter, so None means "let the worker decide".
+        cfg = os.environ.get("SMARTROOM_AVA_CONFIG")
         ckpt = os.environ.get("SMARTROOM_AVA_CKPT") or str(
             Path.home() / "Code/yolo-bench/slowfast_ava.pth")
         lm = os.environ.get("SMARTROOM_AVA_LABELS") or str(
             Path(__file__).resolve().parent / "ava_label_map.txt")
         # AVA goes on the LAST GPU, off the pose devices. Pose is the critical
         # path (it drives /positions, the MJPEG and the segment recorder); AVA
-        # is best-effort. Keeping the heavy SlowFast forward out of the pose
-        # contexts means it cannot wedge them.
+        # is best-effort.
         for i, (cam_key, e) in enumerate(cams.items()):
             adev = f"cuda:{ngpu - 1}" if ngpu else "cpu"
             threading.Thread(target=ava_loop,
