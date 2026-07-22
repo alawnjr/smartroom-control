@@ -67,6 +67,15 @@ PERSON_HEIGHT_MAX_MM = 2200.0
 # thickness plus slack. Used both to find the robust range and to reject a
 # joint's own depth in favour of the billboard fallback.
 BODY_DEPTH_TOL_MM = 450.0
+# Ankle floor-ray fallback (used only when a clip has NO depth). It triangulates
+# a person's distance from where their ankle pixel meets the floor, which is
+# only trustworthy when the camera looks DOWN at the floor. Our cameras look
+# nearly horizontally down the room, so a distant ankle sits near the horizon
+# where the ray grazes the floor and pixel noise becomes metres — that flung
+# people through the walls. Disable the ray unless the camera is pitched down at
+# least this much, and never trust a hit farther than this from the camera.
+MIN_RAY_PITCH_DEG = 20.0
+MAX_RAY_REACH_MM = 5500.0
 TRACK_GATE_MM_PER_S = 4000.0    # association gate grows with the sample gap
 TRACK_GATE_MIN_MM = 500.0
 TRACK_DEAD_S = 1.0
@@ -409,6 +418,12 @@ def process_clip(mp4: Path) -> bool:
 
     native_fps = float(kp.get("nativeFps") or 30.0)
 
+    # Is this camera pitched down enough for the ankle floor-ray to mean anything?
+    # optical axis in the room frame; its downward angle below horizontal.
+    optical_axis = geom["R"] @ np.array([0.0, 0.0, 1.0])
+    pitch_down_deg = float(np.degrees(np.arcsin(np.clip(-optical_axis[1], -1.0, 1.0))))
+    ray_ok = pitch_down_deg >= MIN_RAY_PITCH_DEG
+
     # --- depth plumbing (None for camera_main / missing depth) ---
     depth = depth_stream_for(mp4)
     depth_frames = {}
@@ -446,7 +461,7 @@ def process_clip(mp4: Path) -> bool:
     tracks = Tracks()
     persons_out = {}
     n_samples = 0
-    n_depth = n_ray = 0
+    n_depth = n_ray = n_ray_rejected = 0
     for fr in kp["frames"]:
         t = float(fr["t"])
         n_samples += 1
@@ -472,11 +487,22 @@ def process_clip(mp4: Path) -> bool:
                 a = backproject_room(hip[0], hip[1], rng, geom)
                 if a is not None:
                     anchor_room, pos, src = a, (float(a[0]), float(a[2])), "depth-body"
-            if pos is None and ank is not None:
+            if pos is None and ank is not None and ray_ok:
                 hit = pixel_to_floor(ank[0], ank[1], geom, ANKLE_JOINT_HEIGHT_MM)
                 if hit is not None:
-                    anchor_room = np.array([hit[0], ANKLE_JOINT_HEIGHT_MM, hit[1]])
-                    pos, src = hit, "ray-ankles"
+                    # The ankle floor-ray is only trustworthy when the camera
+                    # actually looks DOWN at the floor. These cameras look nearly
+                    # horizontally, so a distant person's ankle sits near the
+                    # horizon where the ray grazes the floor and a 1px error
+                    # becomes metres — that's what flung people through the walls.
+                    # Reject a hit farther than a sane room radius from the camera.
+                    reach = float(np.hypot(hit[0] - geom["cam_pos_mm"][0],
+                                           hit[1] - geom["cam_pos_mm"][2]))
+                    if reach <= MAX_RAY_REACH_MM:
+                        anchor_room = np.array([hit[0], ANKLE_JOINT_HEIGHT_MM, hit[1]])
+                        pos, src = hit, "ray-ankles"
+                    else:
+                        n_ray_rejected += 1
             if pos is None:
                 continue
 
@@ -539,11 +565,15 @@ def process_clip(mp4: Path) -> bool:
         "source": mp4.name, "sourceMtimeMs": source_mtime_ms,
         "hasAnnotated": False,
         "framesAnalyzed": n_samples, "durationSec": round(duration, 2),
-        "samplesDepth": n_depth, "samplesRay": n_ray,
+        "samplesDepth": n_depth, "samplesRay": n_ray, "samplesRayRejected": n_ray_rejected,
+        "rayDisabled": not ray_ok, "cameraPitchDownDeg": round(pitch_down_deg, 1),
         "tracks": len(persons_out),
     })
+    ray_note = (f", ray OFF (camera pitch {pitch_down_deg:.0f}deg < {MIN_RAY_PITCH_DEG:.0f})"
+                if not ray_ok else
+                (f", {n_ray_rejected} ray samples rejected as out-of-room" if n_ray_rejected else ""))
     print(f"  {mp4.parent.parent.parent.name}/{mp4.parent.parent.name}/{mp4.name}: "
-          f"{len(persons_out)} track(s), {n_depth} depth / {n_ray} ray samples",
+          f"{len(persons_out)} track(s), {n_depth} depth / {n_ray} ray samples{ray_note}",
           file=sys.stderr)
     return True
 
