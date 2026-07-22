@@ -265,7 +265,12 @@ class SegmentRecorder:
     def _rotate(self, idx: int):
         self._close()
         self.idx, self.frames, self.people_frames, self.rows = idx, 0, 0, []
-        self.started = dt.datetime.now().astimezone()
+        # Name the segment after the wall-clock BOUNDARY, not the instant we
+        # happened to rotate. The two cameras rotate a fraction of a second
+        # apart, and datetime.now() straddling a second boundary produced
+        # rec_..._162530 and rec_..._162531 — one take per camera instead of
+        # one take with both. From idx the name is identical for every camera.
+        self.started = dt.datetime.fromtimestamp(idx * SEGMENT_S).astimezone()
         rec = "rec_" + self.started.strftime("%Y%m%d_%H%M%S")
         self.dir = _day_dir(self.root, self.started) / rec / "streams" / "cam2"
         self.dir.mkdir(parents=True, exist_ok=True)
