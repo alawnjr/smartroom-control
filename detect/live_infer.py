@@ -191,6 +191,8 @@ SEGMENT_MIN_PEOPLE_FRAMES = int(os.environ.get("SMARTROOM_SEGMENT_MIN_FRAMES", "
 # CPU-fallback ReID saturated the CPU and starved the HTTP server (requests
 # queued behind a 190%-CPU process). NVENC is effectively free here.
 SEGMENT_ENCODER = os.environ.get("SMARTROOM_SEGMENT_ENCODER", "h264_nvenc")
+# Consecutive pose-predict failures before we give up and let systemd restart us.
+PREDICT_FAIL_LIMIT = int(os.environ.get("SMARTROOM_PREDICT_FAIL_LIMIT", "60"))
 
 
 def _day_dir(root: Path, when: dt.datetime) -> Path:
@@ -273,7 +275,10 @@ class SegmentRecorder:
                "-c:v", SEGMENT_ENCODER, "-pix_fmt", "yuv420p"]
         cmd += (["-cq", "26", "-preset", "p5"] if "nvenc" in SEGMENT_ENCODER
                 else ["-crf", "26", "-preset", "veryfast"])
-        cmd += [str(out)]
+        # +faststart moves the moov atom to the FRONT on close. Without it the
+        # index lands at the end of the file and browsers/WebCodecs cannot begin
+        # playback over HTTP — the clips download fine but show no video.
+        cmd += ["-movflags", "+faststart", str(out)]
         try:
             self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
                                          stdout=subprocess.DEVNULL,
@@ -865,6 +870,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     use_half = device not in ("cpu", "intel:cpu")
     last_id = 0
     ema_fps = 0.0
+    predict_fails = 0
     print(f"[live] {cam_key}: pose model loaded ({weights}) device={device} "
           f"half={use_half}", flush=True)
     while True:
@@ -889,7 +895,17 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                                 classes=[0], verbose=False)[0].cpu()
         except Exception as exc:  # noqa: BLE001
             print(f"[live] predict error: {exc}", flush=True)
+            # A CUDA fault ("misaligned address") poisons the whole context: every
+            # later kernel fails the same way, so the service stays *active* while
+            # silently producing zero detections. Bail out and let systemd give us
+            # a fresh process rather than spin on a dead GPU for hours.
+            predict_fails += 1
+            if predict_fails >= PREDICT_FAIL_LIMIT:
+                print(f"[live] {cam_key}: {predict_fails} consecutive predict "
+                      f"failures — exiting for a restart", flush=True)
+                os._exit(1)
             continue
+        predict_fails = 0
 
         # Image-space ByteTrack for STABLE ids (the tracker model.track() uses),
         # shared by localization and action — fixes greedy room-space
