@@ -8,7 +8,14 @@ to a pretrained skeleton recognizer (mmaction2, CPU), then overlay the predicted
 action label on each tracked person. Selectable via --variant:
   ntu  (default) — 2D ST-GCN++ on NTU-RGB+D 60  -> sidecar key "action"
   hmdb           — PoseC3D on HMDB51 (adds walk/run) -> sidecar key "action-hmdb"
-Both are skeleton models driven one person at a time, so both are multi-person.
+  ava            — SlowFast-AVA 2.1 -> sidecar key "action-ava"
+The first two are skeleton models driven one person at a time. `ava` is the same
+model the live service runs (see ava_model.py): it classifies RGB PIXELS plus
+each person's box rather than keypoints, so it sees carried objects, posture and
+scene context the skeleton models are blind to, and it is multi-label — several
+simultaneous actions per person. Poses are still tracked, stored and drawn in
+every variant; under `ava` they simply don't drive the label. All are
+multi-person.
 
 Runs in the dedicated Python 3.10 venv (.venv-action) which has the
 mmcv/mmaction2 stack. Per clip it writes, next to camera_main.mp4:
@@ -471,7 +478,24 @@ VARIANTS = {
             "posec3d", "slowonly_kinetics400-pretrained-r50_8xb16-u48-120e_hmdb51-split1-keypoint.py"),
         "ckpt_default": str(Path.home() / "Code" / "yolo-bench" / "posec3d_hmdb51.pth"),
     },
+    # ava — SlowFast-AVA spatiotemporal detection. The odd one out: it reads RGB
+    # PIXELS plus each person's box, not keypoints, so it sees carried objects,
+    # posture and scene context the skeleton models are blind to. Poses are still
+    # tracked, stored and drawn exactly as before — they just don't drive the
+    # label. Multi-label (sigmoid): every class over the threshold is reported,
+    # so `top` can hold several simultaneous actions rather than a softmax rank.
+    "ava": {
+        "key": "action-ava", "labels": None, "classifier": "slowfast_ava21",
+        "kind": "ava", "classify_every": 12, "temp": 1.0, "conf_mult": 0.0,
+        "config_env": "SMARTROOM_AVA_CONFIG", "ckpt_env": "SMARTROOM_AVA_CKPT",
+        "config": lambda: None, "ckpt_default": None,
+    },
 }
+
+# The batch clip is a real video at its true fps, so unlike the live path we can
+# take a genuine trailing window: AVA's 32x2 sampling spans ~2.1s at 30fps.
+AVA_SPAN_S = float(os.environ.get("SMARTROOM_AVA_SPAN_S", "2.1"))
+AVA_MIN_FRAMES = 8        # need at least this many buffered frames to classify
 
 
 def variant_config(v: dict) -> str:
@@ -561,6 +585,67 @@ def needs_action(mp4: Path, force: bool, key: str) -> bool:
     return data.get("sourceMtimeMs", 0) + 2000 < mp4.stat().st_mtime * 1000
 
 
+def _ava_pass(src, framedata, boxes_by_frame, width, height, native_fps,
+              classify_every, offset_frames, ev_idx, ev_lab, timeline,
+              win_pose, seen):
+    """Second decode pass for --variant ava: slide a trailing RGB window over
+    the clip and classify every tracked person in one forward per step.
+
+    Memory-bounded by design — only the last AVA_SPAN_S seconds are held, at the
+    AVA short side — so a 3-minute segment costs tens of MB rather than the
+    gigabytes a whole-clip buffer would. Fills the same ev_idx/ev_lab/timeline/
+    win_pose structures the skeleton path fills, so every downstream sidecar,
+    overlay and dashboard view is unchanged."""
+    import cv2
+
+    from ava_model import AvaDetector, resize_short
+
+    det = AvaDetector(device=DEVICE)
+    nw, nh = resize_short(width, height)
+    rx, ry = nw / width, nh / height
+    span = max(AVA_MIN_FRAMES, int(round(AVA_SPAN_S * native_fps)))
+    buf = deque(maxlen=span)
+    cap = cv2.VideoCapture(str(src))
+    g = 0
+    while True:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        buf.append(cv2.resize(frame, (nw, nh)))
+        boxes = boxes_by_frame[g] if g < len(boxes_by_frame) else []
+        if boxes and len(buf) >= AVA_MIN_FRAMES and g % classify_every == 0:
+            scaled = [(tid, [b[0] * rx, b[1] * ry, b[2] * rx, b[3] * ry])
+                      for tid, b in boxes]
+            try:
+                labels = det.infer(list(buf), scaled)
+            except Exception as error:  # noqa: BLE001
+                print(f"  ava infer error at frame {g}: {error}", file=sys.stderr)
+                labels = {}
+            kp_by_tid = {tid: (pts, cs) for tid, _, pts, cs in framedata[g]}
+            # the label describes the middle of the trailing window, so it is
+            # shifted back by the same offset the skeleton path uses
+            t = max(0.0, (g - offset_frames) / native_fps)
+            for tid, labs in labels.items():
+                label = labs[0][0] if labs else None
+                conf = labs[0][1] if labs else 0.0
+                ev_idx[tid].append(g)
+                ev_lab[tid].append(label or IDLE)
+                timeline[tid].append({"t": round(t, 3), "action": label or IDLE,
+                                      "conf": round(conf, 3),
+                                      "kept": label is not None,
+                                      # multi-label: EVERY class above threshold
+                                      "top": labs[:TOPK]})
+                pts, cs = kp_by_tid.get(tid, (None, None))
+                win_pose[tid].append(
+                    [[round(float(pts[j][0]), 1), round(float(pts[j][1]), 1),
+                      round(float(cs[j]), 3)] for j in range(len(pts))]
+                    if pts is not None else [])
+                if label is not None and label not in seen:
+                    seen.append(label)
+        g += 1
+    cap.release()
+
+
 def process_clip(model, infer, pose, mp4: Path, variant: dict,
                  rtm=None, pose_source: str = "yolo"):
     import cv2
@@ -574,9 +659,13 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     if pose_source == "rtmpose" and not KP_CONF_SET:
         kp_conf = float(os.environ.get("SMARTROOM_RTMPOSE_KP_CONF", "0.2"))
 
-    key, class_names = variant["key"], variant["labels"]
-    temp, min_conf = variant_temp(variant), variant_min_conf(variant, len(class_names))
-    disabled_idx = load_disabled(key, class_names)
+    # AVA classifies RGB pixels, not keypoints: no skeleton window, no softmax
+    # abstention, and its class list comes from the label map file.
+    is_ava = variant.get("kind") == "ava"
+    key, class_names = variant["key"], variant["labels"] or []
+    temp = variant_temp(variant)
+    min_conf = 0.0 if is_ava else variant_min_conf(variant, len(class_names))
+    disabled_idx = [] if is_ava else load_disabled(key, class_names)
     json_path, actions_path, annotated_path = sidecars(mp4, key)
     out_dir = mp4.parent
     source_mtime_ms = mp4.stat().st_mtime * 1000
@@ -656,6 +745,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     timeline = defaultdict(list)
     win_pose = defaultdict(list)    # per track: one [[x,y,c]*17] pose per classified window (aligned with timeline)
     centroids = defaultdict(list)   # per track: per-frame bbox centroid {t,x,y} (location tracking sidecar)
+    boxes_by_frame = []             # per frame: [(tid, [x1,y1,x2,y2])] — AVA proposals
     seen = []
 
     # Per-frame detections as (ids, xyxy, xy, conf), from either the fast batched
@@ -695,6 +785,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     idx = 0
     for ids, xyxy, xy, conf in _frame_source():
         perframe = []
+        boxes_by_frame.append([(tid, list(xyxy[n])) for n, tid in enumerate(ids)])
         if len(ids):
             for n, tid in enumerate(ids):
                 traj[tid].append((idx, xy[n], conf[n]))  # every frame (full vertical resolution)
@@ -724,7 +815,7 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
                     tubes[tid].append((xy[n], conf[n]))
                     n_vis = int((conf[n] >= kp_conf).sum())
                     trunc[tid].append(n_vis < MIN_KEYPOINTS)
-                if len(tubes[tid]) >= MIN_WINDOW and idx % classify_every == 0:
+                if (not is_ava) and len(tubes[tid]) >= MIN_WINDOW and idx % classify_every == 0:
                     # Judge truncation on the recent samples (around the moment the
                     # label describes), not the whole trailing window — scattered
                     # single-frame keypoint dropouts shouldn't count, but a person
@@ -762,6 +853,14 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
                 perframe.append((tid, (x1, y1), xy[n], conf[n]))
         framedata.append(perframe)
         idx += 1
+
+    # AVA classifies from RGB, so it needs its own decode pass over the clip
+    # (pass 1 kept only keypoints and boxes). Everything it fills is the same
+    # structures the skeleton path fills above.
+    if is_ava:
+        _ava_pass(src, framedata, boxes_by_frame, width, height, native_fps,
+                  classify_every, offset_frames, ev_idx, ev_lab, timeline,
+                  win_pose, seen)
 
     # Geometric jump detection over each track's full trajectory (classifier-
     # independent). Surface "jumping" as a chip when any track jumps.
@@ -911,7 +1010,8 @@ def main():
     ap.add_argument("--path", action="append", metavar="REL",
                     help="clip to analyze, relative to the recordings root; repeatable for a subset")
     ap.add_argument("--variant", default="ntu",
-                    help="action model(s), comma-separated: ntu (ST-GCN++/NTU-60), hmdb (PoseC3D/HMDB51)")
+                    help="action model(s), comma-separated: ntu (ST-GCN++/NTU-60 skeleton), "
+                         "hmdb (PoseC3D/HMDB51 skeleton), ava (SlowFast-AVA, RGB pixels)")
     ap.add_argument("--force", action="store_true")
     args = ap.parse_args()
 
@@ -976,8 +1076,12 @@ def main():
             print(f"{tag}: {len(todo)}/{len(clips)} clip(s) to process", file=sys.stderr)
             if not todo:
                 continue
-            model = init_recognizer(variant_config(variant), variant_ckpt(variant), device=DEVICE)
-            label = (f"Actions ({'HMDB' if vkey == 'hmdb' else 'NTU'})"
+            # AVA builds its own detector inside the pass (it needs mmdet's ROI
+            # head, not a skeleton recognizer), so there is nothing to build here.
+            model = (None if variant.get("kind") == "ava" else
+                     init_recognizer(variant_config(variant), variant_ckpt(variant), device=DEVICE))
+            label = ({"hmdb": "Actions (HMDB)", "ava": "Actions (AVA)"}
+                     .get(vkey, "Actions (NTU)")
                      + (" · RTMPose" if pose_source == "rtmpose" else ""))
             started = dt.datetime.now(dt.timezone.utc)
             processed = errors = 0

@@ -88,16 +88,11 @@ POS_HOLD_S = float(os.environ.get("SMARTROOM_POS_HOLD_S", "0.7"))
 ACTION_WINDOW = 48        # skeleton-window length (mirrors action.WINDOW); deque cap
 ACTION_TRACK_TTL_S = 2.0  # drop a track's window/label if unseen this long
 ACTION_SWEEP_S = 0.35     # how often the action thread re-classifies live tracks
-AVA_SHORT = 256           # short-side the SlowFast-AVA clip is resized to
 AVA_BUF = 128             # rolling RGB frame buffer (a few seconds at any fps)
 AVA_PERIOD_S = 0.4        # how often to run the (heavier) AVA forward
-AVA_THR = float(os.environ.get("SMARTROOM_AVA_THR", "0.4"))  # multi-label: every class above this is output
-# Classes to suppress entirely (never output). ';'-separated (AVA names contain
-# commas), case-insensitive exact match. Override/extend via SMARTROOM_AVA_BLACKLIST.
-AVA_BLACKLIST = {s.strip().lower() for s in
-                 os.environ.get("SMARTROOM_AVA_BLACKLIST",
-                                "watch (a person);talk to (e.g., self, a person, a group)").split(";")
-                 if s.strip()}
+# AVA_SHORT / AVA_THR / the class blacklist live in ava_model, shared with the
+# batch pass (action.py --variant ava) so both classify identically.
+from ava_model import AVA_SHORT, AVA_THR, resize_short as _resize_short  # noqa: E402
 # SlowFast-AVA was trained on ~30fps clips where its 32x2 window ≈ 2.1s. Our live
 # feed is ~10fps, so taking the last 64 frames would span ~6.4s — too much motion
 # integrated per label (inertia) and 3x-stretched so dynamic actions look static.
@@ -404,22 +399,6 @@ def find_calib_clips(cam_key: str) -> list:
                 out.append(mp4)
         except (OSError, ValueError):
             continue
-    return out
-
-
-def _resize_short(w, h, short):
-    """New (w, h) with the short side scaled to `short`, aspect preserved."""
-    scale = short / min(w, h)
-    return int(round(w * scale)), int(round(h * scale))
-
-
-def load_label_map(path):
-    """AVA label map: 'id: name' per line -> {int id: name} (same as the demo)."""
-    out = {}
-    for line in Path(path).read_text().splitlines():
-        if ": " in line:
-            i, name = line.split(": ", 1)
-            out[int(i)] = name.strip()
     return out
 
 
@@ -1101,43 +1080,16 @@ def action_loop(shared: Shared, width: int, height: int, variant_key: str):
 
 def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
              device: str, action_thr: float):
-    """SlowFast-AVA spatiotemporal detection. Reuses mmaction2's official demo
-    inference recipe: build the detection model, then per prediction step take
-    the trailing RGB clip + current person boxes as proposals and read per-box
-    multi-label action scores. One forward classifies everyone in the frame."""
-    import mmcv
-    import mmengine
-    import numpy as np
-    import torch
-    from mmengine.runner import load_checkpoint
-    from mmengine.structures import InstanceData
-    from mmaction.registry import MODELS
-    from mmaction.structures import ActionDataSample
-    try:
-        from mmaction.utils import register_all_modules
-        register_all_modules(True)
-    except Exception:  # noqa: BLE001
-        pass
+    """SlowFast-AVA spatiotemporal detection: per prediction step, hand the
+    trailing RGB clip + the current person boxes to the shared AvaDetector and
+    publish each track's above-threshold labels. The model reads pixels, not
+    keypoints — the skeletons are still drawn, they just don't drive the label."""
+    from ava_model import AvaDetector
 
-    with _MODEL_BUILD_LOCK:
-        cfg = mmengine.Config.fromfile(config_path)
-        # equal bbox count across classes (demo does this); handle test_cfg.rcnn None
-        tc = cfg.model.get("test_cfg") or {}
-        tc["rcnn"] = dict(action_thr=0)
-        cfg.model["test_cfg"] = tc
-        cfg.model.backbone.pretrained = None
-        model = MODELS.build(cfg.model)
-        load_checkpoint(model, ckpt, map_location="cpu")
-        model.to(device).eval()
-
-    sampler = [x for x in cfg.val_pipeline
-               if str(x["type"]).endswith("SampleAVAFrames")][0]
-    clip_len, interval = sampler["clip_len"], sampler["frame_interval"]
-    mean = np.array(cfg.model.data_preprocessor["mean"])
-    std = np.array(cfg.model.data_preprocessor["std"])
-    label_map = load_label_map(label_map_path)
-    print(f"[live] AVA model loaded: {len(label_map)} classes, clip_len={clip_len} "
-          f"span={AVA_SPAN_S}s thr={action_thr} device={device}", flush=True)
+    det = AvaDetector(config_path, ckpt, label_map_path, device, action_thr)
+    print(f"[live] AVA model loaded: {len(det.label_map)} classes, "
+          f"clip_len={det.clip_len} span={AVA_SPAN_S}s thr={action_thr} "
+          f"device={device}", flush=True)
 
     while True:
         time.sleep(AVA_PERIOD_S)
@@ -1153,35 +1105,15 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
         _, boxes, _ = seg[-1]              # proposals = the newest frame's people
         if not boxes:
             continue
-        nh, nw = seg[-1][0].shape[:2]
-        idx = np.linspace(0, len(seg) - 1, clip_len).round().astype(int)
-        imgs = [seg[i][0].astype(np.float32) for i in idx]
-        for im in imgs:
-            mmcv.imnormalize_(im, mean, std, to_rgb=False)
-        arr = np.stack(imgs).transpose(3, 0, 1, 2)[np.newaxis]   # 1,C,T,H,W
-        inp = torch.from_numpy(arr).to(device)
-        tids = [t for t, _ in boxes]
-        prop = torch.tensor([b for _, b in boxes], dtype=torch.float32, device=device)
-        ds = ActionDataSample()
-        ds.proposals = InstanceData(bboxes=prop)
-        ds.set_metainfo(dict(img_shape=(nh, nw)))
         try:
-            with torch.no_grad():
-                res = model(inp, [ds], mode="predict")
-            scores = res[0].pred_instances.scores    # (num_props, num_classes)
+            labels = det.infer([e[0] for e in seg], boxes)
         except Exception as exc:  # noqa: BLE001
             print(f"[live] AVA infer error: {exc}", flush=True)
             continue
-        for j, tid in enumerate(tids):
-            labs = [(label_map[i], float(scores[j, i]))
-                    for i in range(scores.shape[1])
-                    if i in label_map and float(scores[j, i]) > action_thr
-                    and label_map[i].lower() not in AVA_BLACKLIST]
-            labs.sort(key=lambda x: -x[1])
+        for tid, labs in labels.items():
             # multi-label: keep EVERY class above the threshold, not just top-1
             shared.set_label(tid, labs[0][0] if labs else None,
-                             labs[0][1] if labs else 0.0,
-                             [[a, round(s, 3)] for a, s in labs])
+                             labs[0][1] if labs else 0.0, labs)
 
 
 def _draw_person(frame, px, conf, marker, tid, src, actions=None, label_id=None):
