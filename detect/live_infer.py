@@ -110,10 +110,10 @@ JUMP_FRAC = float(os.environ.get("SMARTROOM_JUMP_FRAC", "0.20"))
 JUMP_WINDOW_S = 1.5       # rolling baseline window
 JUMP_MIN_STREAK = 2       # consecutive airborne frames before firing (anti-jitter)
 JUMP_HOLD_S = 0.5         # keep showing "jump" this long after the last airborne frame
-# mmaction's registry isn't safe to populate from two threads at once (a second
-# concurrent build raced and failed with "MaxIoUAssignerAVA is not in the
-# registry"), so per-camera model construction is serialized.
-_MODEL_BUILD_LOCK = threading.Lock()
+# (The old _MODEL_BUILD_LOCK lived here: mmaction's registry could not be
+# populated from two threads at once. Moot now — every model is built inside its
+# own process, so there is no shared registry left to race on. ava_model keeps
+# its own lock for the batch pipeline, which does still build in-process.)
 
 # --- person re-identification (stable identity across gaps and cameras) -------
 # ByteTrack ids are per-camera and reset whenever a track is lost, so a person
@@ -214,6 +214,13 @@ STALL_S = float(os.environ.get("SMARTROOM_STALL_S", "60"))
 # up on it and respawning. Generous: a forward is ~70ms, but the worker may be
 # serving the other camera and queueing behind a cold CUDA context.
 AVA_TIMEOUT_S = float(os.environ.get("SMARTROOM_AVA_TIMEOUT_S", "20"))
+# ReID sits on the pose loop's critical path (one round trip per embedded
+# frame), so its deadline is short: dropping an embed only costs geometry-only
+# identity for that frame, whereas waiting costs every camera its frame rate.
+REID_TIMEOUT_S = float(os.environ.get("SMARTROOM_REID_TIMEOUT_S", "5"))
+# "cpu" until onnxruntime-gpu is installed. Safe to point at a GPU now that the
+# encoder runs in its own process.
+REID_DEVICE = os.environ.get("SMARTROOM_REID_DEVICE", "cpu")
 
 
 def _day_dir(root: Path, when: dt.datetime) -> Path:
@@ -877,18 +884,14 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     held = {}          # tid -> (pos, t) last good room position, for POS_HOLD_S
     encoder = None
     if ids is not None and REID_ON:
-        try:
-            with _MODEL_BUILD_LOCK:
-                from ultralytics.trackers.utils.reid import ReID
-                # follow THIS camera's GPU, not a hardcoded 0 — otherwise every
-                # camera's ReID piles back onto cuda:0 and undoes the split.
-                encoder = ReID(REID_MODEL,
-                               device=("cpu" if device in ("cpu", "intel:cpu")
-                                       else int(device)))
-            print(f"[live] {cam_key}: ReID encoder {REID_MODEL} ready", flush=True)
-        except Exception as exc:  # noqa: BLE001
-            print(f"[live] {cam_key}: ReID unavailable ({exc}) — geometry only",
-                  flush=True)
+        # Out-of-process (see _reid_worker). Its ONNX Runtime thread pool
+        # busy-waits, and keeping it out of here also leaves the door open to
+        # running it on the GPU without adding a CUDA runtime to this process.
+        encoder = ModelWorker(f"ReID[{cam_key}]", _reid_worker,
+                              (REID_MODEL, REID_DEVICE), timeout=REID_TIMEOUT_S)
+        if not encoder.start():
+            print(f"[live] {cam_key}: ReID unavailable — geometry only", flush=True)
+            encoder = None
     frame_n = 0
     use_half = device not in ("cpu", "intel:cpu")
     if use_half:
@@ -1007,15 +1010,18 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             # re-identified — the whole point of the gallery.
             fresh = any(not ids.known(cam_key, t) for t, *_ in found)
             if encoder is not None and (fresh or frame_n % REID_EVERY == 0):
-                try:
-                    dets = np.array([[(p["box"][0] + p["box"][2]) / 2,
-                                      (p["box"][1] + p["box"][3]) / 2,
-                                      p["box"][2] - p["box"][0],
-                                      p["box"][3] - p["box"][1]]
-                                     for *_, p, _ in found], dtype=np.float32)
-                    embs = encoder(clean, dets)      # xywh, on the CLEAN frame
-                except Exception as exc:  # noqa: BLE001
-                    print(f"[live] {cam_key}: ReID embed failed: {exc}", flush=True)
+                dets = np.array([[(p["box"][0] + p["box"][2]) / 2,
+                                  (p["box"][1] + p["box"][3]) / 2,
+                                  p["box"][2] - p["box"][0],
+                                  p["box"][3] - p["box"][1]]
+                                 for *_, p, _ in found], dtype=np.float32)
+                ok, enc_jpg = cv2.imencode(".jpg", clean,   # the CLEAN frame
+                                           [cv2.IMWRITE_JPEG_QUALITY, 90])
+                # A failed/timed-out embed is not fatal: identities fall back to
+                # geometry for this frame, exactly as before.
+                got = encoder.call((enc_jpg.tobytes(), dets)) if ok else None
+                if got is not None and len(got) == len(found):
+                    embs = got
             if any(e is not None for e in embs):
                 ids.note(cam_key, [(t, e) for (t, *_), e in zip(found, embs)])
             ids.fuse(t0)      # continuously combine co-located identities
@@ -1128,6 +1134,121 @@ def action_loop(shared: Shared, width: int, height: int, variant_key: str):
         time.sleep(ACTION_SWEEP_S)
 
 
+class ModelWorker:
+    """A model living in its own process, called request/response over a Pipe.
+
+    Every GPU model this service runs gets one of these. Compiled CUDA
+    extensions from different projects corrupt each other's context when they
+    issue kernels from one process (mmaction/mmcv vs ultralytics/torchvision —
+    see `_ava_worker`), and a corrupted context never recovers, so the only
+    durable isolation is a process boundary. It also means a model that dies or
+    wedges costs one respawn instead of the whole service.
+
+    `call` never blocks the caller indefinitely: a worker that misses its
+    deadline is killed and respawned, and the caller gets None for that request.
+    """
+
+    def __init__(self, name: str, target, args: tuple, timeout: float,
+                 ready_timeout: float = 300.0):
+        self.name, self.target, self.args = name, target, args
+        self.timeout, self.ready_timeout = timeout, ready_timeout
+        self.ctx = mp.get_context("spawn")
+        self.conn = self.proc = None
+        self.info = None
+
+    def start(self) -> bool:
+        """(Re)spawn the worker; False if it could not be brought up."""
+        self.stop()
+        parent, child = self.ctx.Pipe()
+        p = self.ctx.Process(target=self.target, daemon=True,
+                             args=(child,) + self.args)
+        p.start()
+        child.close()
+        try:
+            # model build is slow (checkpoint load), so wait — but not forever
+            if not parent.poll(self.ready_timeout):
+                raise TimeoutError(f"not ready in {self.ready_timeout:g}s")
+            kind, payload = parent.recv()
+            if kind != "ready":
+                raise RuntimeError(payload)
+        except (OSError, EOFError, TimeoutError, RuntimeError) as exc:
+            print(f"[live] {self.name} worker failed to start: {exc}", flush=True)
+            p.kill()
+            parent.close()
+            return False
+        self.conn, self.proc, self.info = parent, p, payload
+        print(f"[live] {self.name} worker up (pid {p.pid}): {payload}", flush=True)
+        return True
+
+    def stop(self):
+        if self.conn is not None:
+            try:
+                self.conn.close()
+            except OSError:
+                pass
+        if self.proc is not None and self.proc.is_alive():
+            self.proc.kill()
+        self.conn = self.proc = None
+
+    def start_blocking(self, retry_s: float = 30.0):
+        while not self.start():
+            time.sleep(retry_s)
+
+    def call(self, payload):
+        """Round-trip one request. Returns the reply, or None on any failure
+        (the worker is respawned in the background of the next call)."""
+        if self.conn is None and not self.start():
+            return None
+        try:
+            self.conn.send(payload)
+            if not self.conn.poll(self.timeout):
+                raise TimeoutError(f"no reply in {self.timeout:g}s")
+            kind, reply = self.conn.recv()
+        except (OSError, EOFError, TimeoutError) as exc:
+            print(f"[live] {self.name} worker lost ({exc}) — respawning", flush=True)
+            self.start()
+            return None
+        if kind != "ok":
+            print(f"[live] {self.name} infer error: {reply}", flush=True)
+            return None
+        return reply
+
+
+def _reid_worker(conn, model_path: str, device):
+    """Subprocess entry point: the ReID appearance encoder.
+
+    Isolated for two reasons. It keeps ONNX Runtime's thread pool — which
+    busy-waits, and was measured pinning several cores — out of the pose
+    process. And it makes a GPU ReID safe to enable later: onnxruntime-gpu's
+    CUDA provider would be a THIRD compiled CUDA runtime inside the pose
+    process, the exact hazard that took this service down, but inside its own
+    process it cannot reach anyone else's context.
+    """
+    import cv2 as _cv2
+    import numpy as _np
+    try:
+        from ultralytics.trackers.utils.reid import ReID
+        enc = ReID(model_path, device=device)
+        conn.send(("ready", f"{model_path} on {device}"))
+    except Exception as exc:  # noqa: BLE001
+        conn.send(("fatal", str(exc)))
+        return
+    while True:
+        try:
+            msg = conn.recv()
+        except (EOFError, OSError):
+            return
+        if msg is None:
+            return
+        jpeg, dets = msg
+        try:
+            frame = _cv2.imdecode(_np.frombuffer(jpeg, _np.uint8), _cv2.IMREAD_COLOR)
+            embs = enc(frame, dets)
+            conn.send(("ok", [None if e is None else _np.asarray(e) for e in embs]))
+        except Exception as exc:  # noqa: BLE001
+            conn.send(("error", str(exc)))
+
+
 def _ava_worker(conn, config_path: str, ckpt: str, label_map_path: str,
                 device: str, thr: float):
     """Subprocess entry point: one SlowFast-AVA model answering infer requests.
@@ -1183,49 +1304,10 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
 
     This thread now only marshals; the model itself lives in `_ava_worker`,
     see there for why."""
-    ctx = mp.get_context("spawn")
-    conn = proc = None
-
-    def start():
-        """(Re)spawn the worker. Returns False if it could not be brought up."""
-        nonlocal conn, proc
-        stop()
-        parent, child = ctx.Pipe()
-        p = ctx.Process(target=_ava_worker, daemon=True,
-                        args=(child, config_path, ckpt, label_map_path,
-                              device, action_thr))
-        p.start()
-        child.close()
-        # model build is slow (checkpoint load); wait, but not forever
-        if not parent.poll(300) :
-            print("[live] AVA worker did not become ready", flush=True)
-            p.kill()
-            parent.close()
-            return False
-        kind, payload = parent.recv()
-        if kind != "ready":
-            print(f"[live] AVA worker failed to load: {payload}", flush=True)
-            p.kill()
-            parent.close()
-            return False
-        conn, proc = parent, p
-        print(f"[live] AVA worker up (pid {p.pid}): {payload} classes, "
-              f"span={AVA_SPAN_S}s thr={action_thr} device={device}", flush=True)
-        return True
-
-    def stop():
-        nonlocal conn, proc
-        if conn is not None:
-            try:
-                conn.close()
-            except OSError:
-                pass
-        if proc is not None and proc.is_alive():
-            proc.kill()
-        conn = proc = None
-
-    while not start():
-        time.sleep(30)
+    worker = ModelWorker("AVA", _ava_worker,
+                         (config_path, ckpt, label_map_path, device, action_thr),
+                         timeout=AVA_TIMEOUT_S)
+    worker.start_blocking()
 
     while True:
         time.sleep(AVA_PERIOD_S)
@@ -1248,22 +1330,10 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
                 jpegs.append(enc.tobytes())
         if len(jpegs) < AVA_MIN_FRAMES:
             continue
-        try:
-            conn.send((jpegs, boxes))
-            # A wedged worker must not wedge us too: give up on this clip and
-            # respawn rather than block the loop forever.
-            if not conn.poll(AVA_TIMEOUT_S):
-                raise TimeoutError(f"no reply in {AVA_TIMEOUT_S}s")
-            kind, payload = conn.recv()
-        except (OSError, EOFError, TimeoutError) as exc:
-            print(f"[live] AVA worker lost ({exc}) — respawning", flush=True)
-            while not start():
-                time.sleep(30)
+        labels = worker.call((jpegs, boxes))
+        if labels is None:          # timed out / died; the clip is dropped
             continue
-        if kind != "ok":
-            print(f"[live] AVA infer error: {payload}", flush=True)
-            continue
-        for tid, labs in payload.items():
+        for tid, labs in labels.items():
             # multi-label: keep EVERY class above the threshold, not just top-1
             shared.set_label(tid, labs[0][0] if labs else None,
                              labs[0][1] if labs else 0.0, labs)
