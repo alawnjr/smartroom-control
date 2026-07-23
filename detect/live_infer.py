@@ -64,6 +64,15 @@ L_SHOULDER, R_SHOULDER = 5, 6
 BOUNDARY = "frame"
 JPEG_QUALITY = 75
 KP_CONF = float(os.environ.get("SMARTROOM_ROOM_KP_CONF", "0.5"))
+# A person is only real if the POSE is real, not just the box. YOLO's person box
+# clears the tracker's 0.55 gate on dark clutter (the office chairs bottom-right),
+# but the keypoints on such a phantom are garbage: ~2 joints above KP_CONF and
+# ~0.18 mean confidence, vs 8-15 confident joints on an actual human. Without a
+# pose-quality gate a phantom that happens to land a shoulder anchor gets a depth
+# range, persists past SEGMENT_MIN_PEOPLE_FRAMES, and preserves an empty segment
+# (and paints a footprint in the room map). Require this many joints above
+# KP_CONF before a detection counts as a person to localize or to keep a segment.
+MIN_POSE_KP = int(os.environ.get("SMARTROOM_MIN_POSE_KP", "5"))
 DEPTH_MATCH_FRAC = 0.06   # a depth sample within this (fraction of frame) counts as "this hip"
 # A 1s-old depth sample applied to a moving person puts them metres away and was
 # a source of bad room positions (and hence false cross-camera merges). The
@@ -1053,6 +1062,10 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         found = []          # (tid, pos_xz, marker_px, person, src)
         anchors_frac = []
         for tid, p in persons:
+            # Reject phantom detections (dark chairs etc.): a real human lights up
+            # far more than a couple of joints. Gate on pose quality, not the box.
+            if sum(c >= KP_CONF for c in p["conf"]) < MIN_POSE_KP:
+                continue
             anchor = hip_point(p, w, h)   # mid-hip pixels, or None if low-conf
             src = "depth-hip"
             if anchor is None:
