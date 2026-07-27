@@ -401,10 +401,22 @@ class SegmentRecorder:
             # recording (tag height lives here; without it geometry cannot load)
             if self.room_frame and "room_frame" not in meta:
                 meta["room_frame"] = self.room_frame
+            # Top-level duration is the RECORDING's extent (the longest stream).
+            # It is NOT this camera's, and consumers must not treat it as such:
+            # the cameras deliver different frame counts, so their containers
+            # differ — a segment where the D455 kept 2389 frames and the D435
+            # 2302 is 79.6 s of container for one and 76.7 s for the other.
+            # Anything converting a sidecar time into real time needs the
+            # per-stream value below; using this one stretched the mirror's 3D
+            # scene by up to 114 s on the worst clip in the archive.
             meta["duration_seconds"] = round(max(dur, meta.get("duration_seconds", 0)), 2)
             entry = dict(self.stream_meta)        # calibration + extrinsics
             entry.update({"path": f"{self.cam}.mp4",
                           "start_time": self.started.isoformat(),
+                          # THIS stream's container duration: frames at the blind
+                          # CFR the encoder was fed, which is what the sidecars'
+                          # `t` values are expressed in.
+                          "duration_seconds": round(dur, 3),
                           "frame_count": self.frames,
                           "people_frames": self.people_frames})
             meta.setdefault("streams", {})[self.cam] = entry
