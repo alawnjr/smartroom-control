@@ -9,6 +9,7 @@ before (load_undistort_maps returns None -> no remap).
 """
 
 import json
+import math
 import os
 from pathlib import Path
 
@@ -123,6 +124,15 @@ def _floor_config(mp4: Path) -> dict:
 
 
 def tag_height_mm(mp4: Path, camera_id: str):
+    """The reference tag's height above the floor (mm), or None if unknown.
+
+    ZERO IS A VALID HEIGHT, not a missing one. The room's anchor is now a tag
+    lying flat on the floor — the only place every camera can see one shared
+    tag — so its height is exactly 0. Testing these values for truthiness (as
+    this did) rejected 0 as "unknown" and made every floor-anchored recording
+    unlocatable, silently dropping it from localization and the 3D scene. Test
+    for presence and finiteness; let 0 through.
+    """
     env = os.environ.get("SMARTROOM_TAG_HEIGHT_MM")
     if env:
         try:
@@ -130,7 +140,7 @@ def tag_height_mm(mp4: Path, camera_id: str):
         except ValueError:
             pass
     entry = _floor_config(mp4).get(camera_id)
-    if isinstance(entry, dict) and entry.get("tag_height_mm"):
+    if isinstance(entry, dict) and isinstance(entry.get("tag_height_mm"), (int, float)):
         return float(entry["tag_height_mm"])
     # Fall back to the recording's own metadata: capture.py embeds the room
     # frame's tag height (room_frame.tag_center_above_floor_mm) in every
@@ -140,7 +150,7 @@ def tag_height_mm(mp4: Path, camera_id: str):
     try:
         meta = json.loads((mp4.parent / "metadata.json").read_text())
         height = (meta.get("room_frame") or {}).get("tag_center_above_floor_mm")
-        if height:
+        if isinstance(height, (int, float)) and math.isfinite(height):
             return float(height)
     except (OSError, ValueError):
         pass

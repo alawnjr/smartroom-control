@@ -495,33 +495,53 @@ def saved_root() -> Path:
 
 
 def find_calib_clips(cam_key: str) -> list:
-    """Uploaded <cam_key>.mp4 clips with calibration+extrinsics, newest first.
+    """Uploaded <cam_key>.mp4 clips with calibration+extrinsics, freshest first.
 
-    Returns every candidate, not just the newest: a clip can carry calibration
+    Returns every candidate, not just the freshest: a clip can carry calibration
     yet still fail load_room_geometry (e.g. a recorded segment with no
-    room_frame/tag height), and picking only the newest made startup fail
-    outright instead of falling back to a usable one.
+    room_frame/tag height), and picking only one made startup fail outright
+    instead of falling back to a usable one.
+
+    Ordering is by the extrinsics' own `calibrated_at`, and clips this recorder
+    WROTE come last. Both parts matter, because ranking by file mtime and
+    treating all clips alike created a feedback loop that froze the geometry:
+    every segment SegmentRecorder writes carries a verbatim copy of the
+    calibration it bootstrapped from, so its own fresh-on-disk output was always
+    the "newest" clip and every restart re-adopted its own stale snapshot. A
+    recalibration on the Pi could never reach this process — the room's anchor
+    tag was physically replaced and 259 segments went on being localized against
+    the tag that had been taken down, the two cameras' people landing ~0.6 m
+    apart in the fused scene. A real Pi capture is the authority on where the
+    cameras are; a segment is only a last-resort fallback.
     """
     root = saved_root()
     out = []
     if not root.exists():
         return out
-    clips = sorted(root.rglob(f"{cam_key}.mp4"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
-    for mp4 in clips:
+    for mp4 in root.rglob(f"{cam_key}.mp4"):
         if "undistorted" in mp4.parts:
             continue
         md = mp4.parent / "metadata.json"
         if not md.exists():
             continue
         try:
-            streams = json.loads(md.read_text()).get("streams", {})
-            entry = streams.get(mp4.stem, {})
-            if entry.get("calibration") and entry.get("extrinsics"):
-                out.append(mp4)
-        except (OSError, ValueError):
+            meta = json.loads(md.read_text())
+            entry = (meta.get("streams") or {}).get(mp4.stem, {})
+            if not (entry.get("calibration") and entry.get("extrinsics")):
+                continue
+            # A segment we wrote is a COPY of someone else's calibration, so it
+            # can never be more authoritative than its source.
+            derived = meta.get("source") == "live_segment_recorder"
+            stamp = (entry["extrinsics"] or {}).get("calibrated_at") or ""
+            mtime = mp4.stat().st_mtime
+        except (OSError, ValueError, AttributeError):
             continue
-    return out
+        out.append((not derived, stamp, mtime, mp4))
+    # Descending, so real captures (not derived -> True) come first, then the most
+    # recently CALIBRATED, then the most recently written. mtime only breaks ties
+    # so a re-uploaded clip still wins over one with the same or no stamp.
+    out.sort(reverse=True, key=lambda t: t[:3])
+    return [t[-1] for t in out]
 
 
 class TimestampLog:
