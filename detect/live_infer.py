@@ -55,7 +55,15 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from calib_utils import load_room_geometry  # noqa: E402
-from localize import backproject_room, hip_point, joint_px  # noqa: E402
+from localize import (  # noqa: E402
+    MAX_RAY_REACH_MM,
+    MIN_RAY_PITCH_DEG,
+    backproject_room,
+    ground_point,
+    hip_point,
+    joint_px,
+)
+from calib_utils import ANKLE_JOINT_HEIGHT_MM, pixel_to_floor  # noqa: E402
 
 # COCO-17 shoulders (fallback anchor when the hips are occluded, e.g. seated at
 # a desk). Both anchors are ranged by real depth — no floor-ray, never the feet.
@@ -1116,6 +1124,24 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     tracker = _make_bytetrack()
     jumps = JumpDetector()
     held = {}          # tid -> (pos, t) last good room position, for POS_HOLD_S
+    # Can this camera place a person WITHOUT depth? Localization used to be
+    # depth-only, which silently excluded every RGB-only camera: the four NVR
+    # cameras run at 30-50fps, see the whole room from 2.6m, and contributed
+    # nothing at all -- `depth_near` returns None for them, so every detection
+    # hit `pos is None` and was dropped before it was even drawn. That is why the
+    # room showed 2 people while nine were standing in it.
+    #
+    # The ankle floor-ray is the same fallback localize.py uses offline, with the
+    # same guard: it only means anything when the camera actually looks DOWN at
+    # the floor. Near-horizontal, a distant person's ankle sits by the horizon
+    # where the ray grazes the floor and one pixel is worth metres.
+    optical_axis = geom["R"] @ np.array([0.0, 0.0, 1.0])
+    pitch_down_deg = float(np.degrees(np.arcsin(np.clip(-optical_axis[1], -1.0, 1.0))))
+    ray_ok = pitch_down_deg >= MIN_RAY_PITCH_DEG
+    print(f"[live] {cam_key}: pitch {pitch_down_deg:.0f}° below horizontal — "
+          f"floor-ray fallback {'ON' if ray_ok else 'OFF'} "
+          f"(needs >= {MIN_RAY_PITCH_DEG:.0f}°)", flush=True)
+
     spatial_off = cam_key in NO_SPATIAL
     if spatial_off:
         print(f"[live] {cam_key}: SPATIAL MUTED (SMARTROOM_NO_SPATIAL) — streaming, "
@@ -1230,6 +1256,21 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 if p_room is not None:
                     pos = (float(p_room[0]), float(p_room[2]))
                     held[tid] = (pos, t0)
+            if pos is None and ray_ok:
+                # No depth (an RGB-only camera, or a sample that has not landed
+                # near this person yet): cast the ankle ray onto the floor.
+                foot = ground_point(p, w, h)
+                if foot is not None:
+                    hit = pixel_to_floor(foot[0], foot[1], geom, ANKLE_JOINT_HEIGHT_MM)
+                    if hit is not None:
+                        # Reject a hit implausibly far away: near the horizon the
+                        # ray grazes the floor and a 1px error becomes metres,
+                        # which is what used to fling people through walls.
+                        reach = float(np.hypot(hit[0] - geom["cam_pos_mm"][0],
+                                               hit[1] - geom["cam_pos_mm"][2]))
+                        if reach <= MAX_RAY_REACH_MM:
+                            pos, src = (float(hit[0]), float(hit[1])), "ray-ankles"
+                            held[tid] = (pos, t0)
             if pos is None:
                 # no fresh depth this frame — hold the last known position rather
                 # than dropping the person (that is what caused the flicker).

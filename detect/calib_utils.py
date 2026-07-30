@@ -19,10 +19,21 @@ import numpy as np
 # Max believable floor-hit distance from the camera (mm); beyond this the ray is
 # near-horizontal and a pixel of ankle error means meters of position error.
 MAX_FLOOR_RANGE_MM = 15000.0
-# The tag sits ON a wall, so nobody stands meaningfully behind its plane (Z < 0).
+# Only meaningful when the reference tag hangs on a WALL: nobody stands behind
+# the wall, so a floor hit well behind its plane (Z < 0) was a mis-detection.
 # Small negatives are legit — the tag's mount (breaker-panel door) sits proud of
-# the actual wall — but beyond this the "ankle" was a mis-detection.
+# the actual wall.
+#
+# It does NOT apply to a floor-mounted anchor. The room's origin is now a tag
+# lying flat in the MIDDLE of the floor, so the room extends to both signs of Z
+# and this test throws away everything more than 30cm to one side of the origin.
+# Measured on the NVR cameras at Z = -1980: rays toward the near floor in front
+# of them were all rejected as "behind the wall", i.e. the half of the room those
+# two cameras mainly look at. Gated on the tag's own height below.
 BEHIND_WALL_TOLERANCE_MM = 300.0
+# A reference tag at or below this height above the floor IS the floor tag, so
+# there is no wall plane to be behind.
+FLOOR_TAG_MAX_HEIGHT_MM = 50.0
 
 
 def analysis_source(mp4: Path) -> Path:
@@ -221,6 +232,9 @@ def pixel_to_floor(u: float, v: float, geom: dict, plane_height_mm: float = 0.0)
     hit = cam + t * d
     if float(np.linalg.norm(hit - cam)) > MAX_FLOOR_RANGE_MM:
         return None
-    if hit[2] < -BEHIND_WALL_TOLERANCE_MM:
+    # "Behind the wall" only exists if the anchor IS on a wall. With a floor
+    # anchor the room surrounds the origin and negative Z is ordinary floor.
+    on_wall = float(geom.get("tag_height_mm") or 0.0) > FLOOR_TAG_MAX_HEIGHT_MM
+    if on_wall and hit[2] < -BEHIND_WALL_TOLERANCE_MM:
         return None
     return float(hit[0]), float(hit[2])
