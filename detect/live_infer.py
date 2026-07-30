@@ -123,6 +123,25 @@ SPATIAL_ONLY = {c.strip() for c in os.environ.get("SMARTROOM_SPATIAL_ONLY", "").
                 if c.strip()}
 
 
+# One lock per CUDA device, serializing pose inference across the camera threads
+# that share it.
+#
+# Pose runs in THREADS in this process (ReID and AVA were long ago moved into
+# subprocesses because a corrupted CUDA context never recovers; pose never was).
+# Ultralytics' predict is not safe to call concurrently on one device, and the
+# failure is not a clean exception: a wedge dump caught THREE camera threads
+# blocked simultaneously inside the same op, `head.py get_topk_index`, none of
+# which ever returned. The watchdog then killed the process at 60s. The companion
+# symptom is `CUDA error: misaligned address` — the same collision, seen by
+# whichever thread got the exception instead of the hang.
+#
+# Serializing costs little here: each camera loop runs at 55-75 fps against a
+# 15 fps input, so two cameras sharing a device still clear the input rate with
+# room to spare. Correctness first; if throughput ever becomes the constraint the
+# real fix is a subprocess per camera, matching ReID/AVA and the Pi's depth page.
+POSE_LOCKS = defaultdict(threading.Lock)
+
+
 def spatial_muted(cam_key: str) -> bool:
     """Is this camera barred from publishing room positions?"""
     if SPATIAL_ONLY:
@@ -1210,8 +1229,14 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         h, w = frame.shape[:2]
         clean = frame.copy()   # pristine RGB for the action model (frame gets overlays)
         try:
-            res = model.predict(frame, imgsz=640, device=device, half=use_half,
-                                classes=[0], verbose=False)[0].cpu()
+            # Serialized per device — see POSE_LOCKS. `.cpu()` stays INSIDE the
+            # lock: it is what forces the async CUDA work to complete, so
+            # releasing before it would hand the device to the next thread while
+            # this one's kernels are still in flight, which is the very overlap
+            # this prevents.
+            with POSE_LOCKS[device]:
+                res = model.predict(frame, imgsz=640, device=device, half=use_half,
+                                    classes=[0], verbose=False)[0].cpu()
         except Exception as exc:  # noqa: BLE001
             print(f"[live] {cam_key}: predict error: {exc}", flush=True)
             # A CUDA fault ("misaligned address") poisons the whole context: every
