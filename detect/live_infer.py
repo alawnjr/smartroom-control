@@ -2133,11 +2133,25 @@ def main():
             Path.home() / "Code/yolo-bench/slowfast_ava.pth")
         lm = os.environ.get("SMARTROOM_AVA_LABELS") or str(
             Path(__file__).resolve().parent / "ava_label_map.txt")
-        # AVA goes on the LAST GPU, off the pose devices. Pose is the critical
-        # path (it drives /positions, the MJPEG and the segment recorder); AVA
-        # is best-effort.
+        # AVA used to pin every camera to the LAST GPU, on the premise that this
+        # kept it "off the pose devices". That held while there were two cameras
+        # and three GPUs: pose took 0 and 1, AVA took 2. It broke silently as soon
+        # as the cameras outnumbered the GPUs -- pose round-robins over ALL of
+        # them, so with six cameras GPU 2 was running two pose models AND all six
+        # AVA models (5.7 GB, 71% utilisation) while GPUs 0 and 1 idled at 5-7%.
+        #
+        # That imbalance is what made the service "freeze": cam1's pose predict,
+        # on GPU 2, hung inside the head's topk for 60s until the wedge watchdog
+        # killed the process, and the same device threw `CUDA error: misaligned
+        # address` until the 300-failure limit did. Restarting reloads six models,
+        # so each event blanked the live view for ~90s.
+        #
+        # With more cameras than GPUs, separation is not achievable -- so balance
+        # instead. Offsetting AVA one device from pose keeps a camera's own two
+        # models apart, and spreads six AVA models 2-per-GPU rather than 6-on-one.
         for i, (cam_key, e) in enumerate(cams.items()):
-            adev = f"cuda:{ngpu - 1}" if ngpu else "cpu"
+            adev = f"cuda:{(i + 1) % ngpu}" if ngpu else "cpu"
+            print(f"[live] {cam_key}: AVA on {adev}", flush=True)
             threading.Thread(target=ava_loop,
                              args=(e["shared"], cfg, ckpt, lm, adev, AVA_THR),
                              daemon=True).start()
