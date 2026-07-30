@@ -30,6 +30,13 @@ ExecStart=%h/smartroom-control/.venv-action/bin/python detect/live_infer.py \
     --cam camera_d455_color,camera_d435_color,camera_cam1_color,camera_cam2_color,camera_cam3_color,camera_cam4_color \
     --port 8010 --action ava
 Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
+# Cameras that stream, pose and record but publish NO room positions. The D435 is
+# muted at the user's request (2026-07-30) until they say to put it back: it sits
+# close enough that a person fills its frame, so it has no confident hip and falls
+# back to the shoulder anchor, whose depth reads the wall behind them — it placed
+# a person at 1424mm where the D455 put them at 383mm, which double-counted one
+# person in the occupancy panel. Remove this line to restore it.
+Environment=SMARTROOM_NO_SPATIAL=camera_d435_color
 # 3-minute segments; a segment needs this many frames containing people to be kept
 Environment=SMARTROOM_SEGMENT_S=180
 Environment=SMARTROOM_SEGMENT_MIN_FRAMES=15
