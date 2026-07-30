@@ -113,6 +113,21 @@ BODY_HALF_DEPTH_MM = float(os.environ.get("SMARTROOM_BODY_HALF_DEPTH_MM", "0"))
 # none, because the wrong one still gets averaged and still gets counted.
 NO_SPATIAL = {c.strip() for c in os.environ.get("SMARTROOM_NO_SPATIAL", "").split(",")
               if c.strip()}
+# The allowlist form: when set, ONLY these cameras publish room positions and
+# every other camera is muted. Preferred over listing the muted ones when the
+# intent is "one camera is the source of truth for location", because it holds for
+# cameras that do not exist yet -- four NVR cameras appeared in this pipeline
+# without anyone deciding they should localize, and a denylist would have let a
+# fifth do the same silently.
+SPATIAL_ONLY = {c.strip() for c in os.environ.get("SMARTROOM_SPATIAL_ONLY", "").split(",")
+                if c.strip()}
+
+
+def spatial_muted(cam_key: str) -> bool:
+    """Is this camera barred from publishing room positions?"""
+    if SPATIAL_ONLY:
+        return cam_key not in SPATIAL_ONLY
+    return cam_key in NO_SPATIAL
 # The depth back-channel polls at ~8Hz while the pose loop runs 30-60fps, and a
 # sample must land near the anchor to match. A person who is STILL matches every
 # frame; a MOVING one outruns the last sample, and the person used to be dropped
@@ -1142,11 +1157,13 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
           f"floor-ray fallback {'ON' if ray_ok else 'OFF'} "
           f"(needs >= {MIN_RAY_PITCH_DEG:.0f}°)", flush=True)
 
-    spatial_off = cam_key in NO_SPATIAL
+    spatial_off = spatial_muted(cam_key)
     if spatial_off:
-        print(f"[live] {cam_key}: SPATIAL MUTED (SMARTROOM_NO_SPATIAL) — streaming, "
-              f"pose and recording continue; it publishes no room positions and no "
-              f"geo into its segments", flush=True)
+        why = ("not in SMARTROOM_SPATIAL_ONLY=" + ",".join(sorted(SPATIAL_ONLY))
+               if SPATIAL_ONLY else "SMARTROOM_NO_SPATIAL")
+        print(f"[live] {cam_key}: SPATIAL MUTED ({why}) — streaming, pose and "
+              f"recording continue; it publishes no room positions and no geo "
+              f"into its segments", flush=True)
     encoder = None
     if ids is not None and REID_ON:
         # Out-of-process (see _reid_worker). Its ONNX Runtime thread pool

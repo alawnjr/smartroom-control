@@ -627,14 +627,23 @@ def main() -> int:
     # switch live_infer.py reads). Skipped ENTIRELY rather than localized and
     # filtered later: the sidecar is what the 3D scene and the LAN API read, so
     # writing one would leave the bad positions in reach of every consumer.
+    # SMARTROOM_SPATIAL_ONLY is the allowlist form and wins when set: only those
+    # cameras are localized. Same semantics as live_infer.spatial_muted.
+    only = {c.strip() for c in os.environ.get("SMARTROOM_SPATIAL_ONLY", "").split(",")
+            if c.strip()}
     muted = {c.strip() for c in os.environ.get("SMARTROOM_NO_SPATIAL", "").split(",")
              if c.strip()}
-    if muted:
-        skipped = [c for c in clips if c.stem in muted]
-        clips = [c for c in clips if c.stem not in muted]
+    if only or muted:
+        allowed = (lambda stem: stem in only) if only else (lambda stem: stem not in muted)
+        keep = [c for c in clips if allowed(c.stem)]
+        skipped = len(clips) - len(keep)
+        clips = keep
         if skipped:
-            print(f"[{MODEL_KEY}] SPATIAL MUTED: skipping {len(skipped)} clip(s) from "
-                  f"{', '.join(sorted(muted))} (SMARTROOM_NO_SPATIAL)", file=sys.stderr)
+            why = ("only " + ", ".join(sorted(only)) + " may localize "
+                   "(SMARTROOM_SPATIAL_ONLY)") if only else \
+                  (", ".join(sorted(muted)) + " (SMARTROOM_NO_SPATIAL)")
+            print(f"[{MODEL_KEY}] SPATIAL MUTED: skipping {skipped} clip(s) — {why}",
+                  file=sys.stderr)
 
     todo = [c for c in clips if needs_processing(c, args.force)]
     print(f"[{MODEL_KEY}] {len(todo)}/{len(clips)} clip(s) to localize", file=sys.stderr)
