@@ -493,18 +493,28 @@ class SegmentRecorder:
 
     def _close(self):
         """Finish the current segment: keep it only if somebody was in it."""
-        if self.proc is None or self.dir is None:
+        if self.dir is None:
             return
-        try:
-            self.proc.stdin.close()
-            self.proc.wait(timeout=30)
-        except Exception:  # noqa: BLE001
-            try: self.proc.kill()
-            except Exception: pass
-        self.proc = None
+        # Cleanup must run even when the encoder is already gone. This used to
+        # bail on `self.proc is None`, which is exactly the state left behind when
+        # ffmpeg dies mid-segment (the write handler sets proc = None) -- so the
+        # zero-byte mp4 that ffmpeg's own -y had already created was never
+        # removed, and neither was its directory. The archive then carried a
+        # recording with no video, no metadata and no timestamps, which the
+        # listing still advertises and whose thumbnail 502s.
+        if self.proc is not None:
+            try:
+                self.proc.stdin.close()
+                self.proc.wait(timeout=30)
+            except Exception:  # noqa: BLE001
+                try: self.proc.kill()
+                except Exception: pass
+            self.proc = None
         rec_dir = self.dir.parent.parent          # .../rec_x
         mp4 = self.dir / f"{self.cam}.mp4"
-        if self.people_frames < SEGMENT_MIN_PEOPLE_FRAMES:
+        # No frames at all is also a discard: a segment that was opened and then
+        # interrupted has an empty mp4, which is worse than no recording.
+        if self.frames == 0 or self.people_frames < SEGMENT_MIN_PEOPLE_FRAMES:
             # nobody in it — discard, and remove the folder if the other camera
             # did not keep anything either.
             mp4.unlink(missing_ok=True)
