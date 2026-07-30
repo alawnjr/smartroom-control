@@ -331,6 +331,21 @@ class RecordControl:
 RECORD = RecordControl(SEGMENT_ALWAYS)
 
 
+def _segment_mode_note() -> str:
+    """Recording mode for the startup banner.
+
+    A plain function, not an inline conditional inside the banner's f-string: a
+    newline inside f-string braces is only valid from Python 3.12, so the
+    expression form parsed on this laptop (3.13) and was a SyntaxError on the
+    server's interpreter, crash-looping the service.
+    """
+    if not SEGMENT_ON:
+        return "off"
+    if SEGMENT_ALWAYS:
+        return "ALWAYS ON (%gs)" % SEGMENT_S
+    return "on demand (%gs chunks, POST /record/start)" % SEGMENT_S
+
+
 class SegmentRecorder:
     """Encodes the incoming JPEG stream to fixed-length mp4 segments.
 
@@ -2078,9 +2093,7 @@ def main():
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
     print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}  "
-          f"segments={('off' if not SEGMENT_ON else 'ALWAYS ON (%gs)' % SEGMENT_S
-                       if SEGMENT_ALWAYS else 'on demand (%gs chunks, POST /record/start)'
-                       % SEGMENT_S)}", flush=True)
+          f"segments={_segment_mode_note()}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
