@@ -623,6 +623,18 @@ def main() -> int:
         clips = sorted((p for name in SOURCES for p in root.rglob(name)),
                        key=lambda p: p.stat().st_mtime, reverse=True)
     clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
+    # Cameras whose room positions are not trusted (SMARTROOM_NO_SPATIAL, the same
+    # switch live_infer.py reads). Skipped ENTIRELY rather than localized and
+    # filtered later: the sidecar is what the 3D scene and the LAN API read, so
+    # writing one would leave the bad positions in reach of every consumer.
+    muted = {c.strip() for c in os.environ.get("SMARTROOM_NO_SPATIAL", "").split(",")
+             if c.strip()}
+    if muted:
+        skipped = [c for c in clips if c.stem in muted]
+        clips = [c for c in clips if c.stem not in muted]
+        if skipped:
+            print(f"[{MODEL_KEY}] SPATIAL MUTED: skipping {len(skipped)} clip(s) from "
+                  f"{', '.join(sorted(muted))} (SMARTROOM_NO_SPATIAL)", file=sys.stderr)
 
     todo = [c for c in clips if needs_processing(c, args.force)]
     print(f"[{MODEL_KEY}] {len(todo)}/{len(clips)} clip(s) to localize", file=sys.stderr)

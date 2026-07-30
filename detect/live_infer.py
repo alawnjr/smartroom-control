@@ -91,6 +91,20 @@ DEPTH_STALE_S = float(os.environ.get("SMARTROOM_DEPTH_STALE_S", "0.35"))
 # cancel; pushing both along their differing rays just separates them. Kept as a
 # knob in case the cameras are ever repositioned to face each other.
 BODY_HALF_DEPTH_MM = float(os.environ.get("SMARTROOM_BODY_HALF_DEPTH_MM", "0"))
+# Cameras whose ROOM POSITIONS are not trusted (comma-separated cam keys). They
+# keep streaming, keep their pose and action labels, and keep being recorded —
+# they just publish no spatial measurement, and no geo into their segments.
+#
+# Why a camera would be muted rather than fixed: a position is only as good as
+# the depth sample under it. The D435 sits close enough that a person fills its
+# frame, so it has no confident hip and falls back to the SHOULDER anchor, whose
+# depth lands on the wall behind them: it reported a person 1424 mm away when the
+# D455's estimate put them 383 mm away (3.7x — no depth bias does that). Fed into
+# the fusion, that placed one person in two spots ~1.1 m apart and counted them
+# twice. A camera contributing a wrong position is worse than one contributing
+# none, because the wrong one still gets averaged and still gets counted.
+NO_SPATIAL = {c.strip() for c in os.environ.get("SMARTROOM_NO_SPATIAL", "").split(",")
+              if c.strip()}
 # The depth back-channel polls at ~8Hz while the pose loop runs 30-60fps, and a
 # sample must land near the anchor to match. A person who is STILL matches every
 # frame; a MOVING one outruns the last sample, and the person used to be dropped
@@ -1005,6 +1019,11 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     tracker = _make_bytetrack()
     jumps = JumpDetector()
     held = {}          # tid -> (pos, t) last good room position, for POS_HOLD_S
+    spatial_off = cam_key in NO_SPATIAL
+    if spatial_off:
+        print(f"[live] {cam_key}: SPATIAL MUTED (SMARTROOM_NO_SPATIAL) — streaming, "
+              f"pose and recording continue; it publishes no room positions and no "
+              f"geo into its segments", flush=True)
     encoder = None
     if ids is not None and REID_ON:
         # Out-of-process (see _reid_worker). Its ONNX Runtime thread pool
@@ -1187,7 +1206,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 entry["actions"] = acts               # full above-threshold set
                 entry["action"] = acts[0][0]          # primary, for the map dot
                 entry["actionConf"] = acts[0][1]
-            positions.append(entry)
+            if not spatial_off:
+                positions.append(entry)
             _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts,
                          gid if gid is not None else tid)
         jumps.prune({tid for tid, *_ in found}, t0)
@@ -1201,16 +1221,24 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             # depth-measured room positions, so the segment is localizable
             # offline without a depth track. marker = the anchor pixel that was
             # depth-ranged; pos = its room (x,z).
-            geo_frame = [{"id": tid, "px": [float(marker[0]), float(marker[1])],
-                          "room": [float(pos[0]), float(pos[1])], "src": src}
-                         for tid, pos, marker, p, src in found]
+            # Muted camera: record the video but NOT the room positions, or the
+            # offline pass and the 3D scene would read them straight back out of
+            # the segment and we would have muted nothing.
+            geo_frame = [] if spatial_off else [
+                {"id": tid, "px": [float(marker[0]), float(marker[1])],
+                 "room": [float(pos[0]), float(pos[1])], "src": src}
+                for tid, pos, marker, p, src in found]
             recorder.add(jpeg, hw_ts, geo_frame)
         if tslog is not None:
             tslog.write(hw_ts, len(positions))
 
         dt = time.time() - t0
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
-        cv2.putText(frame, f"{cam_key}  {len(positions)} person(s)  {ema_fps:4.1f} fps",
+        # Count what was DETECTED, not what was published: a muted camera still
+        # sees people, and an overlay reading "0 person(s)" over a visible person
+        # would look like the detector had failed.
+        cv2.putText(frame, f"{cam_key}  {len(found)} person(s)"
+                           f"{'  [no spatial]' if spatial_off else ''}  {ema_fps:4.1f} fps",
                     (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
         ok, enc = cv2.imencode(".jpg", frame,
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
