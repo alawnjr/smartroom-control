@@ -19,8 +19,16 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/smartroom-control
 # .venv-action has ultralytics + mmaction + mmdet together (NOT .venv-detect)
+# The four camera_cam<N>_color entries are the Reolink NVR cameras, pushed in by
+# CityOSNode/reolink_live_forward.py from the host that can reach the NVR (the
+# quad server has no route to the camera network). They arrive as the NVR's SUB
+# stream, 640x360 h264, deliberately: the recorder keeps the 4K main stream on
+# disk, and four more 4K decodes here would land on top of the depth cameras'
+# pose work. A camera with no uploaded clip carrying calibration+extrinsics is
+# skipped at startup, so each of these needs one recording uploaded first.
 ExecStart=%h/smartroom-control/.venv-action/bin/python detect/live_infer.py \
-    --cam camera_d455_color,camera_d435_color --port 8010 --action ava
+    --cam camera_d455_color,camera_d435_color,camera_cam1_color,camera_cam2_color,camera_cam3_color,camera_cam4_color \
+    --port 8010 --action ava
 Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 # 3-minute segments; a segment needs this many frames containing people to be kept
 Environment=SMARTROOM_SEGMENT_S=180
