@@ -205,6 +205,17 @@ EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 # plumbing. Segments containing nobody are deleted on close — an empty room is
 # the overwhelming majority of wall-clock time and is not worth the disk.
 SEGMENT_ON = os.environ.get("SMARTROOM_SEGMENT", "1") != "0"
+# Recording is ARMED BY HAND (a Record button) rather than always-on. Running
+# continuously wrote a segment every 3 minutes forever -- 259 of them in one
+# stretch -- so the archive filled with footage nobody asked for, and every one
+# of those segments carried a copy of whatever calibration was current, which is
+# how a six-day-stale pose kept resurrecting itself. Set
+# SMARTROOM_SEGMENT_ALWAYS=1 to restore the old behaviour.
+SEGMENT_ALWAYS = os.environ.get("SMARTROOM_SEGMENT_ALWAYS", "0") != "0"
+# Hard ceiling on one armed recording, and the default when none is given. The
+# button is in a browser tab; a tab can close, sleep, or lose the network, and
+# none of those can be allowed to leave the encoder running indefinitely.
+RECORD_MAX_S = float(os.environ.get("SMARTROOM_RECORD_MAX_S", "1800"))   # 30 min
 SEGMENT_S = float(os.environ.get("SMARTROOM_SEGMENT_S", "180"))     # 3 minutes
 # A couple of stray detections should not preserve an otherwise empty segment.
 SEGMENT_MIN_PEOPLE_FRAMES = int(os.environ.get("SMARTROOM_SEGMENT_MIN_FRAMES", "15"))
@@ -260,6 +271,66 @@ def _day_dir(root: Path, when: dt.datetime) -> Path:
     return root / f"day_{(best or 0) + 1:02d}_{date}"
 
 
+class RecordControl:
+    """Whether recording is armed, shared by every camera.
+
+    ONE flag for all of them, not one per camera: segments are named after the
+    wall-clock boundary precisely so both cameras land in the same recording
+    folder, and arming them separately would produce takes that no longer pair.
+
+    `until` supports a bounded recording (start with a duration) so an armed
+    recorder cannot be left running by a closed browser tab.
+    """
+
+    def __init__(self, always: bool):
+        self.lock = threading.Lock()
+        self.always = always
+        self.armed = always
+        self.since = time.time() if always else None
+        self.until = None
+        self.label = None
+
+    def start(self, seconds=None, label=None):
+        with self.lock:
+            self.armed = True
+            self.since = time.time()
+            self.until = (self.since + float(seconds)) if seconds else None
+            self.label = label
+            return self._state_locked()
+
+    def stop(self):
+        with self.lock:
+            if self.always:      # configured always-on; a stop would be a lie
+                return self._state_locked()
+            self.armed = False
+            self.since = self.until = self.label = None
+            return self._state_locked()
+
+    def is_armed(self):
+        """True while recording. Expiry is checked HERE rather than by a timer
+        thread, so a bounded recording ends even if nothing else is running."""
+        with self.lock:
+            if self.armed and self.until is not None and time.time() >= self.until:
+                self.armed = False
+                self.since = self.until = self.label = None
+            return self.armed
+
+    def state(self):
+        with self.lock:
+            return self._state_locked()
+
+    def _state_locked(self):
+        now = time.time()
+        return {"recording": self.armed, "always": self.always,
+                "elapsedS": round(now - self.since, 1) if self.since else None,
+                "remainingS": (round(self.until - now, 1)
+                              if self.armed and self.until else None),
+                "label": self.label}
+
+
+RECORD = RecordControl(SEGMENT_ALWAYS)
+
+
 class SegmentRecorder:
     """Encodes the incoming JPEG stream to fixed-length mp4 segments.
 
@@ -293,6 +364,8 @@ class SegmentRecorder:
         them makes an RGB-only segment as localizable as a depth recording; the
         offline pass can't (no depth) and would otherwise floor-ray it into the
         walls."""
+        if not RECORD.is_armed():
+            return                         # not recording — drop it here, cheaply
         with self.cond:
             if len(self.q) < 240:          # ~8s at 30fps; never block inference
                 self.q.append((jpeg, hw_ts, positions))
@@ -303,8 +376,17 @@ class SegmentRecorder:
             with self.cond:
                 while not self.q:
                     self.cond.wait(timeout=1.0)
-                    if not self.q and self.proc and time.time() // SEGMENT_S != self.idx:
-                        self._rotate(int(time.time() // SEGMENT_S))
+                    if not self.q and self.proc:
+                        # Recording stopped: close NOW rather than leaving the mp4
+                        # open until some later frame happens to rotate it. Until
+                        # _close runs, the moov atom is missing and the clip is
+                        # unplayable — a Stop button that left the take unreadable
+                        # for minutes would look like it had lost the recording.
+                        if not RECORD.is_armed():
+                            self._close()
+                            self.proc = self.idx = None
+                        elif time.time() // SEGMENT_S != self.idx:
+                            self._rotate(int(time.time() // SEGMENT_S))
                 item = self.q.popleft()
             jpeg, hw_ts, positions = item
             idx = int(time.time() // SEGMENT_S)
@@ -1602,6 +1684,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
             if path == "/depths":
                 self._recv_depths()
                 return
+            if path in ("/record/start", "/record/stop"):
+                self._record(path.endswith("start"))
+                return
             if path != "/ingest":
                 self.send_error(404)
                 return
@@ -1668,8 +1753,48 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 self._hips()
             elif path == "/live.mjpg":
                 self._stream()
+            elif path == "/record/status":
+                self._json(RECORD.state())
             else:
                 self.send_error(404)
+
+        def do_OPTIONS(self):
+            # The Record button is served from the mirror on :3000 and posts here
+            # on :8010, so the browser preflights it.
+            self.send_response(204)
+            self._cors()
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.end_headers()
+
+        def _json(self, obj, code=200):
+            body = json.dumps(obj).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self._cors()
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _record(self, start):
+            q = parse_qs(urlparse(self.path).query)
+            if start:
+                secs = (q.get("seconds") or q.get("duration") or [None])[0]
+                try:
+                    secs = float(secs) if secs else None
+                except ValueError:
+                    secs = None
+                # Cap an open-ended request: a tab that closes mid-recording must
+                # not leave the encoder running until someone notices.
+                if secs is None:
+                    secs = RECORD_MAX_S
+                secs = max(1.0, min(secs, RECORD_MAX_S))
+                state = RECORD.start(secs, (q.get("label") or [None])[0])
+                print(f"[live] RECORD started ({secs:.0f}s max)", flush=True)
+            else:
+                state = RECORD.stop()
+                print("[live] RECORD stopped", flush=True)
+            self._json(state)
 
         def _hips(self):
             entry = self._cam()
@@ -1953,7 +2078,9 @@ def main():
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
     print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}  "
-          f"segments={'on (%gs)' % SEGMENT_S if SEGMENT_ON else 'off'}", flush=True)
+          f"segments={('off' if not SEGMENT_ON else 'ALWAYS ON (%gs)' % SEGMENT_S
+                       if SEGMENT_ALWAYS else 'on demand (%gs chunks, POST /record/start)'
+                       % SEGMENT_S)}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
