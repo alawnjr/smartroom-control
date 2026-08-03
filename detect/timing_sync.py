@@ -117,6 +117,17 @@ def _env_key(cam_key: str) -> str:
     return "SMARTROOM_TIME_OFFSET_" + cam_key.upper()
 
 
+def load_capture_clocks() -> dict:
+    """{cam_key: "hw" | "arrival"} — which clock to take that camera's frame time
+    from. Absent means "arrival", the only thing available before a calibration."""
+    try:
+        data = json.loads(timing_path().read_text())
+        return {str(k): ("hw" if v == "hw" else "arrival")
+                for k, v in (data.get("capture_clocks") or {}).items()}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
 def load_offsets() -> dict:
     """{cam_key: offset_ms} — subtract from that camera's arrival times.
 
@@ -400,6 +411,29 @@ def offset_from_edges(ref_edges, cam_edges, tol_ms=EDGE_TOL_MS):
     return off, matched, spread, flip
 
 
+# A camera whose own timestamp is a TRUE capture clock will place the light switches
+# at the same instants as the reference's does — that is what "same clock domain"
+# means. One whose timestamp is merely a receive time will place them late by
+# whatever happens upstream of it (the NVR's buffer), so it will not agree.
+#
+# This matters because a constant offset can only correct a constant delay. The
+# D435's delay is NOT constant: the Pi holds a 60-frameset queue (~2s at 30fps) to
+# keep recordings whole, and its depth follows the load, so the same camera measured
+# 228ms under light load and ~2.7s with six cameras and people in the room. Its
+# librealsense timestamp tracks that per frame, and using it is the only way to stay
+# in step. Cameras with no such clock keep the constant, which is all they have.
+HW_CLOCK_TOL_MS = float(os.environ.get("SMARTROOM_HW_CLOCK_TOL_MS", "300"))
+
+
+def _view(series, time_index):
+    """The same series expressed on another of its own time columns."""
+    out = []
+    for r in series:
+        if len(r) > time_index and r[time_index]:
+            out.append((r[time_index],) + tuple(r[1:]))
+    return out
+
+
 def _jitter_ms(series) -> float:
     """Spread of this camera's frame intervals — how steady its arrivals are.
 
@@ -511,13 +545,59 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
     for cam, series in series_by_cam.items():
         if cam not in usable:
             rejected[cam] = f"only {len(series)} frame(s) — not streaming?"
+    # --- which cameras carry a true capture clock, and what to use for each -----
+    # Solve a second time on the forwarders' own timestamps. A camera that lands
+    # within HW_CLOCK_TOL_MS of the reference there shares its clock domain, so its
+    # own per-frame timestamp is a real capture instant and beats any constant.
+    HW = 3
+    clocks, hw_offsets = {}, {}
+    ref_hw = _view(usable.get(reference, []), HW)
+    ref_transport = None
+    if ref_hw:
+        d = [r[0] - h[0] for r, h in zip(usable[reference], ref_hw)]
+        ref_transport = float(np.median(d)) if d else None
+        ref_hw_edges = light_edges(ref_hw)
+        for cam in list(offsets):
+            if cam == reference:
+                clocks[cam] = "hw" if ref_hw_edges else "arrival"
+                hw_offsets[cam] = 0.0
+                continue
+            cam_hw = _view(usable.get(cam, []), HW)
+            if not (cam_hw and ref_hw_edges):
+                clocks[cam] = "arrival"
+                continue
+            try:
+                hw_off, _m, _s, _f = offset_from_edges(ref_hw_edges, light_edges(cam_hw))
+            except ValueError:
+                clocks[cam] = "arrival"
+                continue
+            hw_offsets[cam] = round(hw_off, 1)
+            clocks[cam] = "hw" if abs(hw_off) <= HW_CLOCK_TOL_MS else "arrival"
+    # Both families must end up on the SAME timeline. The hw family lands on the
+    # reference's capture clock; the arrival family was measured against the
+    # reference's ARRIVAL, which is its capture plus its own transport delay — so
+    # that delay has to be added back or the two families sit apart by it.
+    if clocks.get(reference) == "hw" and ref_transport:
+        for cam, how in clocks.items():
+            if how == "arrival" and cam in offsets:
+                offsets[cam] = round(offsets[cam] + ref_transport, 1)
+        quality.setdefault(reference, {})["reference_transport_ms"] = round(ref_transport, 1)
+    for cam, how in clocks.items():
+        if cam in quality:
+            quality[cam]["capture_clock"] = how
+            if how == "hw":
+                quality[cam]["hw_offset_ms"] = hw_offsets.get(cam, 0.0)
+                offsets[cam] = hw_offsets.get(cam, 0.0)
+
     return {
-        "schema_version": "1",
+        "schema_version": "2",
         "reference": reference,
-        "offsets_ms": offsets,     # subtract from that camera's ARRIVAL times
+        # Subtract from whichever clock `capture_clocks` names for that camera.
+        "offsets_ms": offsets,
+        "capture_clocks": clocks,
         "quality": quality,
         "rejected": rejected,
-        "basis": "server frame-arrival time",
+        "basis": "reference camera's capture clock",
         "method": "frame-difference energy cross-correlation (lights on/off)",
         "measured_at": dt.datetime.now().astimezone().isoformat(),
     }
@@ -731,6 +811,38 @@ def _selftest() -> int:
                  "cam": _with_brightness(b8, 80.0, n_flips=1, seed=14)}, reference="ref")
     check("a single transition is handled without crashing",
           "cam" in one["offsets_ms"] or "cam" in one["rejected"])
+
+    print("solve(): a camera with a real capture clock is put ON it, not given a constant")
+    def _cam(lag_ms, hw_is_capture, seed=1):
+        base = _with_brightness(_synthetic(0.0, n=900, rate_ms=50.0, seed=seed)[0],
+                                80.0, seed=seed)
+        return [(t + lag_ms, e, b, (t if hw_is_capture else t + lag_ms))
+                for t, e, b in base]
+    # ref: a RealSense, small lag, true hw clock. backlog: the D435 — big lag from the
+    # Pi's frameset queue, but still a true per-frame clock. nvr: Reolink, whose hw
+    # stamp is only when the forwarding host received the frame.
+    tri = {"ref": _cam(100.0, True), "backlog": _cam(2700.0, True),
+           "nvr": _cam(3460.0, False)}
+    r9 = solve(tri, reference="ref")
+    cl = r9["capture_clocks"]
+    check("reference on its hw clock", cl["ref"] == "hw")
+    check("backlogged camera on its hw clock", cl.get("backlog") == "hw", str(cl))
+    check("so its constant offset collapses to ~0",
+          abs(r9["offsets_ms"]["backlog"]) < 60, str(r9["offsets_ms"].get("backlog")))
+    check("receive-time camera stays on arrival", cl.get("nvr") == "arrival", str(cl))
+    # capture = arrival - offset, so the offset must be the FULL lag. The raw edge
+    # measurement only sees nvr-vs-ref arrival (3360); adding the reference's own
+    # transport delay back is what makes it 3460.
+    check("its offset is its full lag, not its lag vs the reference's arrival",
+          abs(r9["offsets_ms"]["nvr"] - 3460.0) < 80,
+          f"{r9['offsets_ms'].get('nvr')} (raw edge measure would be 3360)")
+    for name, hw_is_cap, lag in (("ref", True, 100.0), ("backlog", True, 2700.0),
+                                 ("nvr", False, 3460.0)):
+        off = r9["offsets_ms"][name]
+        errs = [abs(((hw if cl[name] == "hw" else arr) - off) - (arr - lag))
+                for arr, _e, _b, hw in tri[name][:200]]
+        check(f"{name} recovers the true capture instant",
+              float(np.median(errs)) < 80, f"median err {np.median(errs):.0f}ms")
 
     print("solve(): picks a reference when none is given")
     res2 = solve({"few": a[:40], "many": b})

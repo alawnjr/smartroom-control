@@ -293,7 +293,8 @@ EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 # calibration/camera_timing.json measures), but that says nothing about how long
 # the depth page, live_forward and the network take to deliver a frame here —
 # which is the delay that has to match Reolink's to fuse against it.
-CAM_OFFSETS = {}           # cam_key -> ms to subtract from its arrival times
+CAM_OFFSETS = {}           # cam_key -> ms to subtract from its chosen clock
+CAM_CLOCKS = {}            # cam_key -> "hw" (own per-frame stamp) | "arrival"
 OFFSETS_LOCK = threading.Lock()
 
 
@@ -303,11 +304,14 @@ def reload_offsets(cam_keys=None) -> dict:
     restart — the point of a calibration button is not having to bounce six
     models to use its result."""
     stored = timing_sync.load_offsets()
+    clocks = timing_sync.load_capture_clocks()
     keys = set(stored) | set(cam_keys or ()) | set(CAM_OFFSETS)
     fresh = {k: timing_sync.offset_ms_for(k, stored) for k in keys}
     with OFFSETS_LOCK:
         CAM_OFFSETS.clear()
         CAM_OFFSETS.update(fresh)
+        CAM_CLOCKS.clear()
+        CAM_CLOCKS.update({k: clocks.get(k, "arrival") for k in keys})
         return dict(CAM_OFFSETS)
 
 
@@ -321,21 +325,64 @@ def all_offsets() -> dict:
         return dict(CAM_OFFSETS)
 
 
+def cam_clock(cam_key: str) -> str:
+    with OFFSETS_LOCK:
+        return CAM_CLOCKS.get(cam_key, "arrival")
+
+
+def capture_time_s(cam_key, recv_ms, hw_ms, fallback):
+    """When this frame was captured, on the shared timeline.
+
+    Two sources, chosen per camera by the calibration. "hw" means the forwarder
+    sends a real per-frame capture instant (librealsense global time), which is the
+    ONLY thing that can follow a delay that moves — the Pi's frameset queue holds up
+    to ~2s and its depth follows the load, so the same camera has measured 228ms and
+    2.7s within a day. "arrival" means the camera has no such clock (RTSP carries
+    none), leaving a constant offset as the best available.
+    """
+    if cam_clock(cam_key) == "hw" and hw_ms:
+        return hw_ms / 1000.0 - cam_offset_ms(cam_key) / 1000.0
+    if recv_ms:
+        return recv_ms / 1000.0 - cam_offset_ms(cam_key) / 1000.0
+    return fallback
+
+
+# Delay each camera is OBSERVED to run behind, as a running mean of
+# (now - capture time) per frame. Measured rather than taken from the stored
+# offsets because a camera on its own hardware clock has an offset of ~0 while its
+# frames are still genuinely seconds old — the D435 reads +0 and arrives 2.7s late.
+# Using the offsets would have quietly stopped holding anything back for it.
+OBS_DELAY = {}
+OBS_DELAY_ALPHA = 0.02         # ~50 frames to settle; ignores single late frames
+
+
+def note_observed_delay(cam_key: str, t_cap: float):
+    d = max(0.0, (time.time() - t_cap) * 1000.0)
+    with OFFSETS_LOCK:
+        prev = OBS_DELAY.get(cam_key)
+        OBS_DELAY[cam_key] = d if prev is None else (
+            (1 - OBS_DELAY_ALPHA) * prev + OBS_DELAY_ALPHA * d)
+
+
 def present_delay_ms() -> float:
     """How far behind live to present every camera, so they show one instant.
 
-    The slowest camera sets the pace — holding anything back by less than its delay
-    could not bring the two into step. Derived from the offsets each time rather
-    than cached, so a fresh calibration changes the pace without a restart. Zero
-    when nothing has been measured, which leaves the old behaviour untouched.
+    The slowest camera sets the pace — holding anything back by less than its own
+    delay could not bring the two into step. Derived fresh each time, so both a new
+    calibration and a camera whose backlog grows change the pace without a restart.
+    Zero until something has been observed, which leaves the old behaviour intact.
     """
     if not PRESENT_SYNC:
         return 0.0
     if PRESENT_DELAY_MS > 0:
         return PRESENT_DELAY_MS
-    offs = all_offsets()
-    worst = max([v for v in offs.values() if v > 0] or [0.0])
-    return worst + PRESENT_MARGIN_MS if worst > 0 else 0.0
+    with OFFSETS_LOCK:
+        observed = [v for v in OBS_DELAY.values() if v > 0]
+    worst = max(observed) if observed else max(
+        [v for v in all_offsets().values() if v > 0] or [0.0])
+    if worst <= 0:
+        return 0.0
+    return min(worst + PRESENT_MARGIN_MS, PRESENT_MAX_DELAY_MS)
 
 
 # Sampling for the calibration: the frame-difference energy of a downscaled gray
@@ -363,6 +410,9 @@ PRESENT_MARGIN_MS = float(os.environ.get("SMARTROOM_PRESENT_MARGIN_MS", "400"))
 # Override to pin the delay by hand; empty/0 means "derive it from the offsets".
 PRESENT_DELAY_MS = float(os.environ.get("SMARTROOM_PRESENT_DELAY_MS", "0") or 0)
 PRESENT_TICK_S = 0.02          # how often due frames are released
+# Ceiling on the derived delay, so one wedged camera cannot push the whole view
+# arbitrarily far into the past.
+PRESENT_MAX_DELAY_MS = float(os.environ.get("SMARTROOM_PRESENT_MAX_DELAY_MS", "8000"))
 # Bound the hold buffer per camera. 240 frames is ~16s at 15fps, far past any
 # plausible delay, and caps memory at roughly 10MB of JPEG per camera.
 PRESENT_MAX_FRAMES = int(os.environ.get("SMARTROOM_PRESENT_MAX_FRAMES", "240"))
@@ -597,9 +647,17 @@ class TimingCalibration:
             self._reset_run()
             return True, self.state_locked()
 
-    def sample(self, cam_key, arrival_ms, energy, brightness=None):
+    def sample(self, cam_key, arrival_ms, energy, brightness=None, hw_ms=0.0):
         """Called from the pose loop for every frame while armed. Cheap: one
-        bool test when disarmed, one append when armed."""
+        bool test when disarmed, one append when armed.
+
+        hw_ms is the forwarder's own timestamp for this frame. For a RealSense it is
+        librealsense global time — a genuine per-frame capture instant, read off the
+        frameset AFTER it leaves the Pi's queue, so it tracks a varying backlog that
+        no constant offset can. For a Reolink it is merely when the forwarding host
+        received the frame, which excludes the NVR's delay. Recording it lets the
+        solve work out, per camera, which of the two it is looking at.
+        """
         if not self.armed:
             return
         with self.lock:
@@ -608,7 +666,8 @@ class TimingCalibration:
             rows = self.series.setdefault(cam_key, [])
             if len(rows) < TIMING_MAX_SAMPLES:
                 rows.append((float(arrival_ms), float(energy),
-                             float(brightness if brightness is not None else 0.0)))
+                             float(brightness if brightness is not None else 0.0),
+                             float(hw_ms or 0.0)))
 
     def expired(self):
         return self.armed and time.time() >= self.until
@@ -639,7 +698,11 @@ class TimingCalibration:
             key: {"samples": len(rows),
                   "brightness_swing": round(timing_sync.brightness_swing(rows), 2),
                   "median_brightness": round(
-                      float(np.median([r[2] for r in rows])) if rows else 0.0, 1)}
+                      float(np.median([r[2] for r in rows])) if rows else 0.0, 1),
+                  # median transport delay implied by the forwarder's own clock
+                  "hw_delay_ms": round(float(np.median(
+                      [r[0] - r[3] for r in rows if len(r) > 3 and r[3]])), 1)
+                  if any(len(r) > 3 and r[3] for r in rows) else None}
             for key, rows in sorted(series.items())
         }
         with self.lock:
@@ -652,8 +715,9 @@ class TimingCalibration:
             raw = timing_sync.timing_path().with_name("live_timing_last_run.json")
             raw.parent.mkdir(parents=True, exist_ok=True)
             raw.write_text(json.dumps(
-                {"series": {k: [[round(t, 1), round(e, 4), round(b, 2)]
-                                for t, e, b in v] for k, v in series.items()}},
+                {"series": {k: [[round(r[0], 1), round(r[1], 4), round(r[2], 2),
+                                 round(r[3], 1)] for r in v]
+                            for k, v in series.items()}},
                 separators=(",", ":")))
         except (OSError, ValueError) as exc:
             print(f"[live] could not save timing raw series: {exc}", flush=True)
@@ -779,8 +843,16 @@ class SegmentRecorder:
         ago — so its idle bookkeeping (when to rotate, when to give up waiting) has
         to run on that clock too, or it would rotate a segment before the frames
         belonging to it had arrived.
+
+        Uses the OBSERVED lag rather than the stored offset: a camera on its own
+        hardware clock has an offset of ~0 while its frames are still seconds old,
+        and the offset would put this clock 2.7s into that camera's future.
         """
-        return time.time() - cam_offset_ms(self.cam) / 1000.0
+        with OFFSETS_LOCK:
+            lag = OBS_DELAY.get(self.cam)
+        if lag is None:
+            lag = cam_offset_ms(self.cam)
+        return time.time() - lag / 1000.0
 
     def _run(self):
         while True:
@@ -1719,8 +1791,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         # less the measured delay of this camera's delivery path. Everything that
         # compares one camera against another must use this and not the clock —
         # see the CAM_OFFSETS comment.
-        t_frame = (recv_ms / 1000.0 - cam_offset_ms(cam_key) / 1000.0
-                   if recv_ms else t_start)
+        t_frame = capture_time_s(cam_key, recv_ms, hw_ts, t_start)
+        note_observed_delay(cam_key, t_frame)
         frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             continue
@@ -1737,7 +1809,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 # event was the LIGHTS and not somebody walking about.
                 TIMING.sample(cam_key, recv_ms or t_start * 1000.0,
                               float(cv2.absdiff(gray, timing_prev).mean()),
-                              float(gray.mean()))
+                              float(gray.mean()), hw_ms=hw_ts)
             timing_prev = gray
         elif timing_prev is not None:
             timing_prev = None
