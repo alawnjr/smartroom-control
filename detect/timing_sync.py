@@ -129,9 +129,19 @@ def correlate(series_a, series_b, grid_ms=GRID_MS, max_lag_ms=MAX_LAG_MS):
     offset_ms > 0 means series B's frames carry the same physical event LATER
     than A's — i.e. B is the laggier camera and B's times need it subtracted.
 
-    Both series are resampled onto a common grid, then z-scored: the cameras
-    have different exposures, gains and resolutions, so only the SHAPE of each
-    energy curve is comparable, never its magnitude.
+    Both series are resampled onto a common grid, then compared by PEARSON
+    correlation at each candidate lag: the cameras have different exposures, gains
+    and resolutions, so only the SHAPE of each energy curve is comparable, never
+    its magnitude, and Pearson is invariant to both.
+
+    The correlation is recomputed over each lag's overlapping window rather than
+    z-scoring the whole series once and taking a sliding dot product. The cheaper
+    version is fine for LOCATING the peak but its value is not a correlation — the
+    sliced windows are no longer zero-mean unit-variance, so it can exceed 1.0
+    (measured: 1.07) and the "is this camera correlated enough to trust" threshold
+    was being applied to an unbounded number. That let a camera watching a static
+    scene through sensor noise pass at exactly the threshold and be assigned a
+    -1168 ms offset it had no basis for.
     """
     if len(series_a) < MIN_SAMPLES or len(series_b) < MIN_SAMPLES:
         raise ValueError("too few frames — was the camera streaming?")
@@ -146,12 +156,8 @@ def correlate(series_a, series_b, grid_ms=GRID_MS, max_lag_ms=MAX_LAG_MS):
     grid = np.arange(t0, t1, grid_ms)
     a = np.interp(grid, ta, ea)
     b = np.interp(grid, tb, eb)
-    a -= a.mean()
-    b -= b.mean()
     if a.std() < 1e-9 or b.std() < 1e-9:
         raise ValueError("a camera saw no change at all — flip the lights")
-    a /= a.std()
-    b /= b.std()
 
     n = len(grid)
     span = int(max_lag_ms / grid_ms)
@@ -160,13 +166,18 @@ def correlate(series_a, series_b, grid_ms=GRID_MS, max_lag_ms=MAX_LAG_MS):
     for i, lag in enumerate(lags):
         # b shifted later than a by `lag` samples
         if lag >= 0:
-            m = n - lag
-            if m > MIN_SAMPLES:
-                corr[i] = float(np.dot(a[:m], b[lag:]) / m)
+            x, y = a[: n - lag], b[lag:]
         else:
-            m = n + lag
-            if m > MIN_SAMPLES:
-                corr[i] = float(np.dot(a[-lag:], b[:m]) / m)
+            x, y = a[-lag:], b[: n + lag]
+        m = len(x)
+        if m <= MIN_SAMPLES:
+            continue
+        sx, sy = x.std(), y.std()
+        if sx < 1e-9 or sy < 1e-9:
+            continue
+        corr[i] = float(((x * y).mean() - x.mean() * y.mean()) / (sx * sy))
+    if not np.any(corr > -2.0):
+        raise ValueError("no comparable window between these cameras — rerun")
     i = int(np.argmax(corr))
     best_lag, best_corr = float(lags[i]), float(corr[i])
     # Sub-grid refinement: a sharp common edge (a light switch) peaks between two
@@ -310,6 +321,12 @@ def _selftest() -> int:
         check(f"lag {truth:+.0f}ms", abs(off - truth) <= 12.0 and corr > 0.5,
               f"got {off:+.1f}ms r={corr:.2f}")
 
+    print("correlate(): the score really is a correlation")
+    for truth in (0.0, 120.0, -200.0):
+        a, b = _synthetic(truth)
+        _, corr, _ = correlate(a, b)
+        check(f"|r| <= 1 at lag {truth:+.0f}ms", -1.0 <= corr <= 1.0, f"r={corr:.3f}")
+
     print("correlate(): rejects garbage")
     rng = np.random.default_rng(1)
     t = np.arange(400) * 66.0
@@ -317,6 +334,13 @@ def _selftest() -> int:
     noise_only = list(zip(t, rng.normal(0, 1, len(t))))
     _, corr, _ = correlate(a, noise_only)
     check("uncorrelated series scores low", corr < MIN_CORRELATION, f"r={corr:.2f}")
+    # A camera pointed at something the lights do not reach sees only its own
+    # sensor noise on a flat scene. This is what slipped through the old
+    # unbounded score at exactly the threshold; it must be well clear now.
+    static = list(zip(t, 40.0 + rng.normal(0, 0.3, len(t))))
+    _, corr, _ = correlate(a, static)
+    check("static-scene camera scores well below the bar",
+          corr < MIN_CORRELATION * 0.7, f"r={corr:.2f}")
     try:
         correlate(a[:5], a[:5])
         check("too-few-frames raises", False)
