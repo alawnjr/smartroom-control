@@ -482,6 +482,13 @@ class TimingCalibration:
         self.result = None        # last solve output (also written to disk)
         self.error = None
         self.started = None
+        self.diagnostics = None   # per-camera samples/brightness from the last run
+
+    def _reset_run(self):
+        self.series = {}
+        self.result = None
+        self.error = None
+        self.diagnostics = None
 
     def start(self, seconds, reference=None):
         # Floor above timing_sync's minimum window: a shorter run could only ever
@@ -496,9 +503,7 @@ class TimingCalibration:
             self.started = time.time()
             self.until = self.started + seconds
             self.reference = reference or None
-            self.series = {}
-            self.result = None
-            self.error = None
+            self._reset_run()
             return True, self.state_locked()
 
     def sample(self, cam_key, arrival_ms, energy, brightness=None):
@@ -533,6 +538,21 @@ class TimingCalibration:
             self.series = {}
         for key in cam_keys:
             series.setdefault(key, [])
+        # Per-camera numbers recorded BEFORE the solve, and kept whether it
+        # succeeds or not. On the "lights never changed" path the solve raises and
+        # its message rounds to whole gray levels, which cannot distinguish a
+        # genuinely static room (0.4) from brightness never being sampled at all
+        # (exactly 0.00) — and the second would silently block every legitimate
+        # run. These make that difference visible instead of a guess.
+        diagnostics = {
+            key: {"samples": len(rows),
+                  "brightness_swing": round(timing_sync.brightness_swing(rows), 2),
+                  "median_brightness": round(
+                      float(np.median([r[2] for r in rows])) if rows else 0.0, 1)}
+            for key, rows in sorted(series.items())
+        }
+        with self.lock:
+            self.diagnostics = diagnostics
         try:
             result = timing_sync.solve(series, reference=reference)
             path = timing_sync.save(result)
@@ -570,6 +590,7 @@ class TimingCalibration:
             "samples": {k: len(v) for k, v in self.series.items()},
             "result": self.result,
             "error": self.error,
+            "diagnostics": self.diagnostics,
             "offsetsMs": all_offsets(),
             "instructions": ("Flip the room lights fully off and back on 3-4 times, "
                              "a couple of seconds apart, while this runs."),
