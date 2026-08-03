@@ -1132,6 +1132,7 @@ class Shared:
         self.updated_ms = 0
         self.fps = 0.0
         self.hw_ts = 0.0             # sensor timestamp of the newest output frame
+        self.frame_cap_ms = 0.0      # capture instant of the DISPLAYED frame
         # depth back-channel: the server publishes the latest hip pixels it wants
         # ranged, the Pi forwarder samples its own /value there and posts metres
         # back (D455 depth aligned to color). Both keyed in frame-fraction coords.
@@ -1238,7 +1239,7 @@ class Shared:
         """
         if t_cap is None or present_delay_ms() <= 0:
             with self.cond:
-                self._publish_locked(jpeg, positions, fps, hw_ts)
+                self._publish_locked(jpeg, positions, fps, hw_ts, t_cap)
             return
         with self.cond:
             self.pending.append((t_cap, jpeg, positions, fps, hw_ts))
@@ -1258,11 +1259,15 @@ class Shared:
                 pick = self.pending.popleft()
             if pick is None:
                 return False
-            _t, jpeg, positions, fps, hw_ts = pick
-            self._publish_locked(jpeg, positions, fps, hw_ts)
+            t_cap, jpeg, positions, fps, hw_ts = pick
+            self._publish_locked(jpeg, positions, fps, hw_ts, t_cap)
             return True
 
-    def _publish_locked(self, jpeg, positions, fps, hw_ts):
+    def _publish_locked(self, jpeg, positions, fps, hw_ts, t_cap=None):
+        # The instant the displayed frame was CAPTURED, on the shared timeline.
+        # Published so "the cameras are in step" is something you can read off the
+        # API and check, rather than infer from the delay arithmetic.
+        self.frame_cap_ms = (t_cap * 1000.0) if t_cap else 0.0
         self.out_jpeg = jpeg
         self.out_id += 1
         self.positions = positions
@@ -2494,6 +2499,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                     merged.extend(sh.positions)
                     per_cam[key] = {"fps": sh.fps, "updatedMs": sh.updated_ms,
                                     "hwTimestampMs": round(sh.hw_ts, 3),
+                                    # capture instant of the frame on screen —
+                                    # equal across cameras when synced
+                                    "frameCaptureMs": round(sh.frame_cap_ms, 1),
                                     # ms subtracted from this camera's arrival
                                     # times to put it on the shared timeline
                                     "timeOffsetMs": round(cam_offset_ms(key), 1),
