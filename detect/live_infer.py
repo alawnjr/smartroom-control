@@ -2577,6 +2577,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                                     # ms subtracted from this camera's arrival
                                     # times to put it on the shared timeline
                                     "timeOffsetMs": round(cam_offset_ms(key), 1),
+                                    # which clock this camera's frame time comes
+                                    # from: its own per-frame stamp, or arrival
+                                    "captureClock": cam_clock(key),
                                     "persons": len(sh.positions),
                                     "roomFrame": e["roomFrame"],
                                     "recording": (e["recorder"].stats()
