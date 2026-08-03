@@ -256,7 +256,19 @@ def _has_brightness(series) -> bool:
 # correlation.
 EDGE_TOL_MS = float(os.environ.get("SMARTROOM_TIMING_EDGE_TOL_MS", "150"))
 EDGE_MAX_LAG_MS = float(os.environ.get("SMARTROOM_TIMING_EDGE_MAX_LAG_MS", "10000"))
+# Two. It is tempting to demand three -- a 2-edge vote is thin -- but on real data
+# the cameras do not all detect the same transitions: over one 22s run with 4 flips
+# the D455 resolved 5 edges, the D435 6, cam4 5, and only 2-3 of them lined up per
+# camera. Demanding 3 would have REJECTED the D435's +2732 ms, which independent
+# observation (a hand waved in front of both cameras) confirmed is correct.
+#
+# The real protection against a thin vote is the ambiguity check in
+# offset_from_edges, which refuses when a rival alignment explains just as many
+# edges -- that is what actually distinguishes a sparse-but-unique answer from a
+# coin toss between offsets one flip apart. Matches below this are reported as
+# low-confidence rather than silently trusted.
 MIN_EDGES_MATCHED = 2
+CONFIDENT_EDGES = 3
 MAX_EDGE_SPREAD_MS = 250.0
 
 
@@ -306,45 +318,86 @@ def light_edges(series, min_swing=None):
     return edges
 
 
-def offset_from_edges(ref_edges, cam_edges, tol_ms=EDGE_TOL_MS):
-    """(offset_ms, matched, spread_ms) by aligning two cameras' switch times.
+def _align_edges(ref_edges, cam_edges, flip, tol_ms):
+    """Best (matched, -spread, offset_ms) alignment under one polarity hypothesis.
 
-    Every same-direction pairing is a candidate offset and each is scored by how
-    many OTHER edges it also aligns -- a vote, not a fit, so one spurious edge
-    cannot drag the answer. Raises ValueError when too few edges agree.
+    Every compatible pairing is a candidate offset, scored by how many OTHER edges
+    it also aligns -- a vote, not a fit, so one spurious edge cannot drag the answer.
     """
-    if len(ref_edges) < MIN_EDGES_MATCHED or len(cam_edges) < MIN_EDGES_MATCHED:
-        raise ValueError(f"only {min(len(ref_edges), len(cam_edges))} light "
-                         "transition(s) seen — flip the lights more times")
     best = None
     for tc, dc in cam_edges:
+        want = -dc if flip else dc
         for tr, dr in ref_edges:
-            if dr != dc:
+            if dr != want:
                 continue
             cand = tc - tr
             if abs(cand) > EDGE_MAX_LAG_MS:
                 continue
             diffs = []
             for tc2, dc2 in cam_edges:
+                w2 = -dc2 if flip else dc2
                 same = [tr2 for tr2, dr2 in ref_edges
-                        if dr2 == dc2 and abs((tc2 - tr2) - cand) <= tol_ms]
+                        if dr2 == w2 and abs((tc2 - tr2) - cand) <= tol_ms]
                 if same:
                     nearest = min(same, key=lambda x: abs((tc2 - x) - cand))
                     diffs.append(tc2 - nearest)
             if not diffs:
                 continue
             spread = (max(diffs) - min(diffs)) if len(diffs) > 1 else 0.0
-            score = (len(diffs), -spread)
-            if best is None or score > best[0]:
-                best = (score, float(np.median(diffs)), len(diffs), float(spread))
-    if best is None or best[2] < MIN_EDGES_MATCHED:
+            candidate = (len(diffs), -spread, float(np.median(diffs)))
+            if best is None or candidate[:2] > best[:2]:
+                best = candidate
+    return best
+
+
+def offset_from_edges(ref_edges, cam_edges, tol_ms=EDGE_TOL_MS):
+    """(offset_ms, matched, spread_ms, inverted) by aligning two cameras' switches.
+
+    BOTH POLARITIES ARE TRIED, because one camera's mean brightness need not move
+    the same way as another's -- aggressive auto-exposure ramps gain when the room
+    goes dark and can overshoot. Whichever hypothesis explains MORE edges wins, so a
+    camera behaving normally is unaffected: this opens a door, it does not push
+    anything through it.
+
+    An ambiguous winner is refused rather than picked. With sparse edges and
+    evenly-spaced flips, an alignment off by one whole flip scores almost as well as
+    the truth, and guessing between them silently produces an answer wrong by the
+    flip interval. This, not a minimum edge count, is the real guard: on real data
+    the cameras disagree about which transitions they even saw, so a correct answer
+    is often supported by only two or three edges.
+    """
+    if len(ref_edges) < MIN_EDGES_MATCHED or len(cam_edges) < MIN_EDGES_MATCHED:
+        raise ValueError(f"only {min(len(ref_edges), len(cam_edges))} light "
+                         f"transition(s) seen, need {MIN_EDGES_MATCHED} — flip the "
+                         "lights more times")
+    straight = _align_edges(ref_edges, cam_edges, False, tol_ms)
+    inverted = _align_edges(ref_edges, cam_edges, True, tol_ms)
+    options = [(o, f) for o, f in ((straight, False), (inverted, True)) if o]
+    if not options:
         raise ValueError("this camera's light transitions did not line up with the "
                          "reference's — flip the lights more times, more slowly")
-    if best[3] > MAX_EDGE_SPREAD_MS:
-        raise ValueError(f"its light transitions disagree by up to {best[3]:.0f} ms, "
+    options.sort(key=lambda of: of[0][:2], reverse=True)
+    best, flip = options[0]
+    matched, spread, off = best[0], -best[1], best[2]
+    if matched < MIN_EDGES_MATCHED:
+        raise ValueError(f"only {matched} of its {len(cam_edges)} light transitions "
+                         f"line up with the reference (need {MIN_EDGES_MATCHED}) — "
+                         "flip the lights more times")
+    # A rival alignment that explains just as many edges means the answer is a
+    # coin toss between offsets a whole flip apart. Uneven gaps between flips
+    # break the tie, so that is what to ask for.
+    rivals = [o for o, _ in options[1:] if o[0] >= matched
+              and abs(o[2] - off) > tol_ms]
+    if rivals:
+        raise ValueError(
+            f"two different delays ({off:+.0f} ms and {rivals[0][2]:+.0f} ms) explain "
+            "this camera's light transitions equally well — flip the lights at UNEVEN "
+            "intervals (e.g. 1s, 4s, 2s, 6s) so only one can fit")
+    if spread > MAX_EDGE_SPREAD_MS:
+        raise ValueError(f"its light transitions disagree by up to {spread:.0f} ms, "
                          "so it has no single delay (dropped frames or a variable "
                          "buffer) — rerun, and check that camera's frame rate")
-    return best[1], best[2], best[3]
+    return off, matched, spread, flip
 
 
 def _jitter_ms(series) -> float:
@@ -424,11 +477,18 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
         edge_err = None
         if ref_edges and edges.get(cam):
             try:
-                off, matched, spread = offset_from_edges(ref_edges, edges[cam])
+                off, matched, spread, inverted = offset_from_edges(ref_edges, edges[cam])
                 offsets[cam] = round(off, 1)
                 quality[cam] = {**common, "method": "light-edges",
                                 "edges_matched": matched,
-                                "edge_spread_ms": round(spread, 1)}
+                                "edge_spread_ms": round(spread, 1),
+                                # Unique but thin: trustworthy enough to publish
+                                # (nothing else explained the edges as well) while
+                                # worth re-running with more flips to confirm.
+                                "low_confidence": matched < CONFIDENT_EDGES,
+                                # True = its brightness moves opposite the
+                                # reference's, i.e. auto-exposure is overshooting.
+                                "polarity_inverted": inverted}
                 continue
             except ValueError as exc:
                 edge_err = str(exc)
