@@ -26,8 +26,16 @@ WorkingDirectory=%h/smartroom-control
 # disk, and four more 4K decodes here would land on top of the depth cameras'
 # pose work. A camera with no uploaded clip carrying calibration+extrinsics is
 # skipped at startup, so each of these needs one recording uploaded first.
+# The D435 is DROPPED from the live pipeline (2026-08-03, at the user's request).
+# It was never worth its trouble here: the Pi's 60-frameset queue gives it a delay
+# that follows the load rather than a constant (228ms to 2.7s within a day), its
+# auto-exposure leaves a 48-level brightness swing that the timing calibration cannot
+# get a reliable reading from, its depth over-reads by 7% pending Intel's on-chip
+# self-calibration, and it sees its tags too head-on to calibrate its pose well. The
+# D455 carries the depth work alone. To bring it back, add camera_d435_color here and
+# to SMARTROOM_HW_CLOCK_CAMS below.
 ExecStart=%h/smartroom-control/.venv-action/bin/python detect/live_infer.py \
-    --cam camera_d455_color,camera_d435_color,camera_cam1_color,camera_cam2_color,camera_cam3_color,camera_cam4_color \
+    --cam camera_d455_color,camera_cam1_color,camera_cam2_color,camera_cam3_color,camera_cam4_color \
     --port 8010 --action ava
 Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 # ONLY these cameras publish room positions; every other camera streams, poses and
@@ -47,14 +55,12 @@ Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 #     its accuracy never was, and ray positions are looser than depth ones — at the
 #     600mm GEO_MERGE_MM they risk splitting one person into two.
 Environment=SMARTROOM_SPATIAL_ONLY=camera_d455_color
-# Both RealSense send librealsense global time — one clock domain by construction,
-# same host, so use each frame's OWN capture instant instead of a constant offset.
-# Stated rather than measured because the D435's auto-exposure leaves its brightness
-# swing (48 levels vs the D455's 87) too weak for the light-edge test to settle it,
-# and it is precisely the camera that needs a per-frame clock: the Pi holds a
-# 60-frameset queue (~2s at 30fps) to keep recordings whole, and its depth follows
-# the load, so the same camera has measured 228ms and 2.7s within a day.
-Environment=SMARTROOM_HW_CLOCK_CAMS=camera_d455_color,camera_d435_color
+# The D455 sends librealsense global time — a real per-frame capture instant — so use
+# it directly rather than a constant offset. Stated rather than measured because being
+# in its own clock domain is a fact about the hardware, not something a light switch
+# needs to establish, and it makes the D455 the reference every other camera is
+# measured against.
+Environment=SMARTROOM_HW_CLOCK_CAMS=camera_d455_color
 # 3-minute segments; a segment needs this many frames containing people to be kept
 Environment=SMARTROOM_SEGMENT_S=180
 Environment=SMARTROOM_SEGMENT_MIN_FRAMES=15
