@@ -253,6 +253,22 @@ GEO_FUSE_PERSIST = int(os.environ.get("SMARTROOM_GEO_FUSE_PERSIST", "5"))
 # to persist before believing it.
 GEO_SPLIT_PERSIST = int(os.environ.get("SMARTROOM_GEO_SPLIT_PERSIST", "8"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
+# How much of each identity's recent trajectory to remember, so a LATE camera can
+# be compared against where that person was when its frame was captured.
+#
+# Subtracting a measured offset relabels a frame's time; it does not make the
+# other cameras' past available to compare against. The gallery used to hold only
+# each identity's LATEST position, which is fine while every camera is within a
+# frame or two of the others -- and useless the moment one is not. The Reolink
+# cameras come through the NVR several seconds behind: by the time one of their
+# frames is processed, the RealSense entry for that same instant has been
+# overwritten by seconds of newer positions, so the comparison is still between
+# two different moments. That is the ORIGINAL bug, surviving the offset fix.
+#
+# So keep a short trail per identity and look up the position at the queried time.
+# Must comfortably exceed the largest camera delay; 20s covers a 4-5s NVR path
+# with room to spare, and costs a few hundred (t, x, z) tuples per person.
+GEO_HIST_S = float(os.environ.get("SMARTROOM_GEO_HIST_S", "20"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
 
 # --- one comparable timeline across cameras ----------------------------------
@@ -1153,10 +1169,13 @@ class IdentityRegistry:
             gid = self.map.get(key)
             if gid is not None and gid in self.gallery and gid not in taken:
                 e = self.gallery[gid]
-                stale_merge = (GEO_MERGE_MM > 0 and e["cam"] != cam
-                               and t - e["t"] < GEO_MERGE_S
-                               and ((pos[0] - e["pos"][0]) ** 2
-                                    + (pos[1] - e["pos"][1]) ** 2) ** 0.5 > GEO_SPLIT_MM)
+                # Against where the other camera put this identity AT THIS FRAME'S
+                # time — not at its own latest frame's time, which for a camera
+                # seconds behind is a different moment entirely.
+                other = self._pos_at(e, t) if e["cam"] != cam else None
+                stale_merge = (GEO_MERGE_MM > 0 and other is not None
+                               and ((pos[0] - other[0]) ** 2
+                                    + (pos[1] - other[1]) ** 2) ** 0.5 > GEO_SPLIT_MM)
                 if not stale_merge:
                     self.split_pending.pop(key, None)
                     self._touch(gid, emb, pos, t, cam)
@@ -1179,9 +1198,17 @@ class IdentityRegistry:
             for g, e in self.gallery.items():
                 if GEO_MERGE_MM <= 0:
                     break            # location matching disabled — appearance only
-                if g in taken or e["cam"] == cam or t - e["t"] > GEO_MERGE_S:
+                if g in taken or e["cam"] == cam:
                     continue
-                d = ((pos[0] - e["pos"][0]) ** 2 + (pos[1] - e["pos"][1]) ** 2) ** 0.5
+                # Signed comparisons were wrong in BOTH directions once cameras
+                # differ by seconds: a late camera's frame made every fresher entry
+                # look like a negative age and sail through the gate, while a
+                # prompt camera saw the late one as permanently stale and never
+                # matched it at all. _pos_at is symmetric and picks the moment.
+                other = self._pos_at(e, t)
+                if other is None:
+                    continue
+                d = ((pos[0] - other[0]) ** 2 + (pos[1] - other[1]) ** 2) ** 0.5
                 if d >= best_d:
                     continue
                 # Appearance veto — same place is not enough if they look nothing
@@ -1218,12 +1245,46 @@ class IdentityRegistry:
             self._touch(best, emb, pos, t, cam)
             return best, how
 
+    @staticmethod
+    def _pos_at(e, t, window=None):
+        """Where this identity was at time `t`, or None if it was not seen then.
+
+        The trail is what lets a camera running seconds behind be compared against
+        the right moment instead of against "now". Falls back to the latest
+        position for an entry with no trail yet.
+        """
+        window = GEO_MERGE_S if window is None else window
+        trail = e.get("trail")
+        if not trail:
+            return e["pos"] if abs(t - e["t"]) <= window else None
+        best, best_dt = None, window
+        for ts, p in reversed(trail):
+            dt_ = abs(ts - t)
+            if dt_ <= best_dt:
+                best, best_dt = p, dt_
+            elif ts < t - window:
+                break        # trail is time-ordered; nothing older can be nearer
+        return best
+
     def _touch(self, gid, emb, pos, t, cam):
-        e = self.gallery.setdefault(gid, {"emb": emb, "pos": pos, "t": t, "cam": cam, "seen": 0})
+        e = self.gallery.setdefault(gid, {"emb": emb, "pos": pos, "t": t, "cam": cam,
+                                          "seen": 0, "trail": []})
         if emb is not None:
             e["emb"] = emb if e["emb"] is None else (
                 EMB_MOMENTUM * e["emb"] + (1 - EMB_MOMENTUM) * emb)
-        e["pos"], e["t"], e["cam"] = pos, t, cam
+        e["pos"], e["cam"] = pos, cam
+        # `t` is the newest time SEEN, not the newest processed: a late camera must
+        # not be able to drag the entry's clock backwards and make fresher
+        # observations from another camera look stale.
+        e["t"] = max(e.get("t", t), t)
+        trail = e.setdefault("trail", [])
+        trail.append((t, pos))
+        # Keep it ordered (a late camera appends out of order) and bounded.
+        if len(trail) > 1 and trail[-2][0] > t:
+            trail.sort(key=lambda r: r[0])
+        cutoff = e["t"] - GEO_HIST_S
+        if trail[0][0] < cutoff:
+            e["trail"] = [r for r in trail if r[0] >= cutoff]
         e["seen"] += 1
 
     def _prune(self, t):
@@ -1261,7 +1322,13 @@ class IdentityRegistry:
         if GEO_MERGE_MM <= 0:
             return
         with self.lock:
-            live = [(g, e) for g, e in self.gallery.items() if t - e["t"] < GEO_MERGE_S]
+            # Every identity seen recently enough to still have a usable trail —
+            # NOT only those whose newest frame is within GEO_MERGE_S of `t`. That
+            # test silently excluded any camera running more than half a second
+            # behind, which with the NVR's several seconds meant a Reolink identity
+            # could never be a fusion candidate at all, whatever its position.
+            live = [(g, e) for g, e in self.gallery.items()
+                    if abs(t - e["t"]) < GEO_HIST_S]
             seen = set()
             for i in range(len(live)):
                 for j in range(i + 1, len(live)):
@@ -1270,8 +1337,14 @@ class IdentityRegistry:
                     if ea["cam"] == eb["cam"]:
                         continue          # one camera cannot see one person twice
                     key = (min(ga, gb), max(ga, gb))
-                    d = ((ea["pos"][0] - eb["pos"][0]) ** 2
-                         + (ea["pos"][1] - eb["pos"][1]) ** 2) ** 0.5
+                    # Compare the two at a moment they BOTH have a position for,
+                    # rather than each at its own latest frame.
+                    when = min(ea["t"], eb["t"])
+                    pa, pb = self._pos_at(ea, when), self._pos_at(eb, when)
+                    if pa is None or pb is None:
+                        self.pending.pop(key, None)
+                        continue
+                    d = ((pa[0] - pb[0]) ** 2 + (pa[1] - pb[1]) ** 2) ** 0.5
                     ok = d <= GEO_MERGE_MM
                     if ok and ea["emb"] is not None and eb["emb"] is not None:
                         ok = self._cos(ea["emb"], eb["emb"]) >= GEO_REID_MIN
