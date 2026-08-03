@@ -642,6 +642,10 @@ class AudioRelay:
         self.listeners = 0
         self.content_type = "audio/mpeg"
         self.bytes_in = 0
+        # Recorders writing this audio into their segment. They tap the RAW stream,
+        # not the delayed one the browser hears: a recording is assembled on the
+        # capture timeline, and the presentation delay is a viewing concern.
+        self.taps = {}          # id -> callable(arrival_ms, data)
 
     def hold_ms(self):
         """How long to sit on an arriving chunk before letting it out."""
@@ -649,6 +653,14 @@ class AudioRelay:
         if delay <= 0:
             return max(0.0, AUDIO_TRIM_MS)
         return max(0.0, delay - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS)
+
+    def add_tap(self, key, fn):
+        with self.cond:
+            self.taps[key] = fn
+
+    def remove_tap(self, key):
+        with self.cond:
+            self.taps.pop(key, None)
 
     def push(self, data, content_type=None):
         now = time.time() * 1000.0
@@ -660,6 +672,14 @@ class AudioRelay:
             self.pending.append((now, data))
             while len(self.pending) > AUDIO_PENDING_MAX:
                 self.pending.popleft()
+            taps = list(self.taps.values())
+        # Outside the lock: a recorder's disk write must never stall the relay, and
+        # a tap that throws must not take the audio down with it.
+        for fn in taps:
+            try:
+                fn(now, data)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[live] audio tap failed: {exc}", flush=True)
 
     def release_due(self):
         cutoff = time.time() * 1000.0 - self.hold_ms()
@@ -913,6 +933,16 @@ class SegmentRecorder:
         self.rows = []           # (frame_no, hw_ts, sync_ms)
         self.geo_rows = []       # (frame_no, [{id, px, room, src}]) — depth-measured
         self.kept = self.dropped = 0
+        # Room audio, muxed into this camera's mp4 at close. Only the camera the
+        # audio actually comes from records it: it is ONE room microphone, and
+        # copying it onto every camera would make the synced player overlap five
+        # identical tracks (an echo) and imply each camera has its own mic.
+        self.wants_audio = AUDIO_ON and cam_key == AUDIO_SRC_CAM
+        self.audio_fh = None
+        self.audio_path = None
+        self.audio_t0 = None        # capture time of the first chunk in this segment
+        self.audio_bytes = 0
+        self.audio_info = None
         threading.Thread(target=self._run, daemon=True).start()
 
     def add(self, jpeg: bytes, hw_ts: float, positions, sync_ms: float = 0.0,
@@ -945,6 +975,89 @@ class SegmentRecorder:
             if len(self.q) < 240:          # ~8s at 30fps; never block inference
                 self.q.append((jpeg, hw_ts, positions, sync_ms, n_people))
                 self.cond.notify()
+
+    def _audio_chunk(self, arrival_ms, data):
+        """Raw audio from the relay, appended to this segment's sidecar.
+
+        The chunk's CAPTURE time is its arrival less the same delay this camera's
+        pictures took — audio and video come down one path from the NVR, so the
+        offset largely cancels and what is left is their real skew.
+        """
+        fh = self.audio_fh
+        if fh is None:
+            return
+        if self.audio_t0 is None:
+            self.audio_t0 = (arrival_ms - cam_offset_ms(AUDIO_SRC_CAM)
+                             - AUDIO_TRIM_MS) / 1000.0
+        fh.write(data)
+        self.audio_bytes += len(data)
+
+    def _audio_open(self):
+        if not self.wants_audio or self.dir is None:
+            return
+        self.audio_path = self.dir / f".{self.cam}_audio.mp3"
+        self.audio_t0 = None
+        self.audio_bytes = 0
+        try:
+            self.audio_fh = open(self.audio_path, "wb")
+        except OSError as exc:
+            print(f"[live] {self.cam}: cannot open audio sidecar: {exc}", flush=True)
+            self.audio_fh = None
+            return
+        AUDIO.add_tap(id(self), self._audio_chunk)
+
+    def _audio_finish(self, mp4_path, video_t0):
+        """Mux the sidecar into the finished mp4. Returns the audio info, or None.
+
+        A stream copy, so this costs no encoding. Muxed AFTER the fact rather than
+        piped into the live ffmpeg on a second input: two pipes into one process
+        deadlock the moment one of them stalls, and audio arriving over a network
+        from another host is exactly the thing that stalls.
+        """
+        AUDIO.remove_tap(id(self))
+        fh, path = self.audio_fh, self.audio_path
+        self.audio_fh = None
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
+        if not path or not path.exists():
+            return None
+        # A sliver of audio is not worth a remux, and mp3 needs a few frames before
+        # it decodes at all.
+        if self.audio_bytes < 4096 or self.audio_t0 is None or video_t0 is None:
+            path.unlink(missing_ok=True)
+            return None
+        skew = self.audio_t0 - video_t0
+        merged = mp4_path.with_suffix(".muxed.mp4")
+        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp4_path)]
+        # Positive skew = the audio starts later than the video, so delay it to match.
+        if abs(skew) > 0.02:
+            cmd += ["-itsoffset", f"{skew:.3f}"]
+        cmd += ["-i", str(path), "-map", "0:v:0", "-map", "1:a:0",
+                "-c:v", "copy", "-c:a", "copy", "-shortest",
+                "-movflags", "+faststart", str(merged)]
+        try:
+            r = subprocess.run(cmd, timeout=180, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"[live] {self.cam}: audio mux failed: {exc}", flush=True)
+            path.unlink(missing_ok=True)
+            return None
+        if r.returncode != 0 or not merged.exists() or merged.stat().st_size == 0:
+            err = (r.stderr or b"").decode(errors="replace").strip().splitlines()
+            print(f"[live] {self.cam}: audio mux failed: {err[-1] if err else r.returncode}",
+                  flush=True)
+            merged.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            return None
+        merged.replace(mp4_path)      # the clip now HAS the audio; no separate file
+        path.unlink(missing_ok=True)
+        return {"codec": "mp3", "source": AUDIO_SRC_CAM, "scope": "room",
+                "skew_ms": round(skew * 1000.0, 1),
+                "bytes": self.audio_bytes,
+                "note": "one room microphone; only this camera's clip carries it"}
 
     def _cap_now(self):
         """"Now" on the shared capture timeline for THIS camera.
@@ -997,6 +1110,8 @@ class SegmentRecorder:
             try:
                 self.proc.stdin.write(jpeg)
                 self.frames += 1
+                if self.video_t0 is None and sync_ms:
+                    self.video_t0 = sync_ms / 1000.0
                 self.rows.append((self.frames, hw_ts, sync_ms))
                 if n_people:
                     self.people_frames += 1
@@ -1010,6 +1125,7 @@ class SegmentRecorder:
         self._close()
         self.idx, self.frames, self.people_frames, self.rows = idx, 0, 0, []
         self.geo_rows = []
+        self.video_t0 = None      # capture time of this segment's first frame
         # Name the segment after the wall-clock BOUNDARY, not the instant we
         # happened to rotate. The two cameras rotate a fraction of a second
         # apart, and datetime.now() straddling a second boundary produced
@@ -1036,6 +1152,7 @@ class SegmentRecorder:
         except OSError as exc:
             print(f"[live] {self.cam}: cannot start ffmpeg: {exc}", flush=True)
             self.proc = None
+        self._audio_open()
 
     def _close(self):
         """Finish the current segment: keep it only if somebody was in it."""
@@ -1065,6 +1182,15 @@ class SegmentRecorder:
             # did not keep anything either.
             mp4.unlink(missing_ok=True)
             (self.dir / f"{self.cam}_timestamps.csv").unlink(missing_ok=True)
+            # the tap holds a reference to this recorder; a discarded segment must
+            # release it or the next one writes into a closed file
+            AUDIO.remove_tap(id(self))
+            if self.audio_fh is not None:
+                try: self.audio_fh.close()
+                except OSError: pass
+                self.audio_fh = None
+            if self.audio_path:
+                self.audio_path.unlink(missing_ok=True)
             self.dropped += 1
             # tidy up: cam dir -> streams dir -> rec dir. Stops as soon as one is
             # non-empty (i.e. the other camera kept its clip).
@@ -1073,6 +1199,8 @@ class SegmentRecorder:
                 except OSError: break
             return
         dur = max(1.0, self.frames / 30.0)
+        # Before the metadata, so it can record what the clip actually contains.
+        self.audio_info = self._audio_finish(mp4, self.video_t0)
         with open(self.dir / f"{self.cam}_timestamps.csv", "w") as fh:
             # sync_ms is the cross-camera column for these segments: one clock
             # (this server's arrival) with each camera's measured delay already
@@ -1142,6 +1270,10 @@ class SegmentRecorder:
                           # real interval even though they arrived seconds apart.
                           "segment_aligned_on": "capture time (arrival - time_offset_ms)",
                           "sync": "match frames across cameras on sync_ms"})
+            # Recorded, not assumed: metadata claiming audio on a silent track is
+            # worse than none, so this appears only when a track was really muxed.
+            if self.audio_info:
+                entry["audio"] = self.audio_info
             meta.setdefault("streams", {})[self.cam] = entry
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(meta, indent=2))
