@@ -501,7 +501,7 @@ class TimingCalibration:
             self.error = None
             return True, self.state_locked()
 
-    def sample(self, cam_key, arrival_ms, energy):
+    def sample(self, cam_key, arrival_ms, energy, brightness=None):
         """Called from the pose loop for every frame while armed. Cheap: one
         bool test when disarmed, one append when armed."""
         if not self.armed:
@@ -511,7 +511,8 @@ class TimingCalibration:
                 return
             rows = self.series.setdefault(cam_key, [])
             if len(rows) < TIMING_MAX_SAMPLES:
-                rows.append((float(arrival_ms), float(energy)))
+                rows.append((float(arrival_ms), float(energy),
+                             float(brightness if brightness is not None else 0.0)))
 
     def expired(self):
         return self.armed and time.time() >= self.until
@@ -1475,8 +1476,11 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             # must not be subtracted from the measurement).
             gray = cv2.cvtColor(cv2.resize(frame, TIMING_SIZE), cv2.COLOR_BGR2GRAY)
             if timing_prev is not None:
+                # energy places the event in time; brightness is what proves the
+                # event was the LIGHTS and not somebody walking about.
                 TIMING.sample(cam_key, recv_ms or t_start * 1000.0,
-                              float(cv2.absdiff(gray, timing_prev).mean()))
+                              float(cv2.absdiff(gray, timing_prev).mean()),
+                              float(gray.mean()))
             timing_prev = gray
         elif timing_prev is not None:
             timing_prev = None
@@ -2307,9 +2311,10 @@ PAGE_HTML = """<!doctype html><html><head><meta charset=utf-8>
  <div class="card sync"><div>Camera timing</div>
    <div class=meta>Each camera's frames reach this server after a different delay
      (the Reolink cameras come via the NVR and a second host). Fusing two cameras
-     needs that delay measured. Press below, then flip the room lights fully off
-     and on 3–4 times: a light change hits every camera at once, so they need no
-     shared view.</div>
+     needs that delay measured. Press below, then turn the room lights fully OFF
+     and back ON 3–4 times: a light change hits every camera at once, so they need
+     no shared view. Moving around the room instead does not work — it correlates
+     the cameras that can see you and is rejected.</div>
    <div style="margin-top:8px"><button id=syncbtn>Measure timing (lights on/off)</button></div>
    <div class=meta id=syncmsg></div>
    <table id=synctab></table></div>

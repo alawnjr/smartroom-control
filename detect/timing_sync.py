@@ -91,6 +91,21 @@ MIN_OVERLAP_MS = 10000.0
 # ...and enough frames within it. A camera delivering under ~6fps has not sampled
 # the light switch well enough to place it, whatever the window length.
 MIN_SAMPLES = 60
+# Gray levels (0-255) a camera's mean brightness must swing across the window for
+# it to count as having SEEN the lights change.
+#
+# The correlation alone cannot tell what it correlated ON. A first live run
+# measured the D435 at +112.8 ms with r=0.73 while all four Reolink cameras were
+# rejected — from cameras in the SAME room with the ceiling lights in frame, which
+# is impossible if the lights actually flipped. What the two RealSense had in
+# common was a seated person moving, not a light switch, and the run would happily
+# have published that as a timing offset.
+#
+# Brightness is the direct test: a light switch moves the whole frame's mean by
+# tens of levels, while a person moving across a static room moves it by ~1-2.
+# Deliberately well below a real switch (40+ levels) because auto-exposure claws
+# some of the swing back within a second or so.
+MIN_BRIGHTNESS_SWING = float(os.environ.get("SMARTROOM_TIMING_MIN_SWING", "12"))
 
 
 def timing_path() -> Path:
@@ -207,6 +222,24 @@ def correlate(series_a, series_b, grid_ms=GRID_MS, max_lag_ms=MAX_LAG_MS):
     return best_lag * grid_ms, best_corr, float(overlap)
 
 
+def brightness_swing(series) -> float:
+    """p95 - p05 of this camera's mean frame brightness across the window.
+
+    Percentiles rather than max-min: one glint or a passing reflection should not
+    look like the room lights coming on. Returns 0.0 for a series recorded without
+    brightness (nothing to test, so nothing is claimed).
+    """
+    vals = [row[2] for row in series if len(row) > 2]
+    if len(vals) < 5:
+        return 0.0
+    v = np.sort(np.asarray(vals, dtype=float))
+    return float(v[int(0.95 * (len(v) - 1))] - v[int(0.05 * (len(v) - 1))])
+
+
+def _has_brightness(series) -> bool:
+    return any(len(row) > 2 for row in series)
+
+
 def _jitter_ms(series) -> float:
     """Spread of this camera's frame intervals — how steady its arrivals are.
 
@@ -232,17 +265,45 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
     usable = {c: s for c, s in series_by_cam.items() if len(s) >= MIN_SAMPLES}
     if not usable:
         raise ValueError("no camera produced enough frames — are they streaming?")
-    if reference is None or reference not in usable:
-        # The camera with the most samples: the steadiest, densest series makes
-        # the best yardstick, and every other offset is measured against it.
-        reference = max(usable, key=lambda c: len(usable[c]))
+
+    # Did the lights actually change? A correlation says two cameras saw the same
+    # thing, never WHAT — and two cameras watching one person move correlate just
+    # fine. Brightness is the direct test; see MIN_BRIGHTNESS_SWING.
+    swings = {c: brightness_swing(s) for c, s in usable.items()}
+    checking_light = any(_has_brightness(s) for s in usable.values())
+    saw_light = {c for c, sw in swings.items() if sw >= MIN_BRIGHTNESS_SWING}
+    if checking_light and not saw_light:
+        worst = max(swings.values()) if swings else 0.0
+        raise ValueError(
+            f"the room lights do not appear to have changed — the brightest swing "
+            f"any camera saw was {worst:.0f} gray levels, under the "
+            f"{MIN_BRIGHTNESS_SWING:.0f} a light switch produces. Turn the lights "
+            "fully OFF and back ON 3-4 times during the window (dimming or moving "
+            "around the room is not enough).")
+
+    # The reference must be a camera that saw the switch: every other offset is
+    # measured against it, so a reference that missed the event poisons all of them.
+    pool = {c: s for c, s in usable.items() if not checking_light or c in saw_light}
+    if reference is None or reference not in pool:
+        reference = max(pool, key=lambda c: len(pool[c]))
 
     offsets = {reference: 0.0}
     quality = {reference: {"correlation": 1.0, "samples": len(usable[reference]),
-                           "jitter_ms": round(_jitter_ms(usable[reference]), 1)}}
+                           "jitter_ms": round(_jitter_ms(usable[reference]), 1),
+                           "brightness_swing": round(swings.get(reference, 0.0), 1)}}
     rejected = {}
     for cam, series in sorted(usable.items()):
         if cam == reference:
+            continue
+        # Checked BEFORE correlating: "the lights never reached this camera" is a
+        # different problem from "this camera disagrees about when they changed",
+        # and only the first one tells you to go re-aim a camera.
+        if checking_light and cam not in saw_light:
+            rejected[cam] = (f"brightness barely moved ({swings[cam]:.0f} of the "
+                             f"{MIN_BRIGHTNESS_SWING:.0f} gray levels a light switch "
+                             "needs) — this camera did not see the lights change: "
+                             "pointed away from the room's lighting, or lit by "
+                             "something else")
             continue
         try:
             off, corr, overlap = correlate(usable[reference], series)
@@ -251,12 +312,14 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
             continue
         if corr < min_corr:
             rejected[cam] = (f"correlation too weak ({corr:.2f} < {min_corr:.2f}) — "
-                             "this camera did not see the same change")
+                             "it saw the lights change but not at a consistent time; "
+                             "rerun with more flips")
             continue
         offsets[cam] = round(off, 1)
         quality[cam] = {"correlation": round(corr, 3), "samples": len(series),
                         "overlap_s": round(overlap / 1000.0, 1),
-                        "jitter_ms": round(_jitter_ms(series), 1)}
+                        "jitter_ms": round(_jitter_ms(series), 1),
+                        "brightness_swing": round(swings[cam], 1)}
     for cam, series in series_by_cam.items():
         if cam not in usable:
             rejected[cam] = f"only {len(series)} frame(s) — not streaming?"
@@ -299,6 +362,23 @@ def summary_line(result: dict) -> str:
 
 
 # ---------------------------------------------------------------- self-test ---
+def _with_brightness(series, swing, n_flips=4, seed=0):
+    """Attach a mean-brightness column that swings by `swing` gray levels.
+
+    swing=0 models the case that motivated the gate: a real correlated event
+    (someone moving) in a room whose lights never changed.
+    """
+    rng = np.random.default_rng(1000 + seed)
+    t0 = series[0][0]
+    span = series[-1][0] - t0
+    out = []
+    for t, e in series:
+        phase = int((t - t0) / max(span / (n_flips * 2), 1.0)) % 2
+        level = 40.0 + (swing if phase else 0.0) + rng.normal(0, 0.4)
+        out.append((t, e, level))
+    return out
+
+
 def _synthetic(lag_ms, n=600, rate_ms=66.0, noise=0.05, seed=0):
     """Two energy series of the same room, one delayed by `lag_ms`.
 
@@ -391,6 +471,36 @@ def _selftest() -> int:
     check("rejected cameras get no offset",
           "dead" not in res["offsets_ms"] and "blind" not in res["offsets_ms"])
     check("summary mentions the reference", res["reference"] in summary_line(res))
+
+    print("solve(): refuses to call correlated MOTION a lights measurement")
+    a2, b2 = _synthetic(300.0, seed=8)
+    # Both cameras genuinely correlate (a person moving) but no light ever changed.
+    dark = {"ref": _with_brightness(a2, 0.0, seed=1),
+            "other": _with_brightness(b2, 0.0, seed=2)}
+    try:
+        solve(dark, reference="ref")
+        check("no-light-change run is refused", False)
+    except ValueError as exc:
+        check("no-light-change run is refused", "lights do not appear" in str(exc),
+              str(exc)[:64])
+    # Same pair, lights actually flipped -> the offset comes back.
+    lit = {"ref": _with_brightness(a2, 80.0, seed=3),
+           "other": _with_brightness(b2, 80.0, seed=4)}
+    res3 = solve(lit, reference="ref")
+    check("with a real light change it measures", abs(res3["offsets_ms"]["other"] - 300.0) <= 12,
+          f"got {res3['offsets_ms'].get('other')}")
+    check("brightness swing is reported",
+          res3["quality"]["other"]["brightness_swing"] >= MIN_BRIGHTNESS_SWING,
+          str(res3["quality"]["other"]["brightness_swing"]))
+    # One camera the lights don't reach: rejected for THAT reason, not "too weak".
+    mixed = {"ref": _with_brightness(a2, 80.0, seed=5),
+             "unlit": _with_brightness(b2, 0.0, seed=6)}
+    res4 = solve(mixed, reference="ref")
+    check("camera the lights miss is named as such",
+          "did not see the lights change" in res4["rejected"].get("unlit", ""),
+          res4["rejected"].get("unlit", "")[:56])
+    check("a reference that missed the switch is not chosen",
+          solve(mixed)["reference"] == "ref")
 
     print("solve(): picks a reference when none is given")
     res2 = solve({"few": a[:40], "many": b})
