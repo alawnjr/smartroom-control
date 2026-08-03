@@ -553,6 +553,19 @@ class TimingCalibration:
         }
         with self.lock:
             self.diagnostics = diagnostics
+        # Keep the raw series of the LAST run. A rejected camera cannot be
+        # diagnosed from a summary line, and the alternative is asking someone to
+        # stand at the light switch again for every hypothesis. One run overwrites
+        # the previous — this is a scratch pad, not an archive.
+        try:
+            raw = timing_sync.timing_path().with_name("live_timing_last_run.json")
+            raw.parent.mkdir(parents=True, exist_ok=True)
+            raw.write_text(json.dumps(
+                {"series": {k: [[round(t, 1), round(e, 4), round(b, 2)]
+                                for t, e, b in v] for k, v in series.items()}},
+                separators=(",", ":")))
+        except (OSError, ValueError) as exc:
+            print(f"[live] could not save timing raw series: {exc}", flush=True)
         try:
             result = timing_sync.solve(series, reference=reference)
             path = timing_sync.save(result)

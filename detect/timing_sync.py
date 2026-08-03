@@ -240,6 +240,113 @@ def _has_brightness(series) -> bool:
     return any(len(row) > 2 for row in series)
 
 
+# --- primary estimator: match the light switches themselves ------------------
+# Cross-correlating difference energy has two limits that both bit on real
+# cameras. It can only find a lag inside its search window, and it needs the
+# EDGE SHAPE to survive: the Reolink sub-stream arrives at 10fps through the
+# NVR's encoder, so its energy spike is blunter and differently smeared than the
+# D455's at 15fps. Measured result: all four Reolink cameras cleared the
+# brightness gate (they plainly saw the room go dark) yet correlated at only
+# 0.17-0.20 and were rejected, while the two RealSense correlated fine.
+#
+# The brightness STEP is the far better signal for this event. A light switch is
+# a step, its 50% crossing is a well-defined instant, and locating it needs no
+# assumption about lag magnitude at all -- which matters because the NVR path
+# could plausibly be seconds, i.e. outside any window worth searching by
+# correlation.
+EDGE_TOL_MS = float(os.environ.get("SMARTROOM_TIMING_EDGE_TOL_MS", "150"))
+EDGE_MAX_LAG_MS = float(os.environ.get("SMARTROOM_TIMING_EDGE_MAX_LAG_MS", "10000"))
+MIN_EDGES_MATCHED = 2
+MAX_EDGE_SPREAD_MS = 250.0
+
+
+def light_edges(series, min_swing=None):
+    """[(time_ms, +1 on / -1 off)] for each light transition this camera saw.
+
+    A hysteresis state machine on mean brightness: the signal has to reach the
+    far quarter of its own range before the next edge counts, so flicker around
+    the midpoint cannot manufacture edges. The reported time is the interpolated
+    50% crossing, which is the closest thing to the instant the switch was
+    thrown, and is independent of each camera's exposure and gain.
+    """
+    min_swing = MIN_BRIGHTNESS_SWING if min_swing is None else min_swing
+    rows = [r for r in series if len(r) > 2]
+    if len(rows) < 5:
+        return []
+    t = np.asarray([r[0] for r in rows], dtype=float)
+    b = np.asarray([r[2] for r in rows], dtype=float)
+    srt = np.sort(b)
+    lo = float(srt[int(0.05 * (len(srt) - 1))])
+    hi = float(srt[int(0.95 * (len(srt) - 1))])
+    if hi - lo < min_swing:
+        return []
+    mid = (lo + hi) / 2.0
+    hi_th, lo_th = lo + 0.75 * (hi - lo), lo + 0.25 * (hi - lo)
+
+    def crossing(i):
+        """Interpolated time at which b crossed `mid` at or before index i."""
+        j = i
+        while j > 0 and (b[j] > mid) == (b[i] > mid):
+            j -= 1
+        if j == i or b[j] == b[j + 1]:
+            return float(t[i])
+        frac = (mid - b[j]) / (b[j + 1] - b[j])
+        frac = min(max(frac, 0.0), 1.0)
+        return float(t[j] + frac * (t[j + 1] - t[j]))
+
+    state = "high" if b[0] > mid else "low"
+    edges = []
+    for i in range(1, len(b)):
+        if state == "low" and b[i] >= hi_th:
+            edges.append((crossing(i), 1))
+            state = "high"
+        elif state == "high" and b[i] <= lo_th:
+            edges.append((crossing(i), -1))
+            state = "low"
+    return edges
+
+
+def offset_from_edges(ref_edges, cam_edges, tol_ms=EDGE_TOL_MS):
+    """(offset_ms, matched, spread_ms) by aligning two cameras' switch times.
+
+    Every same-direction pairing is a candidate offset and each is scored by how
+    many OTHER edges it also aligns -- a vote, not a fit, so one spurious edge
+    cannot drag the answer. Raises ValueError when too few edges agree.
+    """
+    if len(ref_edges) < MIN_EDGES_MATCHED or len(cam_edges) < MIN_EDGES_MATCHED:
+        raise ValueError(f"only {min(len(ref_edges), len(cam_edges))} light "
+                         "transition(s) seen — flip the lights more times")
+    best = None
+    for tc, dc in cam_edges:
+        for tr, dr in ref_edges:
+            if dr != dc:
+                continue
+            cand = tc - tr
+            if abs(cand) > EDGE_MAX_LAG_MS:
+                continue
+            diffs = []
+            for tc2, dc2 in cam_edges:
+                same = [tr2 for tr2, dr2 in ref_edges
+                        if dr2 == dc2 and abs((tc2 - tr2) - cand) <= tol_ms]
+                if same:
+                    nearest = min(same, key=lambda x: abs((tc2 - x) - cand))
+                    diffs.append(tc2 - nearest)
+            if not diffs:
+                continue
+            spread = (max(diffs) - min(diffs)) if len(diffs) > 1 else 0.0
+            score = (len(diffs), -spread)
+            if best is None or score > best[0]:
+                best = (score, float(np.median(diffs)), len(diffs), float(spread))
+    if best is None or best[2] < MIN_EDGES_MATCHED:
+        raise ValueError("this camera's light transitions did not line up with the "
+                         "reference's — flip the lights more times, more slowly")
+    if best[3] > MAX_EDGE_SPREAD_MS:
+        raise ValueError(f"its light transitions disagree by up to {best[3]:.0f} ms, "
+                         "so it has no single delay (dropped frames or a variable "
+                         "buffer) — rerun, and check that camera's frame rate")
+    return best[1], best[2], best[3]
+
+
 def _jitter_ms(series) -> float:
     """Spread of this camera's frame intervals — how steady its arrivals are.
 
@@ -287,15 +394,18 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
     if reference is None or reference not in pool:
         reference = max(pool, key=lambda c: len(pool[c]))
 
+    edges = {c: light_edges(s) for c, s in usable.items()}
+    ref_edges = edges.get(reference, [])
     offsets = {reference: 0.0}
     quality = {reference: {"correlation": 1.0, "samples": len(usable[reference]),
                            "jitter_ms": round(_jitter_ms(usable[reference]), 1),
-                           "brightness_swing": round(swings.get(reference, 0.0), 1)}}
+                           "brightness_swing": round(swings.get(reference, 0.0), 1),
+                           "light_edges": len(ref_edges), "method": "reference"}}
     rejected = {}
     for cam, series in sorted(usable.items()):
         if cam == reference:
             continue
-        # Checked BEFORE correlating: "the lights never reached this camera" is a
+        # Checked BEFORE anything else: "the lights never reached this camera" is a
         # different problem from "this camera disagrees about when they changed",
         # and only the first one tells you to go re-aim a camera.
         if checking_light and cam not in saw_light:
@@ -305,21 +415,39 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
                              "pointed away from the room's lighting, or lit by "
                              "something else")
             continue
+        common = {"samples": len(series),
+                  "jitter_ms": round(_jitter_ms(series), 1),
+                  "brightness_swing": round(swings.get(cam, 0.0), 1),
+                  "light_edges": len(edges.get(cam, []))}
+        # Edges first: they place the switch directly and impose no limit on how
+        # large the delay may be, which correlation cannot do.
+        edge_err = None
+        if ref_edges and edges.get(cam):
+            try:
+                off, matched, spread = offset_from_edges(ref_edges, edges[cam])
+                offsets[cam] = round(off, 1)
+                quality[cam] = {**common, "method": "light-edges",
+                                "edges_matched": matched,
+                                "edge_spread_ms": round(spread, 1)}
+                continue
+            except ValueError as exc:
+                edge_err = str(exc)
+        # Fallback: correlation, for a run with no brightness recorded or too few
+        # clean edges. Still bounded by its search window — see correlate().
         try:
             off, corr, overlap = correlate(usable[reference], series)
         except ValueError as exc:
-            rejected[cam] = str(exc)
+            rejected[cam] = edge_err or str(exc)
             continue
         if corr < min_corr:
-            rejected[cam] = (f"correlation too weak ({corr:.2f} < {min_corr:.2f}) — "
-                             "it saw the lights change but not at a consistent time; "
-                             "rerun with more flips")
+            rejected[cam] = edge_err or (
+                f"correlation too weak ({corr:.2f} < {min_corr:.2f}) — it saw the "
+                "lights change but not at a consistent time; rerun with more flips")
             continue
         offsets[cam] = round(off, 1)
-        quality[cam] = {"correlation": round(corr, 3), "samples": len(series),
-                        "overlap_s": round(overlap / 1000.0, 1),
-                        "jitter_ms": round(_jitter_ms(series), 1),
-                        "brightness_swing": round(swings[cam], 1)}
+        quality[cam] = {**common, "method": "energy-correlation",
+                        "correlation": round(corr, 3),
+                        "overlap_s": round(overlap / 1000.0, 1)}
     for cam, series in series_by_cam.items():
         if cam not in usable:
             rejected[cam] = f"only {len(series)} frame(s) — not streaming?"
@@ -502,6 +630,48 @@ def _selftest() -> int:
     check("a reference that missed the switch is not chosen",
           solve(mixed)["reference"] == "ref")
 
+    print("light_edges(): finds the switches, ignores flicker")
+    a5, _ = _synthetic(0.0, seed=11)
+    lit5 = _with_brightness(a5, 80.0, n_flips=4, seed=11)
+    ed = light_edges(lit5)
+    check("found the transitions", len(ed) >= 6, f"{len(ed)} edges")
+    check("they alternate on/off",
+          all(ed[i][1] != ed[i + 1][1] for i in range(len(ed) - 1)))
+    check("a static room yields none", light_edges(_with_brightness(a5, 0.0)) == [])
+
+    print("edges beat correlation on a lag OUTSIDE the search window")
+    # 2600ms: past MAX_LAG_MS, so correlation cannot even represent the answer.
+    BIG = 2600.0
+    a6, b6 = _synthetic(BIG, n=900, rate_ms=50.0, seed=12)
+    res6 = solve({"ref": _with_brightness(a6, 80.0, seed=12),
+                  "far": _with_brightness(b6, 80.0, seed=12)}, reference="ref")
+    got6 = res6["offsets_ms"].get("far")
+    check("large lag recovered", got6 is not None and abs(got6 - BIG) <= 60,
+          f"got {got6}  (MAX_LAG_MS={MAX_LAG_MS:.0f})")
+    check("and it used the edge method",
+          res6["quality"]["far"]["method"] == "light-edges",
+          str(res6["quality"]["far"].get("method")))
+    # Correlation on its own genuinely cannot: proves the fallback was the limit.
+    _, corr6, _ = correlate(a6, b6)
+    off6, _, _ = correlate(a6, b6)
+    check("correlation alone would have been wrong", abs(off6 - BIG) > 500,
+          f"correlation said {off6:+.0f}ms r={corr6:.2f}")
+
+    print("edges still work at a normal lag, and refuse when unusable")
+    for truth in (0.0, 120.0, 400.0):
+        a7, b7 = _synthetic(truth, n=900, rate_ms=50.0, seed=13)
+        r7 = solve({"ref": _with_brightness(a7, 80.0, seed=13),
+                    "cam": _with_brightness(b7, 80.0, seed=13)}, reference="ref")
+        g7 = r7["offsets_ms"].get("cam")
+        check(f"edge lag {truth:+.0f}ms", g7 is not None and abs(g7 - truth) <= 60,
+              f"got {g7}")
+    # Only one flip -> not enough to vote on; must refuse, not guess.
+    a8, b8 = _synthetic(300.0, n=900, rate_ms=50.0, seed=14)
+    one = solve({"ref": _with_brightness(a8, 80.0, n_flips=1, seed=14),
+                 "cam": _with_brightness(b8, 80.0, n_flips=1, seed=14)}, reference="ref")
+    check("a single transition is handled without crashing",
+          "cam" in one["offsets_ms"] or "cam" in one["rejected"])
+
     print("solve(): picks a reference when none is given")
     res2 = solve({"few": a[:40], "many": b})
     check("densest series becomes reference", res2["reference"] == "many")
@@ -527,14 +697,58 @@ def _selftest() -> int:
     return 0
 
 
+def _replay(path=None) -> int:
+    """Re-solve a saved run and print what each camera looked like.
+
+    Read-only: nothing is written and no offsets are applied. This exists because
+    a rejected camera cannot be diagnosed from a one-line reason, and the
+    alternative is asking somebody to work the light switch again per hypothesis.
+    """
+    p = Path(path) if path else timing_path().with_name("live_timing_last_run.json")
+    try:
+        series = {k: [tuple(r) for r in v]
+                  for k, v in json.loads(p.read_text())["series"].items()}
+    except (OSError, ValueError, KeyError) as exc:
+        print(f"cannot read {p}: {exc}")
+        return 1
+    print(f"{p}\n")
+    print("%-10s %7s %7s %7s  %s" % ("camera", "frames", "swing", "edges", "switch times (s, rel)"))
+    t0 = min((s[0][0] for s in series.values() if s), default=0.0)
+    for cam, s in sorted(series.items()):
+        ed = light_edges(s)
+        times = " ".join(f"{(t - t0) / 1000:+.2f}{'^' if d > 0 else 'v'}" for t, d in ed[:9])
+        print("%-10s %7d %7.1f %7d  %s" % (cam.replace("camera_", "").replace("_color", ""),
+                                           len(s), brightness_swing(s), len(ed), times))
+    print()
+    try:
+        res = solve(series)
+    except ValueError as exc:
+        print(f"solve refused: {exc}")
+        return 0
+    print(summary_line(res))
+    for cam, q in sorted((res.get("quality") or {}).items()):
+        print(f"  {cam:24s} {res['offsets_ms'].get(cam, 0.0):+9.1f} ms  "
+              f"via {q.get('method')}  " + " ".join(
+                  f"{k}={v}" for k, v in q.items()
+                  if k not in ("method", "samples")))
+    for cam, why in sorted((res.get("rejected") or {}).items()):
+        print(f"  {cam:24s}   (no offset) {why}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--show", action="store_true", help="print the stored offsets")
     ap.add_argument("--selftest", action="store_true", help="check the correlation math")
+    ap.add_argument("--replay", nargs="?", const="", metavar="FILE",
+                    help="re-solve the last run's raw series (live_timing_last_run.json) "
+                         "without writing anything — for diagnosing a rejected camera")
     args = ap.parse_args(argv)
     if args.selftest:
         return _selftest()
+    if args.replay is not None:
+        return _replay(args.replay or None)
     path = timing_path()
     if not args.show:
         ap.print_help()
