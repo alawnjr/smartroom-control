@@ -1006,6 +1006,40 @@ class SegmentRecorder:
             return
         AUDIO.add_tap(id(self), self._audio_chunk)
 
+    def _real_fps(self):
+        """Frames per second this segment actually delivered, from capture times.
+
+        The encoder is fed a blind CFR 30 because the true rate is not known until
+        the segment ends. Every other recorder in this system (capture.py,
+        realsense_depth_page.py) retimes its container to the measured rate on
+        close, and live segments were the one exception -- so 25s of a ~10fps
+        camera became an 8.4s container.
+        """
+        stamps = [r[2] / 1000.0 for r in self.rows if r[2]]
+        if len(stamps) < 2:
+            return None
+        span = stamps[-1] - stamps[0]
+        if span <= 0:
+            return None
+        return (len(stamps) - 1) / span
+
+    def _retime_scale(self):
+        """Factor to stretch this segment's container onto real time, or None.
+
+        Applied ONLY to the clip that carries audio, because that clip has to hold
+        two tracks on one timeline and audio is inherently real-time. The others
+        keep their blind CFR-30 container: the mirror derives each clip's playback
+        rate from its own duration and CSV span independently, so a mix of retimed
+        and non-retimed clips plays correctly either way, and leaving them alone
+        keeps this change off the playback path for four of five cameras.
+        """
+        fps = self._real_fps()
+        if not fps or fps <= 0:
+            return None
+        scale = 30.0 / fps
+        # Below a few percent it is noise, and an itsscale of ~1 only costs a remux.
+        return scale if abs(scale - 1.0) > 0.03 else None
+
     def _audio_finish(self, mp4_path, video_t0):
         """Mux the sidecar into the finished mp4. Returns the audio info, or None.
 
@@ -1031,7 +1065,16 @@ class SegmentRecorder:
             return None
         skew = self.audio_t0 - video_t0
         merged = mp4_path.with_suffix(".muxed.mp4")
-        cmd = ["ffmpeg", "-y", "-loglevel", "error", "-i", str(mp4_path)]
+        cmd = ["ffmpeg", "-y", "-loglevel", "error"]
+        # Stretch the video's fake CFR-30 timeline onto real time BEFORE muxing.
+        # Without this the container is ~3x short for a 10fps camera, and -shortest
+        # then truncates real-time audio to the container -- measured: 26s of sound
+        # cut to 8.2s. Retiming is also what makes the two tracks line up at all,
+        # since audio is inherently real-time and this video was not.
+        scale = self._retime_scale()
+        if scale:
+            cmd += ["-itsscale", f"{scale:.6f}"]
+        cmd += ["-i", str(mp4_path)]
         # Positive skew = the audio starts later than the video, so delay it to match.
         if abs(skew) > 0.02:
             cmd += ["-itsoffset", f"{skew:.3f}"]
@@ -1055,6 +1098,7 @@ class SegmentRecorder:
         merged.replace(mp4_path)      # the clip now HAS the audio; no separate file
         path.unlink(missing_ok=True)
         return {"codec": "mp3", "source": AUDIO_SRC_CAM, "scope": "room",
+                "muxed_with_retimed_video": bool(self._retime_scale()),
                 "skew_ms": round(skew * 1000.0, 1),
                 "bytes": self.audio_bytes,
                 "note": "one room microphone; only this camera's clip carries it"}
@@ -1201,6 +1245,13 @@ class SegmentRecorder:
         dur = max(1.0, self.frames / 30.0)
         # Before the metadata, so it can record what the clip actually contains.
         self.audio_info = self._audio_finish(mp4, self.video_t0)
+        if self.audio_info and self.audio_info.get("muxed_with_retimed_video"):
+            # That clip's container now spans real time, so its declared duration
+            # has to as well -- anything converting a sidecar time into real time
+            # reads this.
+            real_fps = self._real_fps()
+            if real_fps:
+                dur = max(1.0, self.frames / real_fps)
         with open(self.dir / f"{self.cam}_timestamps.csv", "w") as fh:
             # sync_ms is the cross-camera column for these segments: one clock
             # (this server's arrival) with each camera's measured delay already
