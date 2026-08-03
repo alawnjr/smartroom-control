@@ -588,6 +588,23 @@ def solve(series_by_cam: dict, reference: str = None, min_corr: float = None) ->
             if how == "hw":
                 quality[cam]["hw_offset_ms"] = hw_offsets.get(cam, 0.0)
                 offsets[cam] = hw_offsets.get(cam, 0.0)
+    # A frame cannot arrive before it was captured. Once the reference sits on a
+    # true capture clock, an arrival-clock camera's offset IS its transport delay,
+    # so a negative one is not a small error — it is proof the edges were matched to
+    # the wrong transitions. Observed: the D435, whose auto-exposure ripple against
+    # a weak 48-level swing produced crossings that are not light switches, aligned
+    # at -2853 ms with three "matching" edges, and that impossible number was applied.
+    if clocks.get(reference) == "hw":
+        for cam in [c for c in list(offsets) if clocks.get(c) == "arrival"]:
+            if offsets[cam] < -EDGE_TOL_MS:
+                rejected[cam] = (
+                    f"came out at {offsets[cam]:+.0f} ms, which would mean its frames "
+                    "arrive before they were captured — its brightness transitions "
+                    "were matched to the wrong light switches. Its swing is probably "
+                    "too weak (auto-exposure fighting the change); rerun with more, "
+                    "unevenly spaced flips")
+                offsets.pop(cam, None)
+                quality.pop(cam, None)
 
     return {
         "schema_version": "2",
@@ -843,6 +860,22 @@ def _selftest() -> int:
                 for arr, _e, _b, hw in tri[name][:200]]
         check(f"{name} recovers the true capture instant",
               float(np.median(errs)) < 80, f"median err {np.median(errs):.0f}ms")
+
+    print("solve(): an impossible negative delay is refused, not applied")
+    # A camera whose edges get matched to the wrong switches can align at a negative
+    # offset, which would mean frames arriving before they were captured.
+    bad = _cam(3460.0, False)
+    shifted = [(t - 6000.0, e, b, hw) for t, e, b, hw in bad]   # edges land far early
+    r10 = solve({"ref": _cam(100.0, True), "wrong": shifted}, reference="ref")
+    off10 = r10["offsets_ms"].get("wrong")
+    check("either rejected or non-negative, never an impossible offset",
+          "wrong" in r10["rejected"] or (off10 is not None and off10 >= -EDGE_TOL_MS),
+          f"offset={off10} rejected={'wrong' in r10['rejected']}")
+    if "wrong" in r10["rejected"]:
+        check("and the reason says why", "before they were captured" in r10["rejected"]["wrong"]
+              or "did not line up" in r10["rejected"]["wrong"]
+              or "equally well" in r10["rejected"]["wrong"],
+              r10["rejected"]["wrong"][:60])
 
     print("solve(): picks a reference when none is given")
     res2 = solve({"few": a[:40], "many": b})
