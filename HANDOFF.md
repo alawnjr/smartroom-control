@@ -151,9 +151,25 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
    URL directly to split NVR-side from forwarder-side. ffmpeg's RTSP reorder buffer was
    checked and is an unlikely cause: the forwarder uses `-rtsp_transport tcp`, and TCP
    cannot reorder.
-2. **`reolink_audio_forward.py` has never been run.** Written and deployed on the
-   server side, but the NVR-facing host must start it. `/api/v1/live/audio` returns 503
-   until then, and the Listen button stays disabled with the reason in its tooltip.
+2. ~~**`reolink_audio_forward.py` has never been run.**~~ **Running since 2026-08-03.**
+   Started on the NVR-facing laptop; `/api/v1/live/audio` serves a 32 kHz mono mp3 and
+   the Listen button is live. Measured −41.0 dB mean / −14.0 dB peak, matching ch1's
+   recorded track, so the path carries real room sound.
+
+   First run exposed a deadlock in **both** forwarders (fixed, CityOSNode `535d975`):
+   they passed `stderr=PIPE` and only read it after the loop, which is fine for a
+   subprocess you wait on and wrong for one you keep alive. ffmpeg warns continuously
+   on this source (~3 KB/45 s of "non monotonically increasing dts"), the few-KB OS
+   buffer filled in about a minute, and ffmpeg then **blocked writing stderr and stopped
+   producing audio** — the forwarder sat alive on a stream that would never move again,
+   logging nothing. `drain_stderr()` now pumps it on a daemon thread. Worth knowing
+   before writing a third forwarder.
+
+   Still manual: it is a `nohup` process on that laptop, so it dies on reboot or sleep.
+   Wants a scheduled task if the live feed should be permanent.
+
+   `SMARTROOM_AUDIO_TRIM_MS` is still `0` — the lip-sync trim has to be set by ear by
+   someone in the room, since no calibration can measure an audio path.
 3. **`smartroom-live-forward@d435` is still enabled on the Pi** and will reconnect and
    404 in a retry loop. Harmless but noisy: `systemctl --user disable --now
    smartroom-live-forward@d435`.
