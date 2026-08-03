@@ -321,9 +321,52 @@ def all_offsets() -> dict:
         return dict(CAM_OFFSETS)
 
 
+def present_delay_ms() -> float:
+    """How far behind live to present every camera, so they show one instant.
+
+    The slowest camera sets the pace — holding anything back by less than its delay
+    could not bring the two into step. Derived from the offsets each time rather
+    than cached, so a fresh calibration changes the pace without a restart. Zero
+    when nothing has been measured, which leaves the old behaviour untouched.
+    """
+    if not PRESENT_SYNC:
+        return 0.0
+    if PRESENT_DELAY_MS > 0:
+        return PRESENT_DELAY_MS
+    offs = all_offsets()
+    worst = max([v for v in offs.values() if v > 0] or [0.0])
+    return worst + PRESENT_MARGIN_MS if worst > 0 else 0.0
+
+
 # Sampling for the calibration: the frame-difference energy of a downscaled gray
 # frame, which is what a light switch spikes. Computed in the pose loop (the
 # frame is already decoded there) and only while a calibration is armed.
+# --- presenting every camera at the same instant --------------------------------
+# Correcting timestamps fixes the ANALYSIS: fusion compares the right moments. It
+# does nothing for the picture, because each camera's frame is still shown the
+# moment it arrives — so the D455 displays the present while the security cameras
+# display 3.5s ago, side by side, and a person crossing the room appears in
+# different places in different panels.
+#
+# Nothing can make a late camera arrive sooner. On the Pi the D435's latency is a
+# deliberate 60-frameset queue (~2s at 30fps) that exists to stop recordings
+# dropping frames, and the NVR's buffer is not ours at all. The only way to show one
+# instant is therefore to HOLD the fast cameras back to the slowest one, which is
+# what this does: every camera's frame waits until `present_delay` after the moment
+# it was captured, so what is on screen is one coherent slice of the past.
+#
+# Positions travel with their own frame, so the 3D map and the video stay in step.
+PRESENT_SYNC = os.environ.get("SMARTROOM_PRESENT_SYNC", "1") != "0"
+# Extra headroom over the largest measured offset, for arrival jitter: a frame that
+# turns up later than its camera's average would otherwise miss its slot entirely.
+PRESENT_MARGIN_MS = float(os.environ.get("SMARTROOM_PRESENT_MARGIN_MS", "400"))
+# Override to pin the delay by hand; empty/0 means "derive it from the offsets".
+PRESENT_DELAY_MS = float(os.environ.get("SMARTROOM_PRESENT_DELAY_MS", "0") or 0)
+PRESENT_TICK_S = 0.02          # how often due frames are released
+# Bound the hold buffer per camera. 240 frames is ~16s at 15fps, far past any
+# plausible delay, and caps memory at roughly 10MB of JPEG per camera.
+PRESENT_MAX_FRAMES = int(os.environ.get("SMARTROOM_PRESENT_MAX_FRAMES", "240"))
+
 TIMING_SIZE = (160, 120)
 TIMING_MAX_SAMPLES = 4000      # ~4 minutes at 15fps; a hard cap on the buffer
 TIMING_DEFAULT_S = float(os.environ.get("SMARTROOM_TIMING_SECONDS", "25"))
@@ -1102,6 +1145,9 @@ class Shared:
         # SlowFast-AVA: a rolling buffer of (resized BGR frame, [(tid, box_resized)])
         # — whole-frame clips + per-person proposals, classified together.
         self.ava_buf = deque(maxlen=AVA_BUF)
+        # Annotated frames waiting for their presentation slot, oldest first, each
+        # with the capture time that decides when it is due.
+        self.pending = deque()
 
     def put_in(self, jpeg, hw_ts=0.0, recv_ms=None):
         with self.cond:
@@ -1183,15 +1229,47 @@ class Shared:
                 best, best_d = m * 1000.0, d
         return best
 
-    def put_out(self, jpeg, positions, fps, hw_ts=0.0):
+    def put_out(self, jpeg, positions, fps, hw_ts=0.0, t_cap=None):
+        """Publish an annotated frame, or hold it until its presentation slot.
+
+        Held rather than shown immediately so that every camera displays the same
+        captured instant — see PRESENT_SYNC. With no measured offsets the delay is
+        zero and this is a straight publish, exactly as before.
+        """
+        if t_cap is None or present_delay_ms() <= 0:
+            with self.cond:
+                self._publish_locked(jpeg, positions, fps, hw_ts)
+            return
         with self.cond:
-            self.out_jpeg = jpeg
-            self.out_id += 1
-            self.positions = positions
-            self.fps = fps
-            self.hw_ts = hw_ts
-            self.updated_ms = int(time.time() * 1000)
-            self.cond.notify_all()
+            self.pending.append((t_cap, jpeg, positions, fps, hw_ts))
+            while len(self.pending) > PRESENT_MAX_FRAMES:
+                self.pending.popleft()
+
+    def release_due(self, cutoff_t):
+        """Show the newest held frame captured at or before `cutoff_t`.
+
+        Newest, not oldest: if this camera fell behind and several frames came due
+        at once, the current one is what belongs on screen — replaying the backlog
+        in order would run the view in slow motion until it caught up.
+        """
+        with self.cond:
+            pick = None
+            while self.pending and self.pending[0][0] <= cutoff_t:
+                pick = self.pending.popleft()
+            if pick is None:
+                return False
+            _t, jpeg, positions, fps, hw_ts = pick
+            self._publish_locked(jpeg, positions, fps, hw_ts)
+            return True
+
+    def _publish_locked(self, jpeg, positions, fps, hw_ts):
+        self.out_jpeg = jpeg
+        self.out_id += 1
+        self.positions = positions
+        self.fps = fps
+        self.hw_ts = hw_ts
+        self.updated_ms = int(time.time() * 1000)
+        self.cond.notify_all()
 
 
 class IdentityRegistry:
@@ -1856,7 +1934,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
         ok, enc = cv2.imencode(".jpg", frame,
                                [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         if ok:
-            shared.put_out(enc.tobytes(), positions, round(ema_fps, 1), hw_ts)
+            shared.put_out(enc.tobytes(), positions, round(ema_fps, 1), hw_ts,
+                           t_cap=t_frame)
 
 
 def action_loop(shared: Shared, width: int, height: int, variant_key: str):
@@ -2111,6 +2190,23 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
             # multi-label: keep EVERY class above the threshold, not just top-1
             shared.set_label(tid, labs[0][0] if labs else None,
                              labs[0][1] if labs else 0.0, labs)
+
+
+def presenter(cams: dict):
+    """Release each camera's held frames when they come due.
+
+    One thread for every camera, deliberately: they must all be released against
+    the SAME cutoff, or the synchrony this exists to create would depend on how
+    each camera's own thread happened to be scheduled.
+    """
+    while True:
+        time.sleep(PRESENT_TICK_S)
+        delay = present_delay_ms()
+        if delay <= 0:
+            continue          # uncalibrated: put_out published directly
+        cutoff = time.time() - delay / 1000.0
+        for e in cams.values():
+            e["shared"].release_due(cutoff)
 
 
 def timing_driver(cams: dict):
@@ -2411,6 +2507,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 "cams": per_cam,
                 "identities": ids.stats() if ids is not None else None,
                 "timing": TIMING.state(),
+                # How far behind live the whole view deliberately sits, so every
+                # camera shows the same captured instant. 0 = not synced.
+                "presentDelayMs": round(present_delay_ms(), 1),
                 "updatedMs": first.updated_ms,
                 "fps": first.fps,
                 "roomFrame": cams[default_cam]["roomFrame"],
@@ -2737,6 +2836,13 @@ def main():
     offsets = reload_offsets(list(cams))
     measured = {k: v for k, v in offsets.items() if k in cams and v}
     print(f"[live] timeline: {_timing_note(measured)}", flush=True)
+    threading.Thread(target=presenter, args=(cams,), daemon=True).start()
+    pd = present_delay_ms()
+    print(f"[live] presentation: " + (
+        f"all cameras held to one instant, {pd / 1000:.2f}s behind live"
+        if pd > 0 else
+        "each camera shown on arrival (no offsets measured, so nothing to sync to)"),
+        flush=True)
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
     print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}  "
