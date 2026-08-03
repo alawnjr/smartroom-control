@@ -698,7 +698,8 @@ class SegmentRecorder:
         self.kept = self.dropped = 0
         threading.Thread(target=self._run, daemon=True).start()
 
-    def add(self, jpeg: bytes, hw_ts: float, positions, sync_ms: float = 0.0):
+    def add(self, jpeg: bytes, hw_ts: float, positions, sync_ms: float = 0.0,
+            people: int = None):
         """positions: this frame's people as [{id, px:[u,v], room:[x,z], src}] —
         the depth-measured room positions the live map already computed. Saving
         them makes an RGB-only segment as localizable as a depth recording; the
@@ -710,12 +711,22 @@ class SegmentRecorder:
         whatever the forwarding host stamped, which for a RealSense is a real
         sensor clock and for a Reolink is that host's wall clock — two different
         clocks, which is exactly why a segment needs a third column that is one.
+
+        `people` is how many people this frame DETECTED, which is not the same as
+        how many it published. A spatially muted camera emits no positions by
+        design, and counting `positions` meant its segments always looked empty and
+        were discarded on close — so with SMARTROOM_SPATIAL_ONLY set, five of six
+        cameras silently recorded nothing at all, while their own startup line
+        promised "recording continues". Whether footage is worth keeping is a
+        question about people being present, not about which camera was elected to
+        report where they were.
         """
         if not RECORD.accepts(sync_ms / 1000.0 if sync_ms else time.time()):
             return                         # not recording — drop it here, cheaply
+        n_people = len(positions) if people is None else people
         with self.cond:
             if len(self.q) < 240:          # ~8s at 30fps; never block inference
-                self.q.append((jpeg, hw_ts, positions, sync_ms))
+                self.q.append((jpeg, hw_ts, positions, sync_ms, n_people))
                 self.cond.notify()
 
     def _cap_now(self):
@@ -747,7 +758,7 @@ class SegmentRecorder:
                         elif int(self._cap_now() // SEGMENT_S) != self.idx:
                             self._rotate(int(self._cap_now() // SEGMENT_S))
                 item = self.q.popleft()
-            jpeg, hw_ts, positions, sync_ms = item
+            jpeg, hw_ts, positions, sync_ms, n_people = item
             # Segment membership follows the frame's CAPTURE time, so every camera's
             # clip for a given boundary covers the same real interval. Cutting on
             # arrival instead meant a Reolink clip named rec_..._120000 actually held
@@ -762,8 +773,9 @@ class SegmentRecorder:
                 self.proc.stdin.write(jpeg)
                 self.frames += 1
                 self.rows.append((self.frames, hw_ts, sync_ms))
-                if positions:
+                if n_people:
                     self.people_frames += 1
+                if positions:
                     self.geo_rows.append((self.frames, positions))
             except (BrokenPipeError, OSError) as exc:
                 print(f"[live] {self.cam}: segment write failed: {exc}", flush=True)
@@ -1827,7 +1839,9 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 {"id": tid, "px": [float(marker[0]), float(marker[1])],
                  "room": [float(pos[0]), float(pos[1])], "src": src}
                 for tid, pos, marker, p, src in found]
-            recorder.add(jpeg, hw_ts, geo_frame, t_frame * 1000.0)
+            # `found` is what was DETECTED; geo_frame is what this camera is allowed
+            # to publish. A muted camera has the first without the second.
+            recorder.add(jpeg, hw_ts, geo_frame, t_frame * 1000.0, people=len(found))
         if tslog is not None:
             tslog.write(hw_ts, len(positions))
 
