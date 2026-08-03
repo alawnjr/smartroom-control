@@ -59,3 +59,8 @@ __pycache__/
 action-classes.json
 .validate.log
 .claude/
+
+# measured per-camera arrival delays (written by the lights on/off calibration)
+# — machine-generated and specific to one deployment's network, like the Pi's
+# calibration/ directory
+/calibration/

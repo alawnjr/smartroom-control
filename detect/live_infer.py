@@ -14,6 +14,14 @@ every person to the shared AprilTag room frame with the monocular floor-ray
   GET  /live.mjpg                 annotated MJPEG (skeletons + foot markers)
   GET  /positions                 latest room positions JSON + roomFrame
   GET  /                          a viewer page (video + top-down room map)
+  POST /timing/start?seconds=25   arm the lights on/off timing calibration
+  GET  /timing/status             its progress and the measured per-camera offsets
+
+Cameras do not all reach this server at the same speed — a Reolink frame comes
+through the NVR's buffer and a second host, a RealSense frame over one LAN hop —
+so a per-camera offset is measured (see timing_sync.py) and subtracted before any
+two cameras' detections are compared. Uncalibrated, every camera is 0 and the
+behaviour is exactly what it was before offsets existed.
 
 Calibration is NOT sent from the Pi. Extrinsics are static, so `geom` is built
 once from the newest UPLOADED recording that contains this camera (its
@@ -24,6 +32,8 @@ Env:
   SMARTROOM_SAVE_DIR        recordings root (to find a clip for calibration)
   SMARTROOM_DETECT_DEVICE   torch device ("0" for GPU, "cpu"); default auto
   SMARTROOM_LIVE_WEIGHTS    pose weights (default ~/Code/yolo-bench/yolo26n-pose.pt)
+  SMARTROOM_LIVE_TIMING     measured camera offsets (default calibration/live_timing.json)
+  SMARTROOM_TIME_OFFSET_<CAM>  override one camera's offset in ms
 
 Usage:
   python detect/live_infer.py --cam camera_d455_color --port 8010
@@ -64,6 +74,7 @@ from localize import (  # noqa: E402
     joint_px,
 )
 from calib_utils import ANKLE_JOINT_HEIGHT_MM, pixel_to_floor  # noqa: E402
+import timing_sync  # noqa: E402
 
 # COCO-17 shoulders (fallback anchor when the hips are occluded, e.g. seated at
 # a desk). Both anchors are ranged by real depth — no floor-ray, never the feet.
@@ -184,9 +195,12 @@ JUMP_HOLD_S = 0.5         # keep showing "jump" this long after the last airborn
 # ByteTrack ids are per-camera and reset whenever a track is lost, so a person
 # who is occluded, leaves, or is seen by the other camera gets a fresh id. The
 # registry maps (cam, track id) -> a GLOBAL id using two signals:
-#   1. geometry — both cameras localize into the same tag-2 room frame with
-#      hw-synced timestamps (measured ~7cm agreement), so two detections at the
-#      same room point at the same moment are the same person. Cheap + strong.
+#   1. geometry — every camera localizes into the same room frame (measured ~7cm
+#      agreement between the two RealSense), so two detections at the same room
+#      point at the same moment are the same person. Cheap + strong. "The same
+#      moment" is only meaningful once the cameras share a timeline, which is what
+#      CAM_OFFSETS below is for — before it, a Reolink detection was compared
+#      against a RealSense one hundreds of ms out of step.
 #   2. appearance — a ReID embedding (ultralytics' encoder), which is what can
 #      bridge a long absence where geometry says nothing.
 REID_MODEL = os.environ.get("SMARTROOM_REID_MODEL", "yolo26n-reid.onnx")
@@ -240,6 +254,64 @@ GEO_FUSE_PERSIST = int(os.environ.get("SMARTROOM_GEO_FUSE_PERSIST", "5"))
 GEO_SPLIT_PERSIST = int(os.environ.get("SMARTROOM_GEO_SPLIT_PERSIST", "8"))
 GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
+
+# --- one comparable timeline across cameras ----------------------------------
+# Every rule above that compares two cameras (GEO_MERGE_S, GEO_SPLIT_MM, fuse())
+# needs to know WHEN each detection happened. It used to use `time.time()` at the
+# moment this loop picked the frame up, which is two errors deep:
+#
+#   1. inference-start, not arrival — a camera whose GPU is busier is stamped
+#      systematically later than one that is idle, for no physical reason;
+#   2. no allowance for transport — the RealSense cameras arrive over one LAN hop
+#      from the Pi, while a Reolink frame waits on the NVR's encoder and buffer,
+#      crosses RTSP to a second host, and is re-encoded to JPEG there.
+#
+# (1) is fixed by stamping arrival in the ingest handler (Shared.in_recv_ms).
+# (2) cannot be derived — it is a property of the hardware path — so it is
+# MEASURED, per camera, by the lights on/off calibration in timing_sync.py, and
+# subtracted here. The reference camera is 0 by definition; every other camera's
+# frames are treated as having been captured `offset_ms` before they landed.
+#
+# Every camera gets an offset, INCLUDING the RealSense pair. Their sensor clocks
+# are already synchronised with each other by librealsense (that is what the Pi's
+# calibration/camera_timing.json measures), but that says nothing about how long
+# the depth page, live_forward and the network take to deliver a frame here —
+# which is the delay that has to match Reolink's to fuse against it.
+CAM_OFFSETS = {}           # cam_key -> ms to subtract from its arrival times
+OFFSETS_LOCK = threading.Lock()
+
+
+def reload_offsets(cam_keys=None) -> dict:
+    """Re-read the stored offsets (env still wins). Called at startup and again
+    whenever a calibration finishes, so a new measurement takes effect without a
+    restart — the point of a calibration button is not having to bounce six
+    models to use its result."""
+    stored = timing_sync.load_offsets()
+    keys = set(stored) | set(cam_keys or ()) | set(CAM_OFFSETS)
+    fresh = {k: timing_sync.offset_ms_for(k, stored) for k in keys}
+    with OFFSETS_LOCK:
+        CAM_OFFSETS.clear()
+        CAM_OFFSETS.update(fresh)
+        return dict(CAM_OFFSETS)
+
+
+def cam_offset_ms(cam_key: str) -> float:
+    with OFFSETS_LOCK:
+        return CAM_OFFSETS.get(cam_key, 0.0)
+
+
+def all_offsets() -> dict:
+    with OFFSETS_LOCK:
+        return dict(CAM_OFFSETS)
+
+
+# Sampling for the calibration: the frame-difference energy of a downscaled gray
+# frame, which is what a light switch spikes. Computed in the pose loop (the
+# frame is already decoded there) and only while a calibration is armed.
+TIMING_SIZE = (160, 120)
+TIMING_MAX_SAMPLES = 4000      # ~4 minutes at 15fps; a hard cap on the buffer
+TIMING_DEFAULT_S = float(os.environ.get("SMARTROOM_TIMING_SECONDS", "25"))
+TIMING_MAX_S = 180.0
 
 # --- continuous segment recording -------------------------------------------
 # Always-on archival of the live feed in fixed-length segments, written straight
@@ -388,6 +460,130 @@ def _segment_mode_note() -> str:
     return "on demand (%gs chunks, POST /record/start)" % SEGMENT_S
 
 
+class TimingCalibration:
+    """The lights on/off measurement, shared by every camera.
+
+    While armed, each camera's pose loop appends (arrival_ms, frame-difference
+    energy) here. When the window closes, the series are cross-correlated against
+    a reference and the offsets are written and applied.
+
+    ONE window for all cameras, deliberately: the whole measurement is a
+    comparison between cameras, so they must be watching the same light switch at
+    the same time. Cameras that see nothing are reported and left at 0 rather
+    than guessed at.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.armed = False
+        self.until = 0.0
+        self.reference = None
+        self.series = {}          # cam_key -> [(arrival_ms, energy)]
+        self.result = None        # last solve output (also written to disk)
+        self.error = None
+        self.started = None
+
+    def start(self, seconds, reference=None):
+        seconds = max(5.0, min(float(seconds), TIMING_MAX_S))
+        with self.lock:
+            if self.armed:
+                return False, self.state_locked()
+            self.armed = True
+            self.started = time.time()
+            self.until = self.started + seconds
+            self.reference = reference or None
+            self.series = {}
+            self.result = None
+            self.error = None
+            return True, self.state_locked()
+
+    def sample(self, cam_key, arrival_ms, energy):
+        """Called from the pose loop for every frame while armed. Cheap: one
+        bool test when disarmed, one append when armed."""
+        if not self.armed:
+            return
+        with self.lock:
+            if not self.armed:
+                return
+            rows = self.series.setdefault(cam_key, [])
+            if len(rows) < TIMING_MAX_SAMPLES:
+                rows.append((float(arrival_ms), float(energy)))
+
+    def expired(self):
+        return self.armed and time.time() >= self.until
+
+    def finish(self, cam_keys):
+        """Solve, store and apply. Returns the result dict (or None on failure).
+
+        Cameras that never delivered a frame are passed in as empty series so the
+        result names them explicitly — "camera_cam3_color: not streaming" is a
+        far more useful answer than that camera silently missing from the output.
+        """
+        with self.lock:
+            if not self.armed:
+                return None
+            self.armed = False
+            series = {k: list(v) for k, v in self.series.items()}
+            reference = self.reference
+            self.series = {}
+        for key in cam_keys:
+            series.setdefault(key, [])
+        try:
+            result = timing_sync.solve(series, reference=reference)
+            path = timing_sync.save(result)
+            applied = reload_offsets(cam_keys)
+            result["applied_ms"] = {k: applied.get(k, 0.0) for k in cam_keys}
+            result["path"] = str(path)
+            print(f"[live] timing calibration: {timing_sync.summary_line(result)}",
+                  flush=True)
+            with self.lock:
+                self.result, self.error = result, None
+            return result
+        except Exception as exc:  # noqa: BLE001 — reported through /timing/status
+            print(f"[live] timing calibration FAILED: {exc}", flush=True)
+            with self.lock:
+                self.result, self.error = None, str(exc)
+            return None
+
+    def cancel(self):
+        with self.lock:
+            self.armed = False
+            self.series = {}
+            self.error = "cancelled"
+            return self.state_locked()
+
+    def state(self):
+        with self.lock:
+            return self.state_locked()
+
+    def state_locked(self):
+        now = time.time()
+        return {
+            "running": self.armed,
+            "remainingS": round(max(0.0, self.until - now), 1) if self.armed else None,
+            "elapsedS": round(now - self.started, 1) if self.started else None,
+            "samples": {k: len(v) for k, v in self.series.items()},
+            "result": self.result,
+            "error": self.error,
+            "offsetsMs": all_offsets(),
+            "instructions": ("Flip the room lights fully off and back on 3-4 times, "
+                             "a couple of seconds apart, while this runs."),
+        }
+
+
+TIMING = TimingCalibration()
+
+
+def _timing_note(measured: dict) -> str:
+    """Per-camera offsets for the startup banner. Says so plainly when there are
+    none: an uncalibrated system compares cameras on raw arrival times, and that
+    is worth seeing in the log rather than inferring from silence."""
+    if not measured:
+        return (f"all cameras at 0 ms (no calibration at {timing_sync.timing_path()}"
+                " — POST /timing/start and flip the lights)")
+    return ", ".join(f"{k} {v:+.0f}ms" for k, v in sorted(measured.items()))
+
+
 class SegmentRecorder:
     """Encodes the incoming JPEG stream to fixed-length mp4 segments.
 
@@ -410,22 +606,29 @@ class SegmentRecorder:
         self.frames = 0
         self.people_frames = 0
         self.started = None
-        self.rows = []           # (frame_no, hw_ts)
+        self.rows = []           # (frame_no, hw_ts, sync_ms)
         self.geo_rows = []       # (frame_no, [{id, px, room, src}]) — depth-measured
         self.kept = self.dropped = 0
         threading.Thread(target=self._run, daemon=True).start()
 
-    def add(self, jpeg: bytes, hw_ts: float, positions):
+    def add(self, jpeg: bytes, hw_ts: float, positions, sync_ms: float = 0.0):
         """positions: this frame's people as [{id, px:[u,v], room:[x,z], src}] —
         the depth-measured room positions the live map already computed. Saving
         them makes an RGB-only segment as localizable as a depth recording; the
         offline pass can't (no depth) and would otherwise floor-ray it into the
-        walls."""
+        walls.
+
+        sync_ms is this frame's time on the SHARED timeline (arrival here, less
+        this camera's measured delay). hw_ts is kept alongside it untouched: it is
+        whatever the forwarding host stamped, which for a RealSense is a real
+        sensor clock and for a Reolink is that host's wall clock — two different
+        clocks, which is exactly why a segment needs a third column that is one.
+        """
         if not RECORD.is_armed():
             return                         # not recording — drop it here, cheaply
         with self.cond:
             if len(self.q) < 240:          # ~8s at 30fps; never block inference
-                self.q.append((jpeg, hw_ts, positions))
+                self.q.append((jpeg, hw_ts, positions, sync_ms))
                 self.cond.notify()
 
     def _run(self):
@@ -445,14 +648,14 @@ class SegmentRecorder:
                         elif time.time() // SEGMENT_S != self.idx:
                             self._rotate(int(time.time() // SEGMENT_S))
                 item = self.q.popleft()
-            jpeg, hw_ts, positions = item
+            jpeg, hw_ts, positions, sync_ms = item
             idx = int(time.time() // SEGMENT_S)
             if self.proc is None or idx != self.idx:
                 self._rotate(idx)
             try:
                 self.proc.stdin.write(jpeg)
                 self.frames += 1
-                self.rows.append((self.frames, hw_ts))
+                self.rows.append((self.frames, hw_ts, sync_ms))
                 if positions:
                     self.people_frames += 1
                     self.geo_rows.append((self.frames, positions))
@@ -528,9 +731,14 @@ class SegmentRecorder:
             return
         dur = max(1.0, self.frames / 30.0)
         with open(self.dir / f"{self.cam}_timestamps.csv", "w") as fh:
-            fh.write("frame,hw_timestamp_ms\n")
-            for n, ts in self.rows:
-                fh.write(f"{n},{ts:.3f}\n")
+            # sync_ms is the cross-camera column for these segments: one clock
+            # (this server's arrival) with each camera's measured delay already
+            # removed. hw_timestamp_ms stays exactly as the forwarder sent it —
+            # raw, and only comparable between cameras that share a clock.
+            # Consumers pick columns by NAME, so appending one is safe.
+            fh.write("frame,hw_timestamp_ms,sync_ms\n")
+            for n, ts, sync in self.rows:
+                fh.write(f"{n},{ts:.3f},{sync:.3f}\n")
         self._write_metadata(dur)
         self._write_geo()
         self.kept += 1
@@ -581,7 +789,12 @@ class SegmentRecorder:
                           # `t` values are expressed in.
                           "duration_seconds": round(dur, 3),
                           "frame_count": self.frames,
-                          "people_frames": self.people_frames})
+                          "people_frames": self.people_frames,
+                          # What the CSV's sync_ms column means, and how far this
+                          # camera's delivery path was found to lag the reference.
+                          # 0 with no calibration on file — see timing_sync.py.
+                          "time_offset_ms": round(cam_offset_ms(self.cam), 1),
+                          "sync": "match frames across cameras on sync_ms"})
             meta.setdefault("streams", {})[self.cam] = entry
             tmp = path.with_suffix(".tmp")
             tmp.write_text(json.dumps(meta, indent=2))
@@ -741,6 +954,12 @@ class Shared:
         self.cond = threading.Condition()
         self.in_jpeg = None          # latest raw JPEG bytes from the Pi
         self.in_hw_ts = 0.0          # its sensor timestamp (global clock, ms)
+        # When THIS server received the frame. The forwarder's own timestamp
+        # (in_hw_ts) is on the forwarding host's clock — librealsense's on the Pi,
+        # plain wall-clock on the Reolink host — and cross-camera comparisons
+        # cannot be built on three clocks whose agreement is nobody's invariant.
+        # Arrival is one clock for every camera; CAM_OFFSETS carries the rest.
+        self.in_recv_ms = 0.0
         self.in_id = 0
         self.out_jpeg = None         # latest annotated JPEG
         self.out_id = 0
@@ -762,10 +981,11 @@ class Shared:
         # — whole-frame clips + per-person proposals, classified together.
         self.ava_buf = deque(maxlen=AVA_BUF)
 
-    def put_in(self, jpeg, hw_ts=0.0):
+    def put_in(self, jpeg, hw_ts=0.0, recv_ms=None):
         with self.cond:
             self.in_jpeg = jpeg
             self.in_hw_ts = hw_ts
+            self.in_recv_ms = time.time() * 1000.0 if recv_ms is None else recv_ms
             self.in_id += 1
             self.cond.notify_all()
 
@@ -1219,6 +1439,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
     last_id = 0
     ema_fps = 0.0
     predict_fails = 0
+    timing_prev = None      # previous gray frame, only while a calibration runs
     print(f"[live] {cam_key}: pose model loaded ({weights}) device={device} "
           f"half={use_half}", flush=True)
     while True:
@@ -1230,13 +1451,31 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             last_id = shared.in_id
             jpeg = shared.in_jpeg
             hw_ts = shared.in_hw_ts
-        t0 = time.time()
+            recv_ms = shared.in_recv_ms
+        t_start = time.time()          # for the fps measurement only
+        # When this frame was CAPTURED, as best this server can know: arrival,
+        # less the measured delay of this camera's delivery path. Everything that
+        # compares one camera against another must use this and not the clock —
+        # see the CAM_OFFSETS comment.
+        t_frame = (recv_ms / 1000.0 - cam_offset_ms(cam_key) / 1000.0
+                   if recv_ms else t_start)
         frame = cv2.imdecode(np.frombuffer(jpeg, np.uint8), cv2.IMREAD_COLOR)
         if frame is None:
             continue
         if flip:
             frame = cv2.rotate(frame, cv2.ROTATE_180)
         h, w = frame.shape[:2]
+        if TIMING.armed:
+            # Lights on/off calibration: this camera's own view of when the room
+            # changed, against its RAW arrival time (the offset being measured
+            # must not be subtracted from the measurement).
+            gray = cv2.cvtColor(cv2.resize(frame, TIMING_SIZE), cv2.COLOR_BGR2GRAY)
+            if timing_prev is not None:
+                TIMING.sample(cam_key, recv_ms or t_start * 1000.0,
+                              float(cv2.absdiff(gray, timing_prev).mean()))
+            timing_prev = gray
+        elif timing_prev is not None:
+            timing_prev = None
         clean = frame.copy()   # pristine RGB for the action model (frame gets overlays)
         try:
             # Serialized per device — see POSE_LOCKS. `.cpu()` stays INSIDE the
@@ -1307,7 +1546,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                                           z_mm + BODY_HALF_DEPTH_MM, geom)
                 if p_room is not None:
                     pos = (float(p_room[0]), float(p_room[2]))
-                    held[tid] = (pos, t0)
+                    held[tid] = (pos, t_frame)
             if pos is None and ray_ok:
                 # No depth (an RGB-only camera, or a sample that has not landed
                 # near this person yet): cast the ankle ray onto the floor.
@@ -1322,12 +1561,12 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                                                hit[1] - geom["cam_pos_mm"][2]))
                         if reach <= MAX_RAY_REACH_MM:
                             pos, src = (float(hit[0]), float(hit[1])), "ray-ankles"
-                            held[tid] = (pos, t0)
+                            held[tid] = (pos, t_frame)
             if pos is None:
                 # no fresh depth this frame — hold the last known position rather
                 # than dropping the person (that is what caused the flicker).
                 prev = held.get(tid)
-                if prev and t0 - prev[1] <= POS_HOLD_S:
+                if prev and t_frame - prev[1] <= POS_HOLD_S:
                     pos, src = prev[0], src + "-hold"
                 else:
                     continue
@@ -1360,10 +1599,10 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                     embs = got
             if any(e is not None for e in embs):
                 ids.note(cam_key, [(t, e) for (t, *_), e in zip(found, embs)])
-            ids.fuse(t0)      # continuously combine co-located identities
+            ids.fuse(t_frame)      # continuously combine co-located identities
             taken = set()
             for (tid, pos, _marker, _p, _src), emb in zip(found, embs):
-                gid, how = ids.assign(cam_key, tid, emb, pos, t0, taken)
+                gid, how = ids.assign(cam_key, tid, emb, pos, t_frame, taken)
                 taken.add(gid)
                 gids[tid] = (gid, how)
 
@@ -1384,7 +1623,7 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             # geometric jump detector — independent of the classifier; when airborne
             # add "jump" to the set (at the front) rather than replacing it.
             comy, body_h = _hip_com(p)
-            if jumps.update(tid, comy, body_h, t0):
+            if jumps.update(tid, comy, body_h, t_frame):
                 acts = [["jump", 1.0]] + [a for a in acts if a[0] != "jump"]
             gid, how = gids.get(tid, (None, None))
             entry = {"id": tid, "x": round(pos[0], 1), "z": round(pos[1], 1),
@@ -1400,8 +1639,8 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 positions.append(entry)
             _draw_person(frame, p["px"], p["conf"], marker, tid, src, acts,
                          gid if gid is not None else tid)
-        jumps.prune({tid for tid, *_ in found}, t0)
-        for _t in [k for k, v in held.items() if t0 - v[1] > 5]:
+        jumps.prune({tid for tid, *_ in found}, t_frame)
+        for _t in [k for k, v in held.items() if t_frame - v[1] > 5]:
             held.pop(_t, None)
         if ava:
             shared.push_ava(clean, ava_boxes, w, h)   # clean frame, NOT the annotated one
@@ -1418,11 +1657,11 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 {"id": tid, "px": [float(marker[0]), float(marker[1])],
                  "room": [float(pos[0]), float(pos[1])], "src": src}
                 for tid, pos, marker, p, src in found]
-            recorder.add(jpeg, hw_ts, geo_frame)
+            recorder.add(jpeg, hw_ts, geo_frame, t_frame * 1000.0)
         if tslog is not None:
             tslog.write(hw_ts, len(positions))
 
-        dt = time.time() - t0
+        dt = time.time() - t_start
         ema_fps = 0.9 * ema_fps + 0.1 * (1.0 / dt if dt > 0 else 0.0)
         # Count what was DETECTED, not what was published: a muted camera still
         # sees people, and an overlay reading "0 person(s)" over a visible person
@@ -1690,6 +1929,20 @@ def ava_loop(shared: Shared, config_path: str, ckpt: str, label_map_path: str,
                              labs[0][1] if labs else 0.0, labs)
 
 
+def timing_driver(cams: dict):
+    """Close the lights on/off window when its time is up and solve.
+
+    Its own thread rather than a check in the pose loop: the loop only runs while
+    frames arrive, so a camera that dies mid-calibration would leave the window
+    armed forever and the offsets never written. The solve must happen even when
+    every camera has gone quiet — that outcome is itself the result.
+    """
+    while True:
+        time.sleep(0.25)
+        if TIMING.expired():
+            TIMING.finish(list(cams))
+
+
 def stall_watchdog(cams: dict):
     """Exit the process when a camera stops producing frames although the Pi is
     still feeding it.
@@ -1795,6 +2048,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
             if path in ("/record/start", "/record/stop"):
                 self._record(path.endswith("start"))
                 return
+            if path in ("/timing/start", "/timing/cancel"):
+                self._timing(path.endswith("start"))
+                return
             if path != "/ingest":
                 self.send_error(404)
                 return
@@ -1820,7 +2076,12 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                     jpeg = self._readn(length)
                     if jpeg is None:
                         break
-                    shared.put_in(jpeg, hw_ts)
+                    # Arrival stamped HERE, not in the pose loop: this is the last
+                    # point that is purely about the camera's delivery path. Once
+                    # the frame is queued, how long until a GPU picks it up is a
+                    # property of this server's load, and letting that leak into
+                    # the timestamp made a busy camera look like a late one.
+                    shared.put_in(jpeg, hw_ts, time.time() * 1000.0)
                     n += 1
             except (ConnectionError, OSError):
                 pass
@@ -1863,6 +2124,8 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 self._stream()
             elif path == "/record/status":
                 self._json(RECORD.state())
+            elif path == "/timing/status":
+                self._json(TIMING.state())
             else:
                 self.send_error(404)
 
@@ -1904,6 +2167,28 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 print("[live] RECORD stopped", flush=True)
             self._json(state)
 
+        def _timing(self, start):
+            q = parse_qs(urlparse(self.path).query)
+            if not start:
+                self._json(TIMING.cancel())
+                return
+            raw = (q.get("seconds") or q.get("duration") or [None])[0]
+            try:
+                secs = float(raw) if raw else TIMING_DEFAULT_S
+            except ValueError:
+                secs = TIMING_DEFAULT_S
+            ref = (q.get("ref") or q.get("reference") or [None])[0]
+            if ref is not None and ref not in cams:
+                self._json({"error": f"unknown reference camera {ref!r}",
+                            **TIMING.state()}, code=400)
+                return
+            ok, state = TIMING.start(secs, ref)
+            if ok:
+                print(f"[live] timing calibration armed for {secs:.0f}s "
+                      f"(reference={ref or 'auto'}) — flip the room lights",
+                      flush=True)
+            self._json(state)
+
         def _hips(self):
             entry = self._cam()
             hips = entry["shared"].get_hips() if entry else []
@@ -1925,6 +2210,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                     merged.extend(sh.positions)
                     per_cam[key] = {"fps": sh.fps, "updatedMs": sh.updated_ms,
                                     "hwTimestampMs": round(sh.hw_ts, 3),
+                                    # ms subtracted from this camera's arrival
+                                    # times to put it on the shared timeline
+                                    "timeOffsetMs": round(cam_offset_ms(key), 1),
                                     "persons": len(sh.positions),
                                     "roomFrame": e["roomFrame"],
                                     "recording": (e["recorder"].stats()
@@ -1934,6 +2222,7 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 "positions": merged,
                 "cams": per_cam,
                 "identities": ids.stats() if ids is not None else None,
+                "timing": TIMING.state(),
                 "updatedMs": first.updated_ms,
                 "fps": first.fps,
                 "roomFrame": cams[default_cam]["roomFrame"],
@@ -1994,12 +2283,28 @@ PAGE_HTML = """<!doctype html><html><head><meta charset=utf-8>
  img{display:block;border-radius:8px;max-width:640px;width:100%}
  canvas{background:#0a0a0a;border-radius:8px}
  .meta{font-size:12px;color:#a8a29e;margin-top:6px}
+ button{background:#292524;color:#e7e5e4;border:1px solid #44403c;border-radius:7px;
+        padding:7px 11px;font:13px system-ui;cursor:pointer}
+ button:hover{background:#3f3f46}
+ button[disabled]{opacity:.55;cursor:default}
+ .sync{max-width:420px}
+ .sync td{font-size:12px;padding:1px 8px 1px 0;color:#a8a29e}
+ .sync td.n{text-align:right;font-variant-numeric:tabular-nums;color:#e7e5e4}
 </style></head><body>
 <h1>smartroom — live pose + room localization</h1>
 <div class=wrap id=cards>
  <div class=card><div>Top-down room map (mm) — all cameras</div>
    <canvas id=map width=420 height=420></canvas>
    <div class=meta id=cnt></div></div>
+ <div class="card sync"><div>Camera timing</div>
+   <div class=meta>Each camera's frames reach this server after a different delay
+     (the Reolink cameras come via the NVR and a second host). Fusing two cameras
+     needs that delay measured. Press below, then flip the room lights fully off
+     and on 3–4 times: a light change hits every camera at once, so they need no
+     shared view.</div>
+   <div style="margin-top:8px"><button id=syncbtn>Measure timing (lights on/off)</button></div>
+   <div class=meta id=syncmsg></div>
+   <table id=synctab></table></div>
 </div>
 <script>
 const CAMS=__CAMS__;
@@ -2043,8 +2348,10 @@ async function poll(){
     const pos=d.positions||[];room=d.roomFrame;draw(pos);
     const cams=d.cams||{};
     for(const c in cams){const el=document.getElementById('fps_'+c);
-      if(el)el.textContent='inference '+(cams[c].fps||0)+' fps · hw_ts '+
-        (cams[c].hwTimestampMs||0).toFixed(0)+' · '+cams[c].persons+' person(s)';}
+      const off=cams[c].timeOffsetMs;
+      if(el)el.textContent='inference '+(cams[c].fps||0)+' fps · '+cams[c].persons+
+        ' person(s) · timing '+(off?(off>0?'+':'')+off.toFixed(0)+' ms':'0 ms (unmeasured)');}
+    renderTiming(d.timing);
     const acts=pos.map(p=>'#'+(p.gid!=null?p.gid:p.id)+' ['+p.cam.replace('camera_','').replace('_color','')+
       (p.idSrc?'/'+p.idSrc:'')+']: '+((p.actions&&p.actions.length)?
       p.actions.map(a=>a[0]+' '+a[1].toFixed(2)).join(', '):'…'));
@@ -2053,6 +2360,45 @@ async function poll(){
       (acts.length?acts.join('<br>'):'—');
   }catch(e){}
   setTimeout(poll,200);
+}
+const btn=document.getElementById('syncbtn'),msg=document.getElementById('syncmsg'),
+      tab=document.getElementById('synctab');
+btn.onclick=async function(){
+  btn.disabled=true;
+  try{await fetch('/timing/start?seconds=25',{method:'POST'});}
+  catch(e){msg.textContent='could not start: '+e;btn.disabled=false;}
+};
+function renderTiming(t){
+  if(!t)return;
+  btn.disabled=!!t.running;
+  if(t.running){
+    const n=Object.values(t.samples||{}).reduce((a,b)=>a+b,0);
+    msg.textContent='measuring — '+(t.remainingS||0).toFixed(0)+'s left · '+n+
+      ' frames · FLIP THE LIGHTS OFF AND ON';
+  } else if(t.error){
+    msg.textContent='failed: '+t.error;
+  } else if(t.result){
+    const r=t.result;
+    msg.textContent='measured '+(r.measured_at||'').slice(0,19).replace('T',' ')+
+      ' · reference '+r.reference;
+  } else {
+    msg.textContent='no measurement yet — every camera is treated as arriving at the same instant';
+  }
+  const offs=t.result?t.result.offsets_ms:(t.offsetsMs||{});
+  const q=(t.result&&t.result.quality)||{}, bad=(t.result&&t.result.rejected)||{};
+  let rows='';
+  Object.keys(offs).sort().forEach(function(c){
+    const o=offs[c], k=q[c]||{};
+    rows+='<tr><td>'+c.replace('camera_','').replace('_color','')+'</td>'+
+      '<td class=n>'+(o>0?'+':'')+o.toFixed(0)+' ms</td>'+
+      '<td>'+(k.correlation!=null?'r='+k.correlation:'reference')+
+      (k.jitter_ms!=null?' · jitter '+k.jitter_ms+' ms':'')+'</td></tr>';
+  });
+  Object.keys(bad).sort().forEach(function(c){
+    rows+='<tr><td>'+c.replace('camera_','').replace('_color','')+'</td>'+
+      '<td class=n>—</td><td>'+bad[c]+'</td></tr>';
+  });
+  tab.innerHTML=rows;
 }
 poll();
 </script></body></html>"""
@@ -2197,6 +2543,11 @@ def main():
                              daemon=True).start()
 
     threading.Thread(target=stall_watchdog, args=(cams,), daemon=True).start()
+    threading.Thread(target=timing_driver, args=(cams,), daemon=True).start()
+
+    offsets = reload_offsets(list(cams))
+    measured = {k: v for k, v in offsets.items() if k in cams and v}
+    print(f"[live] timeline: {_timing_note(measured)}", flush=True)
 
     httpd = ThreadingHTTPServer(("0.0.0.0", args.port), make_handler(cams, ids))
     print(f"[live] serving on :{args.port}  cams={list(cams)}  action={mode}  "
