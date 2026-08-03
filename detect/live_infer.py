@@ -346,6 +346,11 @@ SEGMENT_ALWAYS = os.environ.get("SMARTROOM_SEGMENT_ALWAYS", "0") != "0"
 # button is in a browser tab; a tab can close, sleep, or lose the network, and
 # none of those can be allowed to leave the encoder running indefinitely.
 RECORD_MAX_S = float(os.environ.get("SMARTROOM_RECORD_MAX_S", "1800"))   # 30 min
+# How long after a take ends to keep accepting frames CAPTURED inside it. The
+# Reolink path is ~3.5s behind, so without this every one of their clips would lose
+# its last few seconds while the RealSense clips kept theirs. Comfortably above the
+# largest measured camera delay.
+RECORD_LATE_GRACE_S = float(os.environ.get("SMARTROOM_RECORD_LATE_GRACE_S", "15"))
 SEGMENT_S = float(os.environ.get("SMARTROOM_SEGMENT_S", "180"))     # 3 minutes
 # A couple of stray detections should not preserve an otherwise empty segment.
 SEGMENT_MIN_PEOPLE_FRAMES = int(os.environ.get("SMARTROOM_SEGMENT_MIN_FRAMES", "15"))
@@ -419,6 +424,7 @@ class RecordControl:
         self.since = time.time() if always else None
         self.until = None
         self.label = None
+        self.window = None     # (start, end) of the most recently closed take
 
     def start(self, seconds=None, label=None):
         with self.lock:
@@ -432,8 +438,7 @@ class RecordControl:
         with self.lock:
             if self.always:      # configured always-on; a stop would be a lie
                 return self._state_locked()
-            self.armed = False
-            self.since = self.until = self.label = None
+            self._disarm_locked()
             return self._state_locked()
 
     def is_armed(self):
@@ -441,9 +446,36 @@ class RecordControl:
         thread, so a bounded recording ends even if nothing else is running."""
         with self.lock:
             if self.armed and self.until is not None and time.time() >= self.until:
-                self.armed = False
-                self.since = self.until = self.label = None
+                self._disarm_locked()
             return self.armed
+
+    def _disarm_locked(self):
+        # Remember the window that just closed. A camera running seconds behind is
+        # still delivering frames CAPTURED inside it, and dropping those would clip
+        # the tail off its take -- the Reolink cameras would lose their last ~3.5s
+        # of every recording while the RealSense kept theirs.
+        if self.since is not None:
+            self.window = (self.since, time.time())
+        self.armed = False
+        self.since = self.until = self.label = None
+
+    def accepts(self, t_capture):
+        """Should a frame CAPTURED at `t_capture` go into the recording?
+
+        Judged on capture time, not arrival: that is what makes every camera's clip
+        cover the same real interval regardless of how late its frames turn up.
+        """
+        if self.is_armed():
+            with self.lock:
+                return self.since is None or t_capture >= self.since
+        with self.lock:
+            if not self.window:
+                return False
+            start, end = self.window
+            # Give up on the tail once no plausible delay could still deliver it.
+            if time.time() - end > RECORD_LATE_GRACE_S:
+                return False
+            return start <= t_capture <= end
 
     def state(self):
         with self.lock:
@@ -679,12 +711,22 @@ class SegmentRecorder:
         sensor clock and for a Reolink is that host's wall clock — two different
         clocks, which is exactly why a segment needs a third column that is one.
         """
-        if not RECORD.is_armed():
+        if not RECORD.accepts(sync_ms / 1000.0 if sync_ms else time.time()):
             return                         # not recording — drop it here, cheaply
         with self.cond:
             if len(self.q) < 240:          # ~8s at 30fps; never block inference
                 self.q.append((jpeg, hw_ts, positions, sync_ms))
                 self.cond.notify()
+
+    def _cap_now(self):
+        """"Now" on the shared capture timeline for THIS camera.
+
+        A camera delivering 3.5s late is, right now, producing frames captured 3.5s
+        ago — so its idle bookkeeping (when to rotate, when to give up waiting) has
+        to run on that clock too, or it would rotate a segment before the frames
+        belonging to it had arrived.
+        """
+        return time.time() - cam_offset_ms(self.cam) / 1000.0
 
     def _run(self):
         while True:
@@ -697,14 +739,23 @@ class SegmentRecorder:
                         # _close runs, the moov atom is missing and the clip is
                         # unplayable — a Stop button that left the take unreadable
                         # for minutes would look like it had lost the recording.
-                        if not RECORD.is_armed():
+                        # accepts(), not is_armed(): a late camera's tail frames are
+                        # still owed to the take that just ended.
+                        if not RECORD.accepts(self._cap_now()):
                             self._close()
                             self.proc = self.idx = None
-                        elif time.time() // SEGMENT_S != self.idx:
-                            self._rotate(int(time.time() // SEGMENT_S))
+                        elif int(self._cap_now() // SEGMENT_S) != self.idx:
+                            self._rotate(int(self._cap_now() // SEGMENT_S))
                 item = self.q.popleft()
             jpeg, hw_ts, positions, sync_ms = item
-            idx = int(time.time() // SEGMENT_S)
+            # Segment membership follows the frame's CAPTURE time, so every camera's
+            # clip for a given boundary covers the same real interval. Cutting on
+            # arrival instead meant a Reolink clip named rec_..._120000 actually held
+            # 11:59:56.5–12:02:56.5 while the D455's held 12:00:00–12:03:00 — the
+            # same folder name over two different 3.5s-shifted spans, which is
+            # exactly what breaks paired playback.
+            t_cap = sync_ms / 1000.0 if sync_ms else time.time()
+            idx = int(t_cap // SEGMENT_S)
             if self.proc is None or idx != self.idx:
                 self._rotate(idx)
             try:
@@ -849,6 +900,10 @@ class SegmentRecorder:
                           # camera's delivery path was found to lag the reference.
                           # 0 with no calibration on file — see timing_sync.py.
                           "time_offset_ms": round(cam_offset_ms(self.cam), 1),
+                          # Segment boundaries are capture-aligned, so this clip and
+                          # every other camera's clip in this folder cover the same
+                          # real interval even though they arrived seconds apart.
+                          "segment_aligned_on": "capture time (arrival - time_offset_ms)",
                           "sync": "match frames across cameras on sync_ms"})
             meta.setdefault("streams", {})[self.cam] = entry
             tmp = path.with_suffix(".tmp")
