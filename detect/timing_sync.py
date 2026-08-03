@@ -117,15 +117,33 @@ def _env_key(cam_key: str) -> str:
     return "SMARTROOM_TIME_OFFSET_" + cam_key.upper()
 
 
+# Cameras whose own timestamp is KNOWN to be a true per-frame capture clock, stated
+# rather than measured. The light-edge test cannot always settle it: the D435's
+# auto-exposure fights the change so hard that its brightness swing (48 levels
+# against the D455's 87) leaves its edges unreliable, and it is exactly the camera
+# that needs a per-frame clock, because its delay follows the Pi's queue depth.
+#
+# For the two RealSense the answer is known from first principles — both are
+# librealsense global time from the same host, so they are one clock domain by
+# construction, and no light switch is needed to establish that.
+HW_CLOCK_CAMS = {c.strip() for c in
+                 os.environ.get("SMARTROOM_HW_CLOCK_CAMS", "").split(",") if c.strip()}
+
+
 def load_capture_clocks() -> dict:
     """{cam_key: "hw" | "arrival"} — which clock to take that camera's frame time
-    from. Absent means "arrival", the only thing available before a calibration."""
+    from. Absent means "arrival", the only thing available before a calibration.
+    SMARTROOM_HW_CLOCK_CAMS overrides, for cameras the measurement cannot settle."""
+    out = {}
     try:
         data = json.loads(timing_path().read_text())
-        return {str(k): ("hw" if v == "hw" else "arrival")
-                for k, v in (data.get("capture_clocks") or {}).items()}
+        out = {str(k): ("hw" if v == "hw" else "arrival")
+               for k, v in (data.get("capture_clocks") or {}).items()}
     except (OSError, ValueError, TypeError):
-        return {}
+        pass
+    for cam in HW_CLOCK_CAMS:
+        out[cam] = "hw"
+    return out
 
 
 def load_offsets() -> dict:

@@ -47,6 +47,14 @@ Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 #     its accuracy never was, and ray positions are looser than depth ones — at the
 #     600mm GEO_MERGE_MM they risk splitting one person into two.
 Environment=SMARTROOM_SPATIAL_ONLY=camera_d455_color
+# Both RealSense send librealsense global time — one clock domain by construction,
+# same host, so use each frame's OWN capture instant instead of a constant offset.
+# Stated rather than measured because the D435's auto-exposure leaves its brightness
+# swing (48 levels vs the D455's 87) too weak for the light-edge test to settle it,
+# and it is precisely the camera that needs a per-frame clock: the Pi holds a
+# 60-frameset queue (~2s at 30fps) to keep recordings whole, and its depth follows
+# the load, so the same camera has measured 228ms and 2.7s within a day.
+Environment=SMARTROOM_HW_CLOCK_CAMS=camera_d455_color,camera_d435_color
 # 3-minute segments; a segment needs this many frames containing people to be kept
 Environment=SMARTROOM_SEGMENT_S=180
 Environment=SMARTROOM_SEGMENT_MIN_FRAMES=15
