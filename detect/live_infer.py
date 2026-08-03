@@ -484,7 +484,11 @@ class TimingCalibration:
         self.started = None
 
     def start(self, seconds, reference=None):
-        seconds = max(5.0, min(float(seconds), TIMING_MAX_S))
+        # Floor above timing_sync's minimum window: a shorter run could only ever
+        # be rejected by the solve, so refusing to arm it is kinder than letting
+        # someone flip the lights for nothing.
+        floor_s = timing_sync.MIN_OVERLAP_MS / 1000.0 + 2.0
+        seconds = max(floor_s, min(float(seconds), TIMING_MAX_S))
         with self.lock:
             if self.armed:
                 return False, self.state_locked()

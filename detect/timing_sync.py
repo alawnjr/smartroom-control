@@ -76,8 +76,21 @@ MAX_LAG_MS = float(os.environ.get("SMARTROOM_TIMING_MAX_LAG_MS", "2000"))
 # Resample grid. 5ms is finer than one frame interval at any rate these cameras
 # run, so the peak's position is limited by the data and not by this.
 GRID_MS = 5.0
-MIN_OVERLAP_MS = 3000.0
-MIN_SAMPLES = 30
+# Minimum window two cameras must share. This is what makes MIN_CORRELATION mean
+# something: the peak is a maximum over ~800 candidate lags, so an uncorrelated
+# pair scores well above zero, and how far above depends entirely on how much data
+# there is. Measured worst-of-12 noise peaks against a real signal of ~0.85:
+#
+#     window     5s     8s    10s    15s    20s    25s    30s
+#     noise   0.398  0.315  0.275  0.296  0.270  0.197  0.167
+#
+# At 5s the noise floor is ABOVE the 0.35 bar, so a camera that saw nothing could
+# pass it — which is how a static-scene camera scored 0.31 in a 5s test run. From
+# 10s the floor is clear of the bar; the default 25s window leaves ~4x margin.
+MIN_OVERLAP_MS = 10000.0
+# ...and enough frames within it. A camera delivering under ~6fps has not sampled
+# the light switch well enough to place it, whatever the window length.
+MIN_SAMPLES = 60
 
 
 def timing_path() -> Path:
@@ -152,7 +165,9 @@ def correlate(series_a, series_b, grid_ms=GRID_MS, max_lag_ms=MAX_LAG_MS):
     t0, t1 = max(ta[0], tb[0]), min(ta[-1], tb[-1])
     overlap = t1 - t0
     if overlap < MIN_OVERLAP_MS:
-        raise ValueError(f"cameras overlapped for only {overlap / 1000:.1f}s — rerun")
+        raise ValueError(f"cameras overlapped for only {overlap / 1000:.1f}s, "
+                         f"under the {MIN_OVERLAP_MS / 1000:.0f}s a trustworthy "
+                         "correlation needs — rerun for longer")
     grid = np.arange(t0, t1, grid_ms)
     a = np.interp(grid, ta, ea)
     b = np.interp(grid, tb, eb)
@@ -352,6 +367,14 @@ def _selftest() -> int:
         check("no-change raises", False)
     except ValueError:
         check("no-change raises", True)
+    # A window too short for the correlation to mean anything must be refused
+    # rather than scored — see the MIN_OVERLAP_MS table.
+    short_a, short_b = _synthetic(120.0, n=90, rate_ms=66.0)   # ~6s
+    try:
+        correlate(short_a, short_b)
+        check("too-short window raises", False)
+    except ValueError as exc:
+        check("too-short window raises", "under the" in str(exc), str(exc)[:60])
 
     print("solve(): reference at 0, laggards positive, bad cameras rejected")
     a, b = _synthetic(300.0, seed=2)
