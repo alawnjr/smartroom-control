@@ -417,6 +417,25 @@ PRESENT_MAX_DELAY_MS = float(os.environ.get("SMARTROOM_PRESENT_MAX_DELAY_MS", "8
 # plausible delay, and caps memory at roughly 10MB of JPEG per camera.
 PRESENT_MAX_FRAMES = int(os.environ.get("SMARTROOM_PRESENT_MAX_FRAMES", "240"))
 
+# --- live audio ----------------------------------------------------------------
+# ONE source, not a mix. Every Reolink camera offers an aac 16kHz track but only
+# channel 1's mic is actually enabled -- measured over a real recording, ch1 is
+# -40.9 dB mean with -14.9 dB peaks while 2, 3 and 4 sit at a flat -91.0 dB with mean
+# equal to peak, which is digital silence rather than a quiet room. The RealSense have
+# no microphone at all. So there is exactly one thing worth listening to.
+#
+# The audio is relayed, never decoded: it arrives already encoded from the forwarder
+# and is fanned out to listeners as bytes, so adding sound costs no CPU here.
+AUDIO_ON = os.environ.get("SMARTROOM_LIVE_AUDIO", "1") != "0"
+AUDIO_SRC_CAM = os.environ.get("SMARTROOM_AUDIO_CAM", "camera_cam1_color")
+# Hand trim for lip-sync, positive = hold the audio back further. The video delay is
+# measured; the audio path's own delay is NOT (a light switch is silent), so this is
+# the one number that has to be set by ear.
+AUDIO_TRIM_MS = float(os.environ.get("SMARTROOM_AUDIO_TRIM_MS", "0") or 0)
+AUDIO_PENDING_MAX = 512        # chunks held for their slot (~0.17s each)
+AUDIO_OUT_MAX = 256            # released chunks kept for listeners that fall behind
+AUDIO_SOURCE_STALE_S = 5.0
+
 TIMING_SIZE = (160, 120)
 TIMING_MAX_SAMPLES = 4000      # ~4 minutes at 15fps; a hard cap on the buffer
 TIMING_DEFAULT_S = float(os.environ.get("SMARTROOM_TIMING_SECONDS", "25"))
@@ -599,6 +618,97 @@ def _segment_mode_note() -> str:
     if SEGMENT_ALWAYS:
         return "ALWAYS ON (%gs)" % SEGMENT_S
     return "on demand (%gs chunks, POST /record/start)" % SEGMENT_S
+
+
+class AudioRelay:
+    """Encoded audio from one camera, held to match the video, fanned out to browsers.
+
+    The video is presented `present_delay` after capture. Audio arriving live would
+    therefore run AHEAD of the picture by that much, so it is held too — but by less,
+    because the audio has already spent the NVR's delay getting here. The hold is the
+    difference: what the video waits for, minus what this camera's frames already
+    waited. Both come out of the same measurement, so re-calibrating fixes both.
+
+    Bytes are never decoded. Chunks are timestamped ON ARRIVAL rather than trusting
+    the forwarder's clock, which keeps this independent of that host's time.
+    """
+
+    def __init__(self):
+        self.cond = threading.Condition()
+        self.pending = deque()       # (arrival_ms, data) not yet due
+        self.out = deque(maxlen=AUDIO_OUT_MAX)   # (seq, data) released
+        self.seq = 0
+        self.last_push = 0.0
+        self.listeners = 0
+        self.content_type = "audio/mpeg"
+        self.bytes_in = 0
+
+    def hold_ms(self):
+        """How long to sit on an arriving chunk before letting it out."""
+        delay = present_delay_ms()
+        if delay <= 0:
+            return max(0.0, AUDIO_TRIM_MS)
+        return max(0.0, delay - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS)
+
+    def push(self, data, content_type=None):
+        now = time.time() * 1000.0
+        with self.cond:
+            if content_type:
+                self.content_type = content_type
+            self.last_push = now
+            self.bytes_in += len(data)
+            self.pending.append((now, data))
+            while len(self.pending) > AUDIO_PENDING_MAX:
+                self.pending.popleft()
+
+    def release_due(self):
+        cutoff = time.time() * 1000.0 - self.hold_ms()
+        with self.cond:
+            n = 0
+            while self.pending and self.pending[0][0] <= cutoff:
+                _t, data = self.pending.popleft()
+                self.seq += 1
+                self.out.append((self.seq, data))
+                n += 1
+            if n:
+                self.cond.notify_all()
+            return n
+
+    def follow(self, after_seq, timeout=5.0):
+        """Chunks released after `after_seq`, waiting if there are none yet.
+
+        A listener that falls further behind than the buffer is resynced to the
+        newest chunk rather than fed stale audio: for live sound, a gap is better
+        than drifting permanently behind the picture.
+        """
+        with self.cond:
+            if not self.out or self.out[-1][0] <= after_seq:
+                self.cond.wait(timeout=timeout)
+            if not self.out:
+                return after_seq, []
+            oldest = self.out[0][0]
+            if after_seq < oldest - 1:
+                after_seq = oldest - 1
+            fresh = [(s, d) for s, d in self.out if s > after_seq]
+            if not fresh:
+                return after_seq, []
+            return fresh[-1][0], [d for _s, d in fresh]
+
+    def live(self):
+        return (time.time() * 1000.0 - self.last_push) / 1000.0 < AUDIO_SOURCE_STALE_S
+
+    def state(self):
+        with self.cond:
+            return {"available": bool(self.last_push) and self.live(),
+                    "sourceCam": AUDIO_SRC_CAM,
+                    "contentType": self.content_type,
+                    "listeners": self.listeners,
+                    "holdMs": round(self.hold_ms(), 1),
+                    "trimMs": AUDIO_TRIM_MS,
+                    "kbReceived": round(self.bytes_in / 1024.0, 1)}
+
+
+AUDIO = AudioRelay()
 
 
 class TimingCalibration:
@@ -2280,10 +2390,14 @@ def presenter(cams: dict):
         time.sleep(PRESENT_TICK_S)
         delay = present_delay_ms()
         if delay <= 0:
+            if AUDIO_ON:
+                AUDIO.release_due()   # its own trim may still hold chunks back
             continue          # uncalibrated: put_out published directly
         cutoff = time.time() - delay / 1000.0
         for e in cams.values():
             e["shared"].release_due(cutoff)
+        if AUDIO_ON:
+            AUDIO.release_due()
 
 
 def timing_driver(cams: dict):
@@ -2408,6 +2522,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
             if path in ("/timing/start", "/timing/cancel"):
                 self._timing(path.endswith("start"))
                 return
+            if path == "/audio":
+                self._recv_audio()
+                return
             if path != "/ingest":
                 self.send_error(404)
                 return
@@ -2483,6 +2600,10 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 self._json(RECORD.state())
             elif path == "/timing/status":
                 self._json(TIMING.state())
+            elif path == "/audio/status":
+                self._json(AUDIO.state())
+            elif path in ("/audio.mp3", "/audio"):
+                self._serve_audio()
             else:
                 self.send_error(404)
 
@@ -2523,6 +2644,70 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 state = RECORD.stop()
                 print("[live] RECORD stopped", flush=True)
             self._json(state)
+
+        def _recv_audio(self):
+            """Sink for the forwarder: [4B len][8B double ts_ms][encoded audio]xN.
+
+            Same framing as /ingest so there is one wire format to understand. The
+            forwarder's timestamp is read but not used for timing — arrival is
+            stamped here instead, so this does not depend on that host's clock.
+            """
+            if not AUDIO_ON:
+                self.send_error(503, "audio relay disabled")
+                return
+            ctype = self.headers.get("X-Audio-Content-Type") or "audio/mpeg"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            n = 0
+            try:
+                while True:
+                    hdr = self._readn(12)
+                    if not hdr:
+                        break
+                    length, _ts = struct.unpack(">Id", hdr)
+                    if length == 0 or length > 4_000_000:
+                        break
+                    data = self._readn(length)
+                    if data is None:
+                        break
+                    AUDIO.push(data, ctype)
+                    n += 1
+            except (ConnectionError, OSError):
+                pass
+            print(f"[live] audio ingest closed after {n} chunks", flush=True)
+
+        def _serve_audio(self):
+            """Continuous encoded audio for an <audio> element."""
+            if not AUDIO_ON:
+                self.send_error(503, "audio relay disabled")
+                return
+            if not AUDIO.live():
+                # 503 rather than an empty stream: a silent <audio> that never errors
+                # is indistinguishable from a room with nobody in it.
+                self.send_error(503, "no audio source connected")
+                return
+            with AUDIO.cond:
+                AUDIO.listeners += 1
+                ctype = AUDIO.content_type
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self._cors()
+            self.end_headers()
+            seq = AUDIO.seq
+            try:
+                while True:
+                    seq, chunks = AUDIO.follow(seq)
+                    for data in chunks:
+                        self.wfile.write(data)
+                    if not chunks and not AUDIO.live():
+                        break
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                with AUDIO.cond:
+                    AUDIO.listeners = max(0, AUDIO.listeners - 1)
 
         def _timing(self, start):
             q = parse_qs(urlparse(self.path).query)
@@ -2593,6 +2778,7 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 # How far behind live the whole view deliberately sits, so every
                 # camera shows the same captured instant. 0 = not synced.
                 "presentDelayMs": round(present_delay_ms(), 1),
+                "audio": AUDIO.state() if AUDIO_ON else None,
                 "updatedMs": first.updated_ms,
                 "fps": first.fps,
                 "roomFrame": cams[default_cam]["roomFrame"],
