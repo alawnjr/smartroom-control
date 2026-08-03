@@ -2188,7 +2188,11 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 return
             ok, state = TIMING.start(secs, ref)
             if ok:
-                print(f"[live] timing calibration armed for {secs:.0f}s "
+                # the state's own remaining time, not the requested `secs` —
+                # start() clamps, and a log line naming the rejected number
+                # would send anyone reading it looking for a bug
+                print(f"[live] timing calibration armed for "
+                      f"{state.get('remainingS') or secs:.0f}s "
                       f"(reference={ref or 'auto'}) — flip the room lights",
                       flush=True)
             self._json(state)
