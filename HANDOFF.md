@@ -1,5 +1,10 @@
 # Handoff — camera time sync, live presentation sync, and room audio
 
+> **See also `HANDOFF-2026-08-04.md`** — the next session's work (recorded audio,
+> recorded-playback sync, the UI rewrite, the dataset export) and the one thing
+> still waiting on a human: switching the Reolink cameras to the single-session
+> `reolink_av_forward.py`, which makes `SMARTROOM_AUDIO_TRIM_MS` unnecessary.
+
 Written 2026-08-03. Covers the cross-camera timing work, the delayed-but-synced live
 view, the live audio relay, and what is still open. Code lives in
 `detect/timing_sync.py`, `detect/live_infer.py`,
