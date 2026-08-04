@@ -61,9 +61,17 @@ Environment=SMARTROOM_SPATIAL_ONLY=camera_d455_color
 # needs to establish, and it makes the D455 the reference every other camera is
 # measured against.
 Environment=SMARTROOM_HW_CLOCK_CAMS=camera_d455_color
-# 3-minute segments; a segment needs this many frames containing people to be kept
+# Segment length for the ALWAYS-ON mode only, which is off — a take someone started
+# is one clip however long it runs. Dead config unless SMARTROOM_SEGMENT_ALWAYS=1.
 Environment=SMARTROOM_SEGMENT_S=180
-Environment=SMARTROOM_SEGMENT_MIN_FRAMES=15
+# 0 = keep every camera's clip. The old 15 meant a clip was thrown away unless 15 of
+# its frames contained a localized person, which made whole cameras disappear from a
+# take: cam1 localizes nobody at all, and an empty-room take left no folder behind at
+# all. Recording is on demand now — pressing Record IS the decision that the footage
+# is wanted, and a second filter behind it only loses data. Costs GPU time in the
+# analysis pass and rows in the recordings list, not meaningful disk (~10 MB/min for
+# all five cameras).
+Environment=SMARTROOM_SEGMENT_MIN_FRAMES=0
 # Stop the CPU thread pools busy-waiting. ONNX Runtime (the ReID encoder, which
 # falls back to CPU here) and OpenMP both default to one worker per core — 36 on
 # this box — and both SPIN rather than sleep between batches. Measured: ~7
