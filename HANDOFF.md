@@ -83,7 +83,7 @@ cam3     arrival   +3620.1 ms
 cam4     arrival   +3637.4 ms
 d455     hw            +0.0 ms   (reference)
 
-presentation delay 4038 ms      audio hold 638 ms
+presentation delay 4040 ms      audio hold 3429 ms (trim 2790 ms)
 ```
 
 The **D435 was dropped from the pipeline** (see the comment in the service unit). It
@@ -255,6 +255,19 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
   started it, the wall clock only for always-on, `TAKE_MAX_S` a ceiling rather than a
   rhythm. `SMARTROOM_SEGMENT_S` in the unit is now dead config unless always-on is
   turned back on.
+- **`-itsoffset` only shifts one way.** A negative value asks for negative
+  timestamps, which mp4 cannot express: ffmpeg clamps them to zero and drops the
+  shift **without an error**. Once the audio backlog started capturing sound from
+  before the take, every skew went negative, so recordings carried `skew_ms` in
+  their metadata and none of it in the container — audio and video both starting
+  at 0.000, indistinguishable from no trim at all. Negative skew now trims the
+  audio HEAD (`-ss`) instead; `metadata.audio.alignment` says which ran
+  (`delayed` / `head-trimmed` / `none`).
+- **Duration cannot prove an audio shift happened.** `-shortest` caps the audio
+  at the video's length, so a trimmed and an untrimmed track can measure the same.
+  Put a burst in the sound and measure WHERE it lands — the same thing a person
+  clapping is testing. The synthetic clap lands at 1.210 s against a predicted
+  1.21 s; unshifted it sits at 4.0 s.
 - **The keep/discard rule silently eats whatever else a clip carries.** Same shape as
   the muting bug below, one layer down: once ch1's clip became the *only* place the room
   audio is stored, "nobody in it, throw it away" started throwing the sound away too —
