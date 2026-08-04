@@ -183,11 +183,18 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
 3. **`smartroom-live-forward@d435` is still enabled on the Pi** and will reconnect and
    404 in a retry loop. Harmless but noisy: `systemctl --user disable --now
    smartroom-live-forward@d435`.
-4. **The mirror's recorded playback does not consume `sync_ms`.** Segments now carry it
-   plus `time_offset_ms`, but `parseFrameRel` zeroes each clip to its own first frame
-   and `hwOffsetMs` is plumbed into page data and read by nothing — so recorded
-   playback still assumes every camera started at the same instant. The data is there;
-   wiring it up changes `remap`'s semantics across the 3D scene and its tests.
+4. ~~**The mirror's recorded playback does not consume `sync_ms`.**~~ **Done
+   2026-08-04** (smartroom-mirror `ad57b14`). It aligned cameras on
+   `hw_timestamp_ms`, which is not one clock — the D455 stamps librealsense capture
+   time, the Reolinks stamp the forwarding host's wall clock at decode, ~1.6 s later
+   for the same frame — and then zeroed each clip against whichever CSV loaded first.
+   Five tiles, five timelines, and a transport reporting 1.0 s for a 20 s take.
+   `parseCsv` now reads `sync_ms`, the player parks the absolute clocks and rebases the
+   session on the earliest camera (`rebaseAbs`) once every CSV is in. On
+   rec_20260804_120357 the five cameras start within 75 ms of each other and the
+   session is 19.97 s. `parseFrameRel` stays clip-relative — it feeds `buildRemap`,
+   which is a within-clip container→real conversion — so `remap`'s semantics did not
+   change. 8 checks in `scripts/sync-clock.test.ts`.
 5. **cam1 records but counts no people.** Its segments used to be discarded for it; they
    are now kept because they carry the audio, so the take survives — but its people
    count is still 0 and nothing downstream sees cam1 detections. `found` only
