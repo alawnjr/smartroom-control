@@ -972,6 +972,7 @@ class SegmentRecorder:
         self.audio_fh = None
         self.audio_path = None
         self.audio_t0 = None        # capture time of the first chunk in this segment
+        self.audio_last = None      # ...and of the most recent, for the tail wait
         self.audio_bytes = 0
         self.audio_info = None
         threading.Thread(target=self._run, daemon=True).start()
@@ -1026,17 +1027,43 @@ class SegmentRecorder:
         fh = self.audio_fh
         if fh is None:
             return
+        t_cap = (arrival_ms - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS) / 1000.0
         if self.audio_t0 is None:
-            self.audio_t0 = (arrival_ms - cam_offset_ms(AUDIO_SRC_CAM)
-                             + AUDIO_TRIM_MS) / 1000.0
+            self.audio_t0 = t_cap
+        self.audio_last = t_cap
         fh.write(data)
         self.audio_bytes += len(data)
+
+    def _await_audio_tail(self):
+        """Wait for the sound that belongs to the video we just finished.
+
+        Dating the audio TRIM ms later than its arrival means that when the last
+        picture is in, the sound for the take's final seconds has not been
+        recorded yet — it is still crossing the network. Closing immediately and
+        muxing left a clip whose audio ran out 3.1 s before its video, which
+        -shortest then made look deliberate.
+
+        Bounded, and it stops the moment the sound catches up to the last frame,
+        so the usual cost is the trim itself (~2.8 s) and never more than that
+        plus a second.
+        """
+        if not self.wants_audio or self.audio_fh is None or not self.rows:
+            return
+        target = (self.rows[-1][2] or 0) / 1000.0
+        if not target:
+            return
+        deadline = time.time() + (AUDIO_TRIM_MS / 1000.0) + 1.0
+        while time.time() < deadline:
+            if (self.audio_last or 0) >= target:
+                return
+            time.sleep(0.1)
 
     def _audio_open(self):
         if not self.wants_audio or self.dir is None:
             return
         self.audio_path = self.dir / f".{self.cam}_audio.mp3"
         self.audio_t0 = None
+        self.audio_last = None
         self.audio_bytes = 0
         try:
             self.audio_fh = open(self.audio_path, "wb")
@@ -1295,6 +1322,7 @@ class SegmentRecorder:
                 except OSError: break
             return
         dur = max(1.0, self.frames / 30.0)
+        self._await_audio_tail()   # the sound for the last frames is still in flight
         # Before the metadata, so it can record what the clip actually contains.
         self.audio_info = self._audio_finish(mp4, self.video_t0)
         if self.audio_info and self.audio_info.get("muxed_with_retimed_video"):
