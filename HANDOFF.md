@@ -61,6 +61,16 @@ the forwarder, relayed as bytes (never decoded here), held by
 `present_delay − cam_offset(ch1) + AUDIO_TRIM_MS` so it lines up with the delayed
 video.
 
+**Recorded audio lands in the clip itself**, not beside it: while a segment is open the
+recorder takes a tap on the *undelayed* relay and writes `.{cam}_audio.mp3`, then muxes
+it into the mp4 by stream copy at close and deletes the sidecar. Only ch1's clip carries
+it (one microphone; five copies would echo in the synced player), and `metadata.json`
+gets an `audio` block only where a track really exists. Two things that clip needs and
+the others do not: its container is **retimed** with `-itsscale 30/real_fps` — the blind
+CFR-30 encode made a 25 s take an 8 s container and `-shortest` then cut the sound to
+match — and it is **exempt from the people test**, because ch1 localizes nobody and was
+being discarded on every take, mute recordings being the result.
+
 ---
 
 ## Current state (2026-08-03 15:16 calibration)
@@ -178,7 +188,9 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
    and `hwOffsetMs` is plumbed into page data and read by nothing — so recorded
    playback still assumes every camera started at the same instant. The data is there;
    wiring it up changes `remap`'s semantics across the 3D scene and its tests.
-5. **cam1 records but counts no people**, so its segments are discarded. `found` only
+5. **cam1 records but counts no people.** Its segments used to be discarded for it; they
+   are now kept because they carry the audio, so the take survives — but its people
+   count is still 0 and nothing downstream sees cam1 detections. `found` only
    contains people who could be *localized*, and cam1 sits 2.6 m up in a corner where
    the floor-ray exceeds `MAX_RAY_REACH_MM`. Deprioritised by the user; the fix is to
    count detections that pass the pose-quality gate rather than localization successes.
@@ -220,6 +232,15 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
 - **Never hardcode a rejection reason in the UI.** The panel asserted "they saw no
   light change" for every rejection; cam1 had seen the lights perfectly and was
   rejected for ambiguity, sending the reader to check the room lighting.
+- **The keep/discard rule silently eats whatever else a clip carries.** Same shape as
+  the muting bug below, one layer down: once ch1's clip became the *only* place the room
+  audio is stored, "nobody in it, throw it away" started throwing the sound away too —
+  and ch1 is precisely the camera that can never localize anyone. Anything new attached
+  to a segment has to be checked against that test.
+- **A segment's mp4 duration is not the take's duration.** Frames are piped to ffmpeg at
+  a blind `-r 30` while the Reolink sub streams deliver ~10 fps, so a 30 s take yields a
+  10 s container. The timestamps CSV is the authority and the mirror's player uses it;
+  only the audio-bearing clip is retimed, because there the lie was destructive.
 - **Muting a camera must not stop it recording.** Segment keep/discard counted
   *published* positions, so with `SMARTROOM_SPATIAL_ONLY` set, five of six cameras
   discarded every segment while their startup line promised recording continued.
