@@ -125,7 +125,8 @@ python detect/timing_sync.py --selftest  # the estimator's own checks
 | `SMARTROOM_PRESENT_MARGIN_MS` | `400` | jitter headroom over the worst lag |
 | `SMARTROOM_LIVE_AUDIO` | `1` | enable the audio relay |
 | `SMARTROOM_AUDIO_CAM` | `camera_cam1_color` | which camera's mic |
-| `SMARTROOM_AUDIO_TRIM_MS` | `0` | **set by ear** — lip-sync trim |
+| `SMARTROOM_AUDIO_TRIM_MS` | *(unit sets `2790`)* | **set by ear** — how much faster the audio path is than the video path |
+| `SMARTROOM_AUDIO_BACKLOG_S` | `trim + 1s` | recent audio replayed into a starting segment |
 | `SMARTROOM_GEO_HIST_S` | `20` | identity trail length; must exceed the worst delay |
 
 ---
@@ -178,8 +179,15 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
    Still manual: it is a `nohup` process on that laptop, so it dies on reboot or sleep.
    Wants a scheduled task if the live feed should be permanent.
 
-   `SMARTROOM_AUDIO_TRIM_MS` is still `0` — the lip-sync trim has to be set by ear by
-   someone in the room, since no calibration can measure an audio path.
+   `SMARTROOM_AUDIO_TRIM_MS` was measured by ear on 2026-08-04: the sound ran **2.79 s
+   ahead** of the picture, so the trim is `2790`. It is the part of cam1's 3.4 s that
+   belongs to the VIDEO path only (NVR encode + pre-buffer) — the audio comes down
+   faster, and subtracting the whole 3.4 s dated the sound too early. Setting it
+   exposed two things worth keeping in mind: the trim used to ADD to the live hold and
+   SUBTRACT from a recording's audio timestamp, so no single by-ear number could have
+   been right for both; and once the sound is held back, a starting segment must be
+   handed the audio that PRECEDES it (`AudioRelay.backlog`) or every clip opens with
+   the trim's worth of silence. Re-measure after anything that changes the NVR path.
 3. **`smartroom-live-forward@d435` is still enabled on the Pi** and will reconnect and
    404 in a retry loop. Harmless but noisy: `systemctl --user disable --now
    smartroom-live-forward@d435`.
