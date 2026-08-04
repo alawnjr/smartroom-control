@@ -232,6 +232,14 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
 - **Never hardcode a rejection reason in the UI.** The panel asserted "they saw no
   light change" for every rejection; cam1 had seen the lights perfectly and was
   rejected for ambiguity, sending the reader to check the room lighting.
+- **A mode's mechanism can outlive the mode.** Segments were cut on a 3-minute
+  wall-clock grid, which is right for the always-on recorder — but always-on has been
+  off by default for a while and the grid was never conditioned on it, so it went on
+  cutting hand-started takes. Pressing Record at 11:44:58 gave a 2-second clip plus a
+  separate recording. `RECORD.segment()` now decides: the take's own start when someone
+  started it, the wall clock only for always-on, `TAKE_MAX_S` a ceiling rather than a
+  rhythm. `SMARTROOM_SEGMENT_S` in the unit is now dead config unless always-on is
+  turned back on.
 - **The keep/discard rule silently eats whatever else a clip carries.** Same shape as
   the muting bug below, one layer down: once ch1's clip became the *only* place the room
   audio is stored, "nobody in it, throw it away" started throwing the sound away too —
