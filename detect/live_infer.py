@@ -432,6 +432,11 @@ AUDIO_SRC_CAM = os.environ.get("SMARTROOM_AUDIO_CAM", "camera_cam1_color")
 # measured; the audio path's own delay is NOT (a light switch is silent), so this is
 # the one number that has to be set by ear.
 AUDIO_TRIM_MS = float(os.environ.get("SMARTROOM_AUDIO_TRIM_MS", "0") or 0)
+# How much recent audio a starting segment is given (see AudioRelay.backlog). It
+# needs to cover the trim, since that is exactly how far the sound for the first
+# frames has already gone by; the extra second is slack.
+AUDIO_BACKLOG_S = float(os.environ.get("SMARTROOM_AUDIO_BACKLOG_S", "0") or 0) or \
+    (AUDIO_TRIM_MS / 1000.0 + 1.0)
 AUDIO_PENDING_MAX = 512        # chunks held for their slot (~0.17s each)
 AUDIO_OUT_MAX = 256            # released chunks kept for listeners that fall behind
 AUDIO_SOURCE_STALE_S = 5.0
@@ -677,6 +682,13 @@ class AudioRelay:
         # not the delayed one the browser hears: a recording is assembled on the
         # capture timeline, and the presentation delay is a viewing concern.
         self.taps = {}          # id -> callable(arrival_ms, data)
+        # A few seconds of the recent past, so a segment that opens now can be given
+        # the sound that belongs to its first frames. It has to: the audio is dated
+        # AUDIO_TRIM_MS later than it arrives (the audio path is faster than the
+        # video path), so at the instant recording starts, the sound covering the
+        # take's first ~2.8s has already gone by. Without this every recording began
+        # with that much silence.
+        self.backlog = deque()  # (arrival_ms, data), trimmed to AUDIO_BACKLOG_S
 
     def hold_ms(self):
         """How long to sit on an arriving chunk before letting it out."""
@@ -685,9 +697,20 @@ class AudioRelay:
             return max(0.0, AUDIO_TRIM_MS)
         return max(0.0, delay - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS)
 
-    def add_tap(self, key, fn):
+    def add_tap(self, key, fn, backlog_s=0.0):
+        """Register a recorder. `backlog_s` replays that much recent audio into it
+        first, so its clip starts with sound rather than with the trim's worth of
+        silence."""
         with self.cond:
             self.taps[key] = fn
+            past = ([c for c in self.backlog
+                     if c[0] >= time.time() * 1000.0 - backlog_s * 1000.0]
+                    if backlog_s > 0 else [])
+        for arrival_ms, data in past:      # outside the lock, like push's fan-out
+            try:
+                fn(arrival_ms, data)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[live] audio backlog replay failed: {exc}", flush=True)
 
     def remove_tap(self, key):
         with self.cond:
@@ -703,6 +726,10 @@ class AudioRelay:
             self.pending.append((now, data))
             while len(self.pending) > AUDIO_PENDING_MAX:
                 self.pending.popleft()
+            self.backlog.append((now, data))
+            horizon = now - AUDIO_BACKLOG_S * 1000.0
+            while self.backlog and self.backlog[0][0] < horizon:
+                self.backlog.popleft()
             taps = list(self.taps.values())
         # Outside the lock: a recorder's disk write must never stall the relay, and
         # a tap that throws must not take the audio down with it.
@@ -1071,7 +1098,7 @@ class SegmentRecorder:
             print(f"[live] {self.cam}: cannot open audio sidecar: {exc}", flush=True)
             self.audio_fh = None
             return
-        AUDIO.add_tap(id(self), self._audio_chunk)
+        AUDIO.add_tap(id(self), self._audio_chunk, backlog_s=AUDIO_BACKLOG_S)
 
     def _real_fps(self):
         """Frames per second this segment actually delivered, from capture times.
