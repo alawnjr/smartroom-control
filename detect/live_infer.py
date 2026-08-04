@@ -463,7 +463,16 @@ RECORD_MAX_S = float(os.environ.get("SMARTROOM_RECORD_MAX_S", "1800"))   # 30 mi
 # its last few seconds while the RealSense clips kept theirs. Comfortably above the
 # largest measured camera delay.
 RECORD_LATE_GRACE_S = float(os.environ.get("SMARTROOM_RECORD_LATE_GRACE_S", "15"))
+# Chunk length for the ALWAYS-ON mode only (SMARTROOM_SEGMENT_ALWAYS, off by
+# default), where the alternative is one file that grows all day. It used to be
+# applied to hand-started takes as well, which is why pressing Record once
+# produced several "recordings" cut at 11:39, 11:42, 11:45 — the grid outlived
+# the mode it was for.
 SEGMENT_S = float(os.environ.get("SMARTROOM_SEGMENT_S", "180"))     # 3 minutes
+# A started take is ONE clip. This is only the ceiling that stops a forgotten one
+# becoming a single unbounded file, and it matches RECORD_MAX_S so the longest
+# take the API will grant is still never split.
+TAKE_MAX_S = float(os.environ.get("SMARTROOM_TAKE_MAX_S", "1800"))  # 30 minutes
 # A couple of stray detections should not preserve an otherwise empty segment.
 SEGMENT_MIN_PEOPLE_FRAMES = int(os.environ.get("SMARTROOM_SEGMENT_MIN_FRAMES", "15"))
 # Encode on the GPU: two continuous libx264 streams alongside pose + AVA + a
@@ -589,6 +598,28 @@ class RecordControl:
                 return False
             return start <= t_capture <= end
 
+    def segment(self, t_capture):
+        """Which segment a frame CAPTURED at `t_capture` belongs to: (key, start).
+
+        A take someone started by hand is ONE segment for its whole length. The
+        3-minute wall-clock chunking exists for the always-on mode, where the
+        alternative is a single file that grows all day; applied to a hand-started
+        take it cuts wherever the boundary happens to fall, so pressing Record at
+        11:44:58 gave a 2-second clip and then a second, separate recording — one
+        press, several "recordings", which is not what anyone means by Record.
+
+        The key is derived from values every camera reads from this one object, so
+        their clips still land in the SAME folder without coordinating.
+        """
+        with self.lock:
+            start = self.since if self.armed else (self.window[0] if self.window else None)
+        if self.always or start is None:
+            idx = int(t_capture // SEGMENT_S)
+            return ("wall", idx), idx * SEGMENT_S
+        # A ceiling, not a rhythm: only a take running past TAKE_MAX_S is split.
+        span = int(max(0.0, t_capture - start) // TAKE_MAX_S) if TAKE_MAX_S > 0 else 0
+        return ("take", round(start, 3), span), start + span * TAKE_MAX_S
+
     def state(self):
         with self.lock:
             return self._state_locked()
@@ -617,7 +648,7 @@ def _segment_mode_note() -> str:
         return "off"
     if SEGMENT_ALWAYS:
         return "ALWAYS ON (%gs)" % SEGMENT_S
-    return "on demand (%gs chunks, POST /record/start)" % SEGMENT_S
+    return "on demand (one clip per take, split past %gs, POST /record/start)" % TAKE_MAX_S
 
 
 class AudioRelay:
@@ -926,7 +957,7 @@ class SegmentRecorder:
         self.cond = threading.Condition()
         self.proc = None
         self.dir = None
-        self.idx = None          # wall-clock segment index
+        self.idx = None          # RECORD.segment() key of the open segment
         self.frames = 0
         self.people_frames = 0
         self.started = None
@@ -1137,8 +1168,10 @@ class SegmentRecorder:
                         if not RECORD.accepts(self._cap_now()):
                             self._close()
                             self.proc = self.idx = None
-                        elif int(self._cap_now() // SEGMENT_S) != self.idx:
-                            self._rotate(int(self._cap_now() // SEGMENT_S))
+                        else:
+                            key, started = RECORD.segment(self._cap_now())
+                            if key != self.idx:
+                                self._rotate(key, started)
                 item = self.q.popleft()
             jpeg, hw_ts, positions, sync_ms, n_people = item
             # Segment membership follows the frame's CAPTURE time, so every camera's
@@ -1148,9 +1181,9 @@ class SegmentRecorder:
             # same folder name over two different 3.5s-shifted spans, which is
             # exactly what breaks paired playback.
             t_cap = sync_ms / 1000.0 if sync_ms else time.time()
-            idx = int(t_cap // SEGMENT_S)
-            if self.proc is None or idx != self.idx:
-                self._rotate(idx)
+            key, started = RECORD.segment(t_cap)
+            if self.proc is None or key != self.idx:
+                self._rotate(key, started)
             try:
                 self.proc.stdin.write(jpeg)
                 self.frames += 1
@@ -1165,17 +1198,18 @@ class SegmentRecorder:
                 print(f"[live] {self.cam}: segment write failed: {exc}", flush=True)
                 self.proc = None
 
-    def _rotate(self, idx: int):
+    def _rotate(self, key, started: float):
         self._close()
-        self.idx, self.frames, self.people_frames, self.rows = idx, 0, 0, []
+        self.idx, self.frames, self.people_frames, self.rows = key, 0, 0, []
         self.geo_rows = []
         self.video_t0 = None      # capture time of this segment's first frame
-        # Name the segment after the wall-clock BOUNDARY, not the instant we
+        # Name the segment after the segment's own START, not the instant we
         # happened to rotate. The two cameras rotate a fraction of a second
         # apart, and datetime.now() straddling a second boundary produced
         # rec_..._162530 and rec_..._162531 — one take per camera instead of
-        # one take with both. From idx the name is identical for every camera.
-        self.started = dt.datetime.fromtimestamp(idx * SEGMENT_S).astimezone()
+        # one take with both. `started` comes from RECORD, so it is identical
+        # for every camera.
+        self.started = dt.datetime.fromtimestamp(started).astimezone()
         rec = "rec_" + self.started.strftime("%Y%m%d_%H%M%S")
         self.dir = _day_dir(self.root, self.started) / rec / "streams" / "cam2"
         self.dir.mkdir(parents=True, exist_ok=True)
