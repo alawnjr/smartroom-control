@@ -2960,6 +2960,9 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 self.send_error(404, "unknown cam")
                 return
             shared = entry["shared"]
+            # The cam key that picked `entry` out of `cams` — not itself a field
+            # of entry, which only carries {shared, roomFrame, geom, recorder}.
+            cam_key = (parse_qs(urlparse(self.path).query).get("cam") or [default_cam])[0]
             # Length-prefixed JPEG stream over one persistent connection:
             #   [4B len][8B double hw_ts_ms][jpeg]                    (classic)
             #   [4B len][8B double hw_ts_ms][8B double media_ms][jpeg]  (?media=1)
@@ -2971,7 +2974,7 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
             # constant somebody set by ear.
             want_media = parse_qs(urlparse(self.path).query).get("media", ["0"])[0] == "1"
             hdr_len = 20 if want_media else 12
-            clock = media_clock(entry["cam"]) if want_media else None
+            clock = media_clock(cam_key) if want_media else None
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -3002,7 +3005,7 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                         # The frame's own capture time on the shared timeline, which
                         # is what the audio will be looked up against.
                         clock.note(media_ms,
-                                   capture_time_s(entry["cam"], recv_ms, hw_ts,
+                                   capture_time_s(cam_key, recv_ms, hw_ts,
                                                   recv_ms / 1000.0))
                     n += 1
             except (ConnectionError, OSError):
