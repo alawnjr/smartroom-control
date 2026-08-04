@@ -1221,7 +1221,16 @@ class SegmentRecorder:
         mp4 = self.dir / f"{self.cam}.mp4"
         # No frames at all is also a discard: a segment that was opened and then
         # interrupted has an empty mp4, which is worse than no recording.
-        if self.frames == 0 or self.people_frames < SEGMENT_MIN_PEOPLE_FRAMES:
+        #
+        # The audio-bearing camera is exempt from the people test. It carries the
+        # room's ONLY microphone, so discarding it throws the take's sound away —
+        # and cam1, which happens to be that camera, localizes nobody at all (it
+        # sits 2.6 m up and its floor-ray overshoots MAX_RAY_REACH_MM), so the
+        # test discarded it every single time and every recording came out mute.
+        # An empty room is still worth hearing.
+        keep_for_audio = self.wants_audio and self.audio_bytes > 0
+        if self.frames == 0 or (self.people_frames < SEGMENT_MIN_PEOPLE_FRAMES
+                                and not keep_for_audio):
             # nobody in it — discard, and remove the folder if the other camera
             # did not keep anything either.
             mp4.unlink(missing_ok=True)
