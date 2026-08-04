@@ -61,6 +61,13 @@ Environment=SMARTROOM_SPATIAL_ONLY=camera_d455_color
 # needs to establish, and it makes the D455 the reference every other camera is
 # measured against.
 Environment=SMARTROOM_HW_CLOCK_CAMS=camera_d455_color
+# Lip-sync trim for the room audio, measured BY EAR — no calibration can time an
+# audio path. The 3.4s subtracted from the sound's arrival is the camera's VIDEO
+# delay (NVR encode + pre-buffer); the audio comes down faster, so without this
+# the sound runs ahead of the picture. Reported ahead by 2.79s on 2026-08-04.
+# Applies to both the live feed (a longer hold) and recordings (a larger mux
+# offset). Re-measure after anything that changes the NVR path.
+Environment=SMARTROOM_AUDIO_TRIM_MS=2790
 # Segment length for the ALWAYS-ON mode only, which is off — a take someone started
 # is one clip however long it runs. Dead config unless SMARTROOM_SEGMENT_ALWAYS=1.
 Environment=SMARTROOM_SEGMENT_S=180

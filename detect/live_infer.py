@@ -1013,13 +1013,22 @@ class SegmentRecorder:
         The chunk's CAPTURE time is its arrival less the same delay this camera's
         pictures took — audio and video come down one path from the NVR, so the
         offset largely cancels and what is left is their real skew.
+
+        Except it does not cancel entirely: the measured 3.4 s belongs to the
+        camera's VIDEO path (the NVR's encoder and pre-buffer), and the audio
+        comes down faster, so subtracting the whole thing dates the sound too
+        early and it plays ahead of the picture. AUDIO_TRIM_MS is that
+        difference, measured by ear. It ADDS here, exactly as it adds to the live
+        hold: in both places a bigger trim means the sound is held back further.
+        It used to subtract, which meant one number could not be right for both —
+        set to fix the live feed it would have doubled the error in recordings.
         """
         fh = self.audio_fh
         if fh is None:
             return
         if self.audio_t0 is None:
             self.audio_t0 = (arrival_ms - cam_offset_ms(AUDIO_SRC_CAM)
-                             - AUDIO_TRIM_MS) / 1000.0
+                             + AUDIO_TRIM_MS) / 1000.0
         fh.write(data)
         self.audio_bytes += len(data)
 
