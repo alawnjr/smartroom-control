@@ -1169,9 +1169,24 @@ class SegmentRecorder:
         if scale:
             cmd += ["-itsscale", f"{scale:.6f}"]
         cmd += ["-i", str(mp4_path)]
-        # Positive skew = the audio starts later than the video, so delay it to match.
-        if abs(skew) > 0.02:
+        # Two DIFFERENT operations, because -itsoffset only works one way. A
+        # negative offset asks for negative timestamps, which mp4 cannot express:
+        # ffmpeg clamps them to zero and the shift is silently dropped. The clip
+        # then carried skew_ms in its metadata and none of it in the container --
+        # audio and video both starting at 0.000 -- which is exactly the "the trim
+        # never reached recordings" symptom, since the audio BACKLOG made the skew
+        # negative for every take.
+        #
+        #   audio starts AFTER  the video (skew > 0): delay it       -> -itsoffset
+        #   audio starts BEFORE the video (skew < 0): drop its head  -> -ss
+        #
+        # Trimming the head, not delaying the video: the backlog deliberately
+        # captures sound from before the take, and the video's timeline is what
+        # every sidecar and timestamps CSV is written against.
+        if skew > 0.02:
             cmd += ["-itsoffset", f"{skew:.3f}"]
+        elif skew < -0.02:
+            cmd += ["-ss", f"{-skew:.3f}"]
         cmd += ["-i", str(path), "-map", "0:v:0", "-map", "1:a:0",
                 "-c:v", "copy", "-c:a", "copy", "-shortest",
                 "-movflags", "+faststart", str(merged)]
@@ -1194,6 +1209,8 @@ class SegmentRecorder:
         return {"codec": "mp3", "source": AUDIO_SRC_CAM, "scope": "room",
                 "muxed_with_retimed_video": bool(self._retime_scale()),
                 "skew_ms": round(skew * 1000.0, 1),
+                "alignment": ("delayed" if skew > 0.02
+                              else "head-trimmed" if skew < -0.02 else "none"),
                 "bytes": self.audio_bytes,
                 "note": "one room microphone; only this camera's clip carries it"}
 
