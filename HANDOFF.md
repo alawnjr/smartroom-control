@@ -57,9 +57,27 @@ that comes due together publishes the *newest* frame rather than replaying the b
 in slow motion.
 
 **Audio.** One source — Reolink ch1, the only enabled microphone. Transcoded to mp3 on
-the forwarder, relayed as bytes (never decoded here), held by
-`present_delay − cam_offset(ch1) + AUDIO_TRIM_MS` so it lines up with the delayed
-video.
+the forwarder and relayed as bytes (never decoded here). There are now TWO ways it
+gets placed on the timeline, and the difference matters:
+
+| forwarder | audio placed by | needs a by-ear constant? |
+|---|---|---|
+| `reolink_audio_forward.py` (separate RTSP session) | arrival − `cam_offset(ch1)` + `AUDIO_TRIM_MS` | **yes**, 2790 ms |
+| `reolink_av_forward.py` (one session, `?media=1`) | lookup in that camera's `MediaClock` | **no** |
+
+The second exists because the first can never be right for long. Two RTSP sessions
+to the same camera, one decoding h264 and re-encoding mjpeg and one only encoding
+mp3, relate a sound to a picture solely by how long each pipeline took — so the
+correction moves with load. Splitting inside ONE ffmpeg gives both outputs one
+input clock; each chunk then carries its own position on it, the frames teach a
+per-camera `MediaClock` (media_ms → capture time), and the audio's capture time is
+a lookup. Live release follows the same rule as the picture (`present_delay` after
+capture), so they come due together by construction.
+
+Measured with a synthetic flash+beep source (`CityOSNode/test/av_split_probe.py`):
+the split introduces **0.000 s** of skew and does not drift, against 2.79 s of
+hand-tuned correction. What remains is ~90 ms of constant libmp3lame priming.
+`/audio/status` reports `measured` and `mediaClock` so the mode in use is visible.
 
 **Recorded audio lands in the clip itself**, not beside it: while a segment is open the
 recorder takes a tap on the *undelayed* relay and writes `.{cam}_audio.mp3`, then muxes
@@ -125,7 +143,7 @@ python detect/timing_sync.py --selftest  # the estimator's own checks
 | `SMARTROOM_PRESENT_MARGIN_MS` | `400` | jitter headroom over the worst lag |
 | `SMARTROOM_LIVE_AUDIO` | `1` | enable the audio relay |
 | `SMARTROOM_AUDIO_CAM` | `camera_cam1_color` | which camera's mic |
-| `SMARTROOM_AUDIO_TRIM_MS` | *(unit sets `2790`)* | **set by ear** — how much faster the audio path is than the video path |
+| `SMARTROOM_AUDIO_TRIM_MS` | *(unit sets `2790`)* | **set by ear** — how much faster the audio path is than the video path. Unused once a forwarder sends `?media=1` |
 | `SMARTROOM_AUDIO_BACKLOG_S` | `trim + 1s` | recent audio replayed into a starting segment |
 | `SMARTROOM_GEO_HIST_S` | `20` | identity trail length; must exceed the worst delay |
 
@@ -152,6 +170,19 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
 ---
 
 ## Open items
+
+0. **The combined forwarder is written but NOT switched on.** Both halves are in
+   place — `CityOSNode/reolink_av_forward.py` and the server's `?media=1` ingest —
+   and the old two-forwarder path still runs untouched. Switching over means, on the
+   NVR-facing laptop, stopping `reolink_live_forward.py` + `reolink_audio_forward.py`
+   and starting `reolink_av_forward.py` instead. It has never met the real NVR:
+   everything was verified against a synthetic source, which exercises the split but
+   not the RTSP session. Two things to check on first run — that the sub stream
+   actually carries audio (`ffprobe` the RTSP URL: if the NVR only puts audio on the
+   main stream, use `--stream main` for the audio-bearing channel), and that
+   `/audio/status` turns `measured: true` with a non-zero `mediaClock.points`. If it
+   reports `measured: true` with 0 points, audio is being placed against nothing.
+   Once it works, `SMARTROOM_AUDIO_TRIM_MS` becomes dead config.
 
 1. **The 3.4 s Reolink delay has never been decomposed.** It is a measured end-to-end
    number, and it is large for RTSP (usually a few hundred ms to ~1 s). It may be the
@@ -268,6 +299,15 @@ Forwarders reconnect on their own within ~6 s of a live-infer restart.
   Put a burst in the sound and measure WHERE it lands — the same thing a person
   clapping is testing. The synthetic clap lands at 1.210 s against a predicted
   1.21 s; unshifted it sits at 4.0 s.
+- **`-r` is not a clock; the `fps` filter is.** Asked for `-r 10` on an 11 s source,
+  ffmpeg emitted **112** frames where 11 × 10 predicts 110 — so `frame_index / fps`
+  mislabelled every frame by 0.2 s. `-vf fps=10` emits exactly 110. This matters
+  because a bare JPEG stream has nowhere to put a timestamp, so the index IS the
+  clock. Variants measured in `CityOSNode/test/av_split_probe.py`.
+- **Two clocks that look independent may just be one clock plus a constant.** The
+  2790 ms audio correction was never a property of the camera — it was the
+  difference between two pipelines we built. Worth asking, of any calibration
+  constant here, whether the thing being measured was created upstream by us.
 - **The keep/discard rule silently eats whatever else a clip carries.** Same shape as
   the muting bug below, one layer down: once ch1's clip became the *only* place the room
   audio is stored, "nobody in it, throw it away" started throwing the sound away too —
