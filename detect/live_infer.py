@@ -656,6 +656,81 @@ def _segment_mode_note() -> str:
     return "on demand (one clip per take, split past %gs, POST /record/start)" % TAKE_MAX_S
 
 
+class MediaClock:
+    """Maps a camera's MEDIA time onto this server's capture timeline.
+
+    The combined forwarder (CityOSNode/reolink_av_forward.py) splits one RTSP
+    session inside one ffmpeg, so its video frames and its audio chunks carry
+    positions on a single input clock. That is the thing the old two-session
+    arrangement could not provide, and the reason the sound needed a 2790 ms
+    constant set by ear: with two processes racing, the only relation between a
+    sound and a picture was how long each pipeline took, which moves with load.
+
+    Given (media_ms -> capture_time) from the frames, an audio chunk's capture
+    time is just a lookup. Linear in the recent past, because a media clock and a
+    capture clock advance at the same rate by construction; the fit exists only to
+    absorb per-frame jitter in the arrival stamping, not to model a rate.
+    """
+
+    KEEP = 240          # ~24s of frames at 10fps — enough to span any hold
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.pts = deque(maxlen=self.KEEP)   # (media_ms, capture_s)
+
+    def note(self, media_ms, capture_s):
+        if media_ms is None or capture_s is None:
+            return
+        with self.lock:
+            # Media time only ever advances; a step backwards means ffmpeg
+            # restarted, so the old mapping describes a different session.
+            if self.pts and media_ms < self.pts[-1][0]:
+                self.pts.clear()
+            self.pts.append((float(media_ms), float(capture_s)))
+
+    def capture_at(self, media_ms):
+        """Capture time for a media instant, or None if there is nothing to go on."""
+        if media_ms is None:
+            return None
+        with self.lock:
+            pts = list(self.pts)
+        if not pts:
+            return None
+        if len(pts) == 1:
+            return pts[0][1] + (media_ms - pts[0][0]) / 1000.0
+        # Straddling pair when possible; otherwise extend from the nearest end at
+        # 1:1, which is exact for two clocks that tick at the same rate.
+        lo, hi = pts[0], pts[-1]
+        for a, b in zip(pts, pts[1:]):
+            if a[0] <= media_ms <= b[0]:
+                lo, hi = a, b
+                break
+        span = hi[0] - lo[0]
+        if span <= 0:
+            return lo[1] + (media_ms - lo[0]) / 1000.0
+        u = (media_ms - lo[0]) / span
+        return lo[1] + u * (hi[1] - lo[1])
+
+    def state(self):
+        with self.lock:
+            n = len(self.pts)
+            last = self.pts[-1] if n else None
+        return {"points": n, "lastMediaMs": last[0] if last else None}
+
+
+# One per camera key, created on first use by the ingest handler.
+MEDIA_CLOCKS = {}
+MEDIA_LOCK = threading.Lock()
+
+
+def media_clock(cam_key):
+    with MEDIA_LOCK:
+        c = MEDIA_CLOCKS.get(cam_key)
+        if c is None:
+            c = MEDIA_CLOCKS[cam_key] = MediaClock()
+        return c
+
+
 class AudioRelay:
     """Encoded audio from one camera, held to match the video, fanned out to browsers.
 
@@ -681,7 +756,8 @@ class AudioRelay:
         # Recorders writing this audio into their segment. They tap the RAW stream,
         # not the delayed one the browser hears: a recording is assembled on the
         # capture timeline, and the presentation delay is a viewing concern.
-        self.taps = {}          # id -> callable(arrival_ms, data)
+        self.taps = {}          # id -> callable(stamp_ms, data, measured)
+        self.measured = False   # True once a forwarder is sending media times
         # A few seconds of the recent past, so a segment that opens now can be given
         # the sound that belongs to its first frames. It has to: the audio is dated
         # AUDIO_TRIM_MS later than it arrives (the audio path is faster than the
@@ -691,11 +767,29 @@ class AudioRelay:
         self.backlog = deque()  # (arrival_ms, data), trimmed to AUDIO_BACKLOG_S
 
     def hold_ms(self):
-        """How long to sit on an arriving chunk before letting it out."""
+        """How long to sit on an arriving chunk before letting it out.
+
+        The GUESSED path, for a forwarder that sends no media time: the video is
+        shown `present_delay` after capture, this chunk already spent the camera's
+        delay getting here, and AUDIO_TRIM_MS is the by-ear remainder.
+        """
         delay = present_delay_ms()
         if delay <= 0:
             return max(0.0, AUDIO_TRIM_MS)
         return max(0.0, delay - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS)
+
+    def due_at(self, now_ms, cap_ms):
+        """When a chunk should be released, in ms.
+
+        With a measured capture time this is the SAME rule the video presenter
+        uses -- show it `present_delay` after it was captured -- so audio and
+        picture come due together by construction instead of by calibration. The
+        `max` keeps a chunk that is already overdue (its media time predates the
+        presenter's window) from being scheduled in the past.
+        """
+        if cap_ms is None:
+            return now_ms + self.hold_ms()
+        return max(now_ms, cap_ms + max(0.0, present_delay_ms()))
 
     def add_tap(self, key, fn, backlog_s=0.0):
         """Register a recorder. `backlog_s` replays that much recent audio into it
@@ -708,7 +802,7 @@ class AudioRelay:
                     if backlog_s > 0 else [])
         for arrival_ms, data in past:      # outside the lock, like push's fan-out
             try:
-                fn(arrival_ms, data)
+                fn(arrival_ms, data, False)   # backlog keeps its arrival stamps
             except Exception as exc:  # noqa: BLE001
                 print(f"[live] audio backlog replay failed: {exc}", flush=True)
 
@@ -716,14 +810,22 @@ class AudioRelay:
         with self.cond:
             self.taps.pop(key, None)
 
-    def push(self, data, content_type=None):
+    def push(self, data, content_type=None, capture_s=None):
+        """Take a chunk. `capture_s`, when given, is this chunk's MEASURED capture
+        time from the camera's shared media clock; the relay then has no need of
+        AUDIO_TRIM_MS for it. Without one, arrival is stamped as before."""
         now = time.time() * 1000.0
+        # A measured capture time replaces both the arrival stamp and the by-ear
+        # trim: the recorder dates its sidecar from this, and the live hold is
+        # measured against it instead of guessed.
+        cap_ms = None if capture_s is None else capture_s * 1000.0
         with self.cond:
             if content_type:
                 self.content_type = content_type
             self.last_push = now
             self.bytes_in += len(data)
-            self.pending.append((now, data))
+            self.measured = cap_ms is not None
+            self.pending.append((self.due_at(now, cap_ms), data))
             while len(self.pending) > AUDIO_PENDING_MAX:
                 self.pending.popleft()
             self.backlog.append((now, data))
@@ -735,15 +837,21 @@ class AudioRelay:
         # a tap that throws must not take the audio down with it.
         for fn in taps:
             try:
-                fn(now, data)
+                # The tap dates the recording's audio. Give it the measured capture
+                # time when the forwarder supplied one, so a recording is aligned by
+                # the camera's own clock rather than by AUDIO_TRIM_MS.
+                fn(now if cap_ms is None else cap_ms, data, cap_ms is not None)
             except Exception as exc:  # noqa: BLE001
                 print(f"[live] audio tap failed: {exc}", flush=True)
 
     def release_due(self):
-        cutoff = time.time() * 1000.0 - self.hold_ms()
+        # `pending` holds each chunk's DUE time, decided when it arrived (see
+        # due_at). Deciding it here instead meant one rule for chunks whose timing
+        # was measured and chunks whose timing was guessed, applied to both.
+        now = time.time() * 1000.0
         with self.cond:
             n = 0
-            while self.pending and self.pending[0][0] <= cutoff:
+            while self.pending and self.pending[0][0] <= now:
                 _t, data = self.pending.popleft()
                 self.seq += 1
                 self.out.append((self.seq, data))
@@ -783,6 +891,13 @@ class AudioRelay:
                     "listeners": self.listeners,
                     "holdMs": round(self.hold_ms(), 1),
                     "trimMs": AUDIO_TRIM_MS,
+                    # True once a forwarder is sending media times, i.e. audio and
+                    # video share one clock and trimMs is no longer used.
+                    "measured": self.measured,
+                    # Whether the video side has taught the clock anything yet: a
+                    # measured audio stamp is only as good as the frames it is
+                    # looked up against, so "measured" with 0 points is a warning.
+                    "mediaClock": media_clock(AUDIO_SRC_CAM).state(),
                     "kbReceived": round(self.bytes_in / 1024.0, 1)}
 
 
@@ -1035,7 +1150,7 @@ class SegmentRecorder:
                 self.q.append((jpeg, hw_ts, positions, sync_ms, n_people))
                 self.cond.notify()
 
-    def _audio_chunk(self, arrival_ms, data):
+    def _audio_chunk(self, stamp_ms, data, measured=False):
         """Raw audio from the relay, appended to this segment's sidecar.
 
         The chunk's CAPTURE time is its arrival less the same delay this camera's
@@ -1054,7 +1169,12 @@ class SegmentRecorder:
         fh = self.audio_fh
         if fh is None:
             return
-        t_cap = (arrival_ms - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS) / 1000.0
+        # A MEASURED stamp is already this chunk's capture time on the shared
+        # timeline -- the combined forwarder gave audio and video one clock, so
+        # there is nothing left to correct. Only the two-session path needs the
+        # camera offset and the by-ear trim.
+        t_cap = (stamp_ms / 1000.0 if measured
+                 else (stamp_ms - cam_offset_ms(AUDIO_SRC_CAM) + AUDIO_TRIM_MS) / 1000.0)
         if self.audio_t0 is None:
             self.audio_t0 = t_cap
         self.audio_last = t_cap
@@ -2840,18 +2960,32 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                 self.send_error(404, "unknown cam")
                 return
             shared = entry["shared"]
-            # length-prefixed JPEG stream over one persistent connection:
-            # [4B len][8B double hw_ts_ms][jpeg]
+            # Length-prefixed JPEG stream over one persistent connection:
+            #   [4B len][8B double hw_ts_ms][jpeg]                    (classic)
+            #   [4B len][8B double hw_ts_ms][8B double media_ms][jpeg]  (?media=1)
+            #
+            # The media field comes from reolink_av_forward.py, which splits audio
+            # and video inside ONE ffmpeg: it is that camera's position on a single
+            # input clock, shared with its audio. Recording it here is what lets an
+            # audio chunk be placed against the pictures instead of against a
+            # constant somebody set by ear.
+            want_media = parse_qs(urlparse(self.path).query).get("media", ["0"])[0] == "1"
+            hdr_len = 20 if want_media else 12
+            clock = media_clock(entry["cam"]) if want_media else None
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             n = 0
             try:
                 while True:
-                    hdr = self._readn(12)
+                    hdr = self._readn(hdr_len)
                     if not hdr:
                         break
-                    length, hw_ts = struct.unpack(">Id", hdr)
+                    if want_media:
+                        length, hw_ts, media_ms = struct.unpack(">Idd", hdr)
+                    else:
+                        length, hw_ts = struct.unpack(">Id", hdr)
+                        media_ms = None
                     if length == 0 or length > 20_000_000:
                         break
                     jpeg = self._readn(length)
@@ -2862,7 +2996,14 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
                     # the frame is queued, how long until a GPU picks it up is a
                     # property of this server's load, and letting that leak into
                     # the timestamp made a busy camera look like a late one.
-                    shared.put_in(jpeg, hw_ts, time.time() * 1000.0)
+                    recv_ms = time.time() * 1000.0
+                    shared.put_in(jpeg, hw_ts, recv_ms)
+                    if clock is not None:
+                        # The frame's own capture time on the shared timeline, which
+                        # is what the audio will be looked up against.
+                        clock.note(media_ms,
+                                   capture_time_s(entry["cam"], recv_ms, hw_ts,
+                                                  recv_ms / 1000.0))
                     n += 1
             except (ConnectionError, OSError):
                 pass
@@ -2953,32 +3094,53 @@ def make_handler(cams: dict, ids: "IdentityRegistry | None" = None):
             self._json(state)
 
         def _recv_audio(self):
-            """Sink for the forwarder: [4B len][8B double ts_ms][encoded audio]xN.
+            """Sink for the forwarder: [4B len][8B double ts_ms][encoded audio]xN,
+            or with ?media=1 [4B len][8B ts_ms][8B media_ms][audio]xN.
 
-            Same framing as /ingest so there is one wire format to understand. The
-            forwarder's timestamp is read but not used for timing — arrival is
-            stamped here instead, so this does not depend on that host's clock.
+            Same framing as /ingest so there is one wire format to understand.
+
+            WITHOUT media: the forwarder's timestamp is read but not used — arrival
+            is stamped here, so timing does not depend on that host's clock, and the
+            sound is then placed by AUDIO_TRIM_MS, a constant set by ear.
+
+            WITH media: the chunk carries its position on the SAME input clock as
+            that camera's video frames (one ffmpeg, one RTSP session), so its
+            capture time is a lookup in that camera's MediaClock and no constant is
+            needed. This is the whole point of the combined forwarder.
             """
             if not AUDIO_ON:
                 self.send_error(503, "audio relay disabled")
                 return
             ctype = self.headers.get("X-Audio-Content-Type") or "audio/mpeg"
+            q = parse_qs(urlparse(self.path).query)
+            want_media = q.get("media", ["0"])[0] == "1"
+            cam = (q.get("cam") or [AUDIO_SRC_CAM])[0]
+            hdr_len = 20 if want_media else 12
+            clock = media_clock(cam) if want_media else None
             self.send_response(200)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
             n = 0
             try:
                 while True:
-                    hdr = self._readn(12)
+                    hdr = self._readn(hdr_len)
                     if not hdr:
                         break
-                    length, _ts = struct.unpack(">Id", hdr)
+                    if want_media:
+                        length, _ts, media_ms = struct.unpack(">Idd", hdr)
+                    else:
+                        length, _ts = struct.unpack(">Id", hdr)
+                        media_ms = None
                     if length == 0 or length > 4_000_000:
                         break
                     data = self._readn(length)
                     if data is None:
                         break
-                    AUDIO.push(data, ctype)
+                    # capture_s is None until the video side has taught the clock at
+                    # least one point; the relay falls back to the old behaviour for
+                    # those first chunks rather than dropping them.
+                    capture_s = clock.capture_at(media_ms) if clock else None
+                    AUDIO.push(data, ctype, capture_s=capture_s)
                     n += 1
             except (ConnectionError, OSError):
                 pass
