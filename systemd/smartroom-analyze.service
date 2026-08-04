@@ -28,6 +28,13 @@ Environment=SMARTROOM_DETECT_ANNOTATE=0
 # Action classification from RGB pixels (SlowFast-AVA), not skeletons — the same
 # model the live service runs. See detect/ava_model.py.
 Environment=SMARTROOM_ACTION_VARIANTS=ava
+# Spatial estimation comes from the DEPTH camera, full stop — same allowlist the
+# live service runs under. Without it, localize.py falls back to the ankle
+# floor-ray on any clip with no depth track, i.e. it would guess room positions
+# from Reolink footage. Nothing on disk has one today, but only because
+# live_infer had already written a `live` sidecar the offline pass refuses to
+# overwrite — an ordering accident, not a rule. This is the rule.
+Environment=SMARTROOM_SPATIAL_ONLY=camera_d455_color
 WorkingDirectory=%h/smartroom-control
 ExecStart=%h/smartroom-control/run-analysis.sh
 # The runner exits nonzero if some clip/model failed; don't spam failed-state.
