@@ -64,6 +64,7 @@ import numpy as np
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import appearance  # noqa: E402  (occlusion test for the identity gallery)
 from calib_utils import load_room_geometry  # noqa: E402
 from localize import (  # noqa: E402
     MAX_RAY_REACH_MM,
@@ -270,6 +271,15 @@ GALLERY_TTL_S = float(os.environ.get("SMARTROOM_GALLERY_TTL_S", "300"))
 # with room to spare, and costs a few hundred (t, x, z) tuples per person.
 GEO_HIST_S = float(os.environ.get("SMARTROOM_GEO_HIST_S", "20"))
 EMB_MOMENTUM = 0.9         # running-mean weight for a track's stored embedding
+# An embedding taken while this person is behind someone else describes BOTH of
+# them, and folding it into the gallery poisons the template exactly when it is
+# about to be needed: the person emerges, is compared against a template that has
+# drifted toward whoever occluded them, fails the threshold, and gets a new
+# identity. That is the "the covered person changes ids" symptom. So a frame where
+# this much of the box is covered by another person may still MATCH (the emerging
+# person is clean, and the template it is matched against was never corrupted) but
+# may not TEACH.
+OCCLUSION_MAX = float(os.environ.get("SMARTROOM_OCCLUSION_MAX", "0.25"))
 
 # --- one comparable timeline across cameras ----------------------------------
 # Every rule above that compares two cameras (GEO_MERGE_S, GEO_SPLIT_MM, fuse())
@@ -1909,6 +1919,11 @@ class IdentityRegistry:
         self.split_pending = {}  # (cam, tid) -> consecutive far-apart observations
         self.splits = 0
         self.fused = 0         # identities merged by the continuous fusion pass
+        self.occluded_skips = 0  # appearance updates withheld (see OCCLUSION_MAX)
+
+    def note_occluded(self):
+        with self.lock:
+            self.occluded_skips += 1
 
     @staticmethod
     def _cos(a, b):
@@ -1919,7 +1934,7 @@ class IdentityRegistry:
             return -1.0
         return float(np.dot(a, b) / (na * nb))
 
-    def assign(self, cam, tid, emb, pos, t, taken):
+    def assign(self, cam, tid, emb, pos, t, taken, clean=True):
         """-> (gid, how). `taken` = gids already used by this camera this frame,
         so one camera can never map two people onto the same identity."""
         with self.lock:
@@ -1937,7 +1952,7 @@ class IdentityRegistry:
                                     + (pos[1] - other[1]) ** 2) ** 0.5 > GEO_SPLIT_MM)
                 if not stale_merge:
                     self.split_pending.pop(key, None)
-                    self._touch(gid, emb, pos, t, cam)
+                    self._touch(gid, emb, pos, t, cam, clean)
                     return gid, "track"
                 # Disagreement seen — but do not split on a single frame (that
                 # oscillated against fuse()). Only break the mapping once it has
@@ -1945,7 +1960,7 @@ class IdentityRegistry:
                 n = self.split_pending.get(key, 0) + 1
                 self.split_pending[key] = n
                 if n < GEO_SPLIT_PERSIST:
-                    self._touch(gid, emb, pos, t, cam)
+                    self._touch(gid, emb, pos, t, cam, clean)
                     return gid, "track"
                 self.split_pending.pop(key, None)
                 self.splits += 1
@@ -1999,9 +2014,12 @@ class IdentityRegistry:
                     del self.misses[:-50]
                 best = self.next_gid
                 self.next_gid += 1
+                # A brand-new identity takes the embedding it was born with even if
+                # the view is partly blocked — a template that is somewhat wrong
+                # beats none at all, and it is refined by the next clean frame.
                 self.gallery[best] = {"emb": emb, "pos": pos, "t": t, "cam": cam, "seen": 0}
             self.map[key] = best
-            self._touch(best, emb, pos, t, cam)
+            self._touch(best, emb, pos, t, cam, clean)
             return best, how
 
     @staticmethod
@@ -2025,10 +2043,12 @@ class IdentityRegistry:
                 break        # trail is time-ordered; nothing older can be nearer
         return best
 
-    def _touch(self, gid, emb, pos, t, cam):
+    def _touch(self, gid, emb, pos, t, cam, clean=True):
         e = self.gallery.setdefault(gid, {"emb": emb, "pos": pos, "t": t, "cam": cam,
                                           "seen": 0, "trail": []})
-        if emb is not None:
+        # Position and time always update — where somebody is remains true while
+        # they are half-hidden. Only the APPEARANCE template is withheld.
+        if emb is not None and clean:
             e["emb"] = emb if e["emb"] is None else (
                 EMB_MOMENTUM * e["emb"] + (1 - EMB_MOMENTUM) * emb)
         e["pos"], e["cam"] = pos, cam
@@ -2141,6 +2161,8 @@ class IdentityRegistry:
             gs = sorted(self.geo_sim)
             return {"known": len(self.gallery), "tracks": len(self.map),
                     "thresh": REID_THRESH,
+                    "occludedSkips": self.occluded_skips,
+                    "occlusionMax": OCCLUSION_MAX,
                     "geoMerge": {"reidMin": GEO_REID_MIN, "vetoed": self.geo_vetoed,
                                  "fused": self.fused, "pending": len(self.pending),
                                  "splits": self.splits,
@@ -2475,8 +2497,18 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
                 ids.note(cam_key, [(t, e) for (t, *_), e in zip(found, embs)])
             ids.fuse(t_frame)      # continuously combine co-located identities
             taken = set()
-            for (tid, pos, _marker, _p, _src), emb in zip(found, embs):
-                gid, how = ids.assign(cam_key, tid, emb, pos, t_frame, taken)
+            # Who is standing in front of whom, this frame. Boxes only: the point is
+            # whether the crop the encoder saw was this person alone.
+            all_boxes = [p.get("box") for *_r, p, _s in found]
+            for n, ((tid, pos, _marker, _p, _src), emb) in enumerate(zip(found, embs)):
+                mine = all_boxes[n]
+                others = [b for i, b in enumerate(all_boxes) if i != n and b is not None]
+                occ = (appearance.occlusion_frac(mine, others)
+                       if (mine is not None and others) else 0.0)
+                clean = occ <= OCCLUSION_MAX
+                if not clean:
+                    ids.note_occluded()
+                gid, how = ids.assign(cam_key, tid, emb, pos, t_frame, taken, clean)
                 taken.add(gid)
                 gids[tid] = (gid, how)
 

@@ -47,7 +47,17 @@ import numpy as np
 # different people at p50 0.383 / p95 0.881. 0.72 sits above the impostor median
 # by a wide margin and still keeps most genuine pairs, with the margin rule below
 # doing the work on the overlap.
-STITCH_THRESH = float(os.environ.get("SMARTROOM_STITCH_THRESH", "0.72"))
+#
+# 0.80, not the 0.72 the template-vs-template distributions suggested. Those
+# distributions flattered the task: they compared two halves of ONE track, where
+# scale, pose and lighting barely change. Measured on the harder thing this module
+# actually does — matching ACROSS a re-detection — the long fragments of a clip
+# that are plausibly one person scored only 0.55-0.60, i.e. inside the
+# different-person range. So the embedding cannot be trusted to stitch in general
+# here, and the threshold is set where it only fires on the clear cases (two pairs
+# at 0.84-0.85 in the clip that motivated this) rather than where it would recover
+# the most fragments.
+STITCH_THRESH = float(os.environ.get("SMARTROOM_STITCH_THRESH", "0.80"))
 # How far the winner must beat the runner-up. This is the guard against the
 # impostor tail: a fragment that looks similar to TWO live identities is exactly
 # the case where a merge should be declined.

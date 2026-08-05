@@ -70,15 +70,50 @@ ANNOTATE = os.environ.get("SMARTROOM_DETECT_ANNOTATE", "1") != "0"
 ACTION_HALF = os.environ.get("SMARTROOM_ACTION_HALF", "1") != "0"
 
 
+# ByteTrack parameters. These deliberately DIVERGE from ultralytics' bytetrack.yaml
+# defaults, which fragmented this room's footage badly: a person walking behind a
+# colleague came back as a new id (new colour, new action timeline), and a 40 s clip
+# of a couple of people produced 20-27 "people".
+#
+# Measured over three clips (sweep in the 2026-08-05 session; ids / frames covered
+# by some track / one-to-three-frame debris ids):
+#     buffer 30, new 0.25, match 0.80  (defaults)   75 ids   91.5%   18 debris
+#     buffer 90, new 0.25, match 0.80                66 ids   92.5%   16
+#     buffer 90, new 0.50, match 0.80                40 ids   87.9%    5
+#     buffer 150, new 0.50, match 0.90 (ours)        33 ids   95.4%    4
+# The last is better on every axis at once — less than half the ids AND more of the
+# clip covered — which is what says the extra ids were fragments of people already
+# being tracked rather than people the tracker would otherwise have missed.
+#
+#   track_buffer     how long a lost track waits to be reclaimed. 30 frames is 1 s;
+#                    an occlusion behind a colleague lasts longer than that, and
+#                    ByteTrack's motion prediction is far more reliable at this
+#                    resolution than any appearance model we measured.
+#   new_track_thresh a weak detection no longer STARTS an identity (it can still
+#                    extend one). This is what removes the debris ids.
+#   match_thresh     association is looser, so a track survives the appearance
+#                    change of turning around. Checked for the obvious hazard —
+#                    handing a track to the wrong person — by looking for
+#                    single-frame position teleports within a track: zero, in every
+#                    configuration above. That test only catches gross swaps; two
+#                    people crossing slowly and swapping would not show up in it.
+BYTETRACK_BUFFER = int(os.environ.get("SMARTROOM_TRACK_BUFFER", "150"))
+BYTETRACK_NEW_THRESH = float(os.environ.get("SMARTROOM_TRACK_NEW_THRESH", "0.5"))
+BYTETRACK_MATCH_THRESH = float(os.environ.get("SMARTROOM_TRACK_MATCH_THRESH", "0.9"))
+
+
 def _make_bytetrack():
-    """A ByteTracker with ultralytics' default bytetrack.yaml parameters — the
-    same tracker `model.track()` builds, so ids match the streaming path."""
+    """The ByteTracker used by the fast batched path. Its parameters are tuned for
+    this room (see above); the streaming `.track()` path — RTMPose, or
+    SMARTROOM_ACTION_FAST=0 — still uses ultralytics' own yaml defaults, so the two
+    paths no longer produce identical ids."""
     from types import SimpleNamespace
 
     from ultralytics.trackers.byte_tracker import BYTETracker
     args = SimpleNamespace(track_high_thresh=0.25, track_low_thresh=0.1,
-                           new_track_thresh=0.25, track_buffer=30,
-                           match_thresh=0.8, fuse_score=True,
+                           new_track_thresh=BYTETRACK_NEW_THRESH,
+                           track_buffer=BYTETRACK_BUFFER,
+                           match_thresh=BYTETRACK_MATCH_THRESH, fuse_score=True,
                            gmc_method="sparseOptFlow")
     return BYTETracker(args)
 
