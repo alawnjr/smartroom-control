@@ -85,6 +85,14 @@ export SMARTROOM_YOLO_MODELS="$MODELS"
 run_stage "object detection + pose: $MODELS" detect/.venv-detect/bin/python detect/detect.py append || rc=$?
 run_stage "spatial localization (pose + depth -> room positions)" detect/.venv-detect/bin/python detect/localize.py nargs || rc=$?
 run_stage "action recognition: $VARIANTS" .venv-action/bin/python detect/action.py append --variant "$VARIANTS" || rc=$?
+# Sound events (PaSST/AudioSet) over whichever clip carries the room microphone —
+# one clip per recording, so this stage is cheap and is NOT sharded across GPUs.
+if [ -x .venv-audio/bin/python ]; then
+  echo "[$(date)] === sound event classification (PaSST) ==="
+  .venv-audio/bin/python detect/audio_events.py "${FF[@]}" || rc=$?
+else
+  echo "[$(date)] === sound events SKIPPED (no .venv-audio; see detect/audio_events.py) ==="
+fi
 echo "[$(date)] === finished, exit=$rc ==="
 echo "$rc" > "$WORK_DIR/analyze.done"
 exit "$rc"
