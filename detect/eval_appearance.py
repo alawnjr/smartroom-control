@@ -43,7 +43,11 @@ def saved_root() -> Path:
 def load_tracks(sidecar: Path):
     """{track id: [(t, kpts, conf)]} from an action sidecar's persons block."""
     doc = json.loads(sidecar.read_text())
-    persons = (doc.get("persons") or {}).get("persons") or {}
+    # On disk the sidecar IS the persons block ({"persons": {tid: ...}}); the
+    # mirror's /inference endpoint nests it one level deeper. Accept either.
+    persons = doc.get("persons") or {}
+    if "persons" in persons and isinstance(persons["persons"], dict):
+        persons = persons["persons"]
     out = {}
     for tid, p in persons.items():
         rows = []
