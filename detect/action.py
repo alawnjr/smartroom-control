@@ -130,6 +130,141 @@ def _tracked_frames_fast(pose, src, device):
     return frames_out
 
 
+# --- re-identification of fragmented tracks ---------------------------------
+# ByteTrack has no appearance model, so an occlusion ends a track and the person
+# comes back as a new id. `stitch` puts them back together after the fact; this
+# is the part that has to look at the pixels for it.
+STITCH_ON = os.environ.get("SMARTROOM_STITCH", "1") != "0"
+REID_MODEL = os.environ.get("SMARTROOM_REID_MODEL",
+                            str(PROJECT_ROOT / "yolo26n-reid.onnx"))
+# Samples per track. The template is a mean, so a dozen clean views is plenty and
+# the cost is a CPU ReID forward each.
+STITCH_SAMPLES = int(os.environ.get("SMARTROOM_STITCH_SAMPLES", "14"))
+# Refuse to LEARN a person's appearance from a frame where this much of their box
+# is behind somebody else's. Sampling through an occlusion is how a template ends
+# up describing two people — which is precisely when it is about to be needed.
+STITCH_MAX_OCCLUSION = float(os.environ.get("SMARTROOM_STITCH_MAX_OCCLUSION", "0.25"))
+_REID_ENCODER = None
+_REID_TRIED = False
+
+
+def _people_groups(person_of):
+    """{person id: [track ids]} — the inverse of the track->person map."""
+    out = {}
+    for tid, pid in person_of.items():
+        out.setdefault(pid, []).append(tid)
+    return {k: sorted(v, key=lambda x: (len(str(x)), str(x))) for k, v in out.items()}
+
+
+def _reid_encoder():
+    """The appearance encoder, built once per process. None (once, quietly) when
+    the model or its runtime is missing — stitching then degrades to off rather
+    than failing the clip."""
+    global _REID_ENCODER, _REID_TRIED
+    if _REID_TRIED:
+        return _REID_ENCODER
+    _REID_TRIED = True
+    if not Path(REID_MODEL).exists():
+        print(f"  stitch: no ReID model at {REID_MODEL} — track ids left fragmented",
+              file=sys.stderr)
+        return None
+    try:
+        from ultralytics.trackers.utils.reid import ReID
+        _REID_ENCODER = ReID(REID_MODEL, device=os.environ.get("SMARTROOM_REID_DEVICE", "cpu"))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  stitch: ReID unavailable ({exc}) — track ids left fragmented",
+              file=sys.stderr)
+        _REID_ENCODER = None
+    return _REID_ENCODER
+
+
+def _appearance_templates(src, traj, boxes_by_frame, native_fps, kp_conf):
+    """{track id: template} for stitching, sampled from CLEAN frames only.
+
+    One extra decode pass over the clip. Deliberately separate from the tracking
+    loop: tracking is batched on the GPU and its frames are transient, while this
+    needs a handful of specific frames and a CPU forward per sample.
+    """
+    import cv2
+    import numpy as np
+
+    import appearance as AP
+
+    enc = _reid_encoder()
+    if enc is None:
+        return {}
+    boxes_at = [dict(f) for f in boxes_by_frame]   # frame -> {tid: box}
+
+    # Choose each track's sample frames: spread over its life, skipping frames
+    # where it is occluded or barely visible.
+    want = defaultdict(list)     # frame index -> [tid]
+    spans = {}
+    for tid, rows in traj.items():
+        if not rows:
+            continue
+        spans[tid] = (rows[0][0] / native_fps, rows[-1][0] / native_fps)
+        usable = []
+        for idx, kpts, conf in rows:
+            if idx >= len(boxes_at):
+                continue
+            mine = boxes_at[idx].get(tid)
+            if mine is None or int((conf >= kp_conf).sum()) < MIN_KEYPOINTS:
+                continue
+            others = [b for t2, b in boxes_at[idx].items() if t2 != tid]
+            if AP.occlusion_frac(mine, others) > STITCH_MAX_OCCLUSION:
+                continue
+            usable.append(idx)
+        if not usable:
+            continue
+        step = max(1, len(usable) // STITCH_SAMPLES)
+        for idx in usable[::step][:STITCH_SAMPLES]:
+            want[idx].append(tid)
+
+    if not want:
+        return {}
+    kp_at = {tid: {idx: (kpts, conf) for idx, kpts, conf in rows} for tid, rows in traj.items()}
+    embs = defaultdict(list)
+    colours = {}
+    cap = cv2.VideoCapture(str(src))
+    idx = 0
+    todo = set(want)
+    while todo:
+        ok, frame = cap.read()
+        if not ok:
+            break
+        if idx in want:
+            todo.discard(idx)
+            tids = want[idx]
+            dets, keep = [], []
+            for tid in tids:
+                box = boxes_at[idx].get(tid)
+                if box is None:
+                    continue
+                keep.append(tid)
+                dets.append([(box[0] + box[2]) / 2.0, (box[1] + box[3]) / 2.0,
+                             box[2] - box[0], box[3] - box[1]])
+                kpts, conf = kp_at[tid][idx]
+                colours[tid] = AP.blend(colours.get(tid), AP.describe(frame, kpts, conf), 0.6)
+            if keep:
+                try:
+                    got = enc(frame, np.asarray(dets, dtype="float32"))
+                    for tid, e in zip(keep, got):
+                        if e is not None:
+                            embs[tid].append(np.asarray(e))
+                except Exception as exc:  # noqa: BLE001
+                    print(f"  stitch: embed failed at frame {idx}: {exc}", file=sys.stderr)
+        idx += 1
+    cap.release()
+
+    out = {}
+    for tid, (t0, t1) in spans.items():
+        e = embs.get(tid)
+        out[tid] = {"emb": (np.mean(e, axis=0) if e else None),
+                    "colour": colours.get(tid), "t0": t0, "t1": t1,
+                    "samples": len(e or ())}
+    return out
+
+
 def _transcode_h264(src: Path, dst: Path) -> subprocess.CompletedProcess:
     """Re-encode to browser-friendly H.264 on the GPU (NVENC) — the annotated-
     video encode dominates wall-clock, so keep it off the CPU. Fall back to
@@ -982,6 +1117,28 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
             s["conf"] = round(sum(c) / len(c), 3)
         return segs
 
+    # Which track ids are the same human. ByteTrack cannot know (no appearance
+    # model), so it is resolved here, once, over the finished clip — see stitch.py.
+    # The track ids are LEFT ALONE and a `person` is recorded alongside: every
+    # consumer that keyed on a track id still works, and one that wants a stable
+    # identity now has one. An empty map means stitching did not run.
+    person_of, stitch_detail = {}, []
+    if STITCH_ON and traj:
+        try:
+            import stitch as ST
+            import appearance as AP
+            templates = _appearance_templates(src, traj, boxes_by_frame, native_fps, kp_conf)
+            if templates:
+                person_of, stitch_detail = ST.stitch(templates, colour_sim=AP.similarity)
+                merges = sum(1 for d in stitch_detail if "merged" in d)
+                print(f"  stitch: {len(templates)} tracks -> "
+                      f"{len(set(person_of.values()))} people ({merges} merges)",
+                      file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001
+            # Identity is an enhancement; a clip must still analyze without it.
+            print(f"  stitch: failed ({exc}) — track ids left fragmented", file=sys.stderr)
+            person_of, stitch_detail = {}, []
+
     persons = {}
     for tid in timeline:
         windows = [{"t": p["t"], "action": p["action"], "conf": p["conf"],
@@ -990,18 +1147,28 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
         persons[str(tid)] = {"segments": _segments(timeline[tid]),
                              "jumps": jumps_sec.get(str(tid), []),
                              "windows": windows}
+        if tid in person_of:
+            persons[str(tid)]["person"] = str(person_of[tid])
     persons_path = out_dir / f"{mp4.stem}.persons.{key}.json"
     _atomic_write_json(persons_path, {
         "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
-        "window": WINDOW, "stride": stride, "poseSource": pose_source, "persons": persons})
+        "window": WINDOW, "stride": stride, "poseSource": pose_source, "persons": persons,
+        # track id -> person id, and the merge decisions that produced it (kept so a
+        # surprising identity can be explained rather than just distrusted).
+        "personOf": {str(k): str(v) for k, v in person_of.items()},
+        "people": {str(k): [str(t) for t in v] for k, v in _people_groups(person_of).items()},
+        "stitch": stitch_detail})
 
+    # Centroids get the same mapping: the location sidecar is keyed by track id
+    # too, and the 3D scene pairs a skeleton with a position per person.
     # Location/centroid tracking — its own file (per-frame bbox centroid per
     # person, plus metric room positions when the clip has extrinsics).
     centroids_doc = {
         "schemaVersion": SCHEMA_VERSION, "model": key, "source": mp4.name,
         "sourceMtimeMs": source_mtime_ms, "nativeFps": round(native_fps, 3),
-        "persons": {str(t): centroids[t] for t in centroids}}
+        "persons": {str(t): centroids[t] for t in centroids},
+        "personOf": {str(k): str(v) for k, v in person_of.items()}}
     if room_geom is not None:
         cam_pos = room_geom["cam_pos_mm"]
         centroids_doc["roomFrame"] = {
@@ -1026,6 +1193,9 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
         "durationSec": round(total / native_fps, 3) if total else None,
         "temp": temp, "minConf": min_conf,
         "tracks": len(ev_idx), "trackActions": track_actions, "actions": seen,
+        # `tracks` counts ByteTrack fragments; `people` counts humans after
+        # stitching. They differ by exactly the fragmentation an occlusion caused.
+        "people": len(set(person_of.values())) if person_of else None,
         "jumps": sum(len(ev) for ev in jumps.values()),
         "annotated": annotated_path.name if has_annotated else None, "hasAnnotated": has_annotated,
     })
