@@ -39,8 +39,12 @@ GPUS="${SMARTROOM_GPUS:-$(nvidia-smi -L 2>/dev/null | wc -l)}"
 [ "$GPUS" -ge 1 ] 2>/dev/null || GPUS=1
 
 # All RGB clips (recordings-relative), the unit of work every stage shards over.
+# EVERY RGB clip: the webcam clip plus every named colour stream — the two
+# RealSense cameras AND the NVR security cameras, which a hardcoded three-name list
+# used to leave out of the whole pipeline. `*_color.mp4` cannot match an analysis
+# output (those end .annotated.<model>.mp4).
 mapfile -t CLIPS < <(cd "$SMARTROOM_SAVE_DIR" && \
-  find . \( -name camera_main.mp4 -o -name camera_d455_color.mp4 -o -name camera_d435_color.mp4 \) \
+  find . \( -name camera_main.mp4 -o -name 'camera_*_color.mp4' \) \
   | grep -v '/undistorted/' | sed 's|^\./||' | sort)
 
 # run_stage <label> <python> <script> <pathstyle: append|nargs> [extra args...]

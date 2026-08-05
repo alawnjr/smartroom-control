@@ -2,8 +2,9 @@
 """
 Object detection over the saved recordings, for the smartroom-control dashboard.
 
-Runs one or more pretrained YOLO26 models (OpenVINO, intel:cpu) on each
-`recordings/<node>/.../streams/camera_main.mp4`, reporting EVERY COCO class the
+Runs one or more pretrained YOLO26 models (OpenVINO, intel:cpu) on EVERY RGB clip
+in the recordings tree — the webcam clip, both RealSense colour streams, and the
+NVR security cameras — reporting EVERY COCO class the
 model knows — people plus the room's contents (chairs, laptops, bottles,
 monitors). Restrict it with SMARTROOM_DETECT_CLASSES if you only want some.
 
@@ -41,6 +42,7 @@ import datetime as dt
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -145,6 +147,24 @@ def _colour_for(cls: int):
     px = _np.uint8([[[h, 200, 255]]])
     b, g, r = _cv2.cvtColor(px, _cv2.COLOR_HSV2BGR)[0][0].tolist()
     return int(b), int(g), int(r)
+
+
+# An RGB clip is the legacy webcam clip or any named colour stream. This used to be
+# a hardcoded tuple of the three streams that existed when it was written —
+# camera_main and the two RealSense colours — which silently skipped every NVR
+# security camera in the archive (85 clips across cam1..cam4). Discover them from
+# disk instead, so a camera that appears never has to be added here.
+# The pattern is strict on purpose: `camera_<sensor>_color.mp4` and nothing else,
+# or the analysis outputs (camera_d455_color.annotated.yolo26m.mp4) would be read
+# back in as source clips.
+CLIP_RE = re.compile(r"^(camera_main|camera_[a-z][a-z0-9]*_color)\.mp4$")
+
+
+def rgb_clips(root: Path):
+    """Every analysable RGB clip under `root`, newest first."""
+    out = [p for p in root.rglob("camera_*.mp4")
+           if CLIP_RE.match(p.name) and "undistorted" not in p.parts]
+    return sorted(out, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def _is_pose(key: str) -> bool:
@@ -448,14 +468,10 @@ def main():
 
 
 def _run(root: Path, args) -> int:
-    # Every RGB source gets detection + pose: legacy webcam clips plus both
-    # RealSense color streams (new recordings are depth-cameras-only).
-    RGB_SOURCES = ("camera_main.mp4", "camera_d455_color.mp4", "camera_d435_color.mp4")
     if args.path:
         clips = [root / p for p in args.path]
     else:
-        clips = sorted((p for name in RGB_SOURCES for p in root.rglob(name)),
-                       key=lambda p: p.stat().st_mtime, reverse=True)
+        clips = rgb_clips(root)
     # undistorted/ holds lens-corrected COPIES of clips, not additional clips.
     clips = [c for c in clips if c.exists() and "undistorted" not in c.parts]
 
