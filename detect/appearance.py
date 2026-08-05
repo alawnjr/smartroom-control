@@ -55,11 +55,24 @@ L_ANKLE, R_ANKLE = 15, 16
 KP_CONF = float(os.environ.get("SMARTROOM_APPEARANCE_KP_CONF", "0.4"))
 # Bin counts. Coarse on purpose: a few hundred cloth pixels cannot fill a fine
 # histogram, and two samples of the same shirt would then intersect at almost
-# nothing. 6x6 chroma is about as fine as this pixel budget supports.
-AB_BINS = int(os.environ.get("SMARTROOM_APPEARANCE_AB_BINS", "6"))
-L_BINS = int(os.environ.get("SMARTROOM_APPEARANCE_L_BINS", "6"))
-# How much of a region's score is chroma vs lightness (see module docstring).
-CHROMA_W = float(os.environ.get("SMARTROOM_APPEARANCE_CHROMA_W", "0.7"))
+# nothing.
+AB_BINS = int(os.environ.get("SMARTROOM_APPEARANCE_AB_BINS", "8"))
+L_BINS = int(os.environ.get("SMARTROOM_APPEARANCE_L_BINS", "8"))
+# The a/b histogram covers a NARROW window around neutral, not the full 0..255.
+# Measured on this room's garment pixels: a and b span p05..p95 of 112..138 and
+# 114..140 — 26 of 255 levels. Binning the full range put every person's chroma in
+# the same one or two bins and the descriptor could not tell anyone apart (shirt
+# AUC 0.59, barely better than a coin). Values outside the window are CLIPPED into
+# the end bins rather than dropped, because cv2.calcHist silently discards
+# out-of-range pixels — a genuinely red shirt would have sampled as nothing.
+AB_LO = float(os.environ.get("SMARTROOM_APPEARANCE_AB_LO", "104"))
+AB_HI = float(os.environ.get("SMARTROOM_APPEARANCE_AB_HI", "152"))
+# How much of a region's score is chroma vs lightness. Lightness carries most of
+# the signal in THIS room — the clothing is largely grey/black/white/denim, whose
+# a/b differences are a few levels while L ranges from 48 to 180 between people —
+# so the split is deliberately close to even rather than chroma-led. Sweep it with
+# eval_appearance.py --sweep if the wardrobe changes.
+CHROMA_W = float(os.environ.get("SMARTROOM_APPEARANCE_CHROMA_W", "0.45"))
 # Fraction of the quad's width/height kept when shrinking toward its centre.
 SHRINK = float(os.environ.get("SMARTROOM_APPEARANCE_SHRINK", "0.6"))
 # A region with fewer sampled pixels than this is not a colour measurement.
@@ -104,7 +117,11 @@ def _hists(lab, mask):
     n = int(mask.sum())
     if n < MIN_PIXELS:
         return None
-    ab = cv2.calcHist([lab], [1, 2], mask, [AB_BINS, AB_BINS], [0, 256, 0, 256])
+    # Clip a/b into the window (see AB_LO/AB_HI) so out-of-window chroma lands in
+    # an end bin instead of being dropped by calcHist.
+    ab_src = np.clip(lab[:, :, 1:3], AB_LO, AB_HI - 1e-3)
+    ab = cv2.calcHist([ab_src.astype(np.float32)], [0, 1], mask,
+                      [AB_BINS, AB_BINS], [AB_LO, AB_HI, AB_LO, AB_HI])
     li = cv2.calcHist([lab], [0], mask, [L_BINS], [0, 256])
     ab = (ab / max(1.0, ab.sum())).astype(np.float32).ravel()
     li = (li / max(1.0, li.sum())).astype(np.float32).ravel()
