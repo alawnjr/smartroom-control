@@ -125,6 +125,16 @@ def sample_clip(mp4: Path, tracks, encoder=None, max_samples_per_track=12):
     return {k: v for k, v in out.items() if v}
 
 
+def _template(rows):
+    """(colour template, mean ReID embedding) over a run of samples — the same
+    accumulation the live registry and the offline stitcher keep per identity."""
+    tmpl = {}
+    for _t, desc, _e in rows:
+        tmpl = A.blend(tmpl, desc, 0.6)
+    embs = [e for _t, _d, e in rows if e is not None]
+    return tmpl, (np.mean(embs, axis=0) if embs else None)
+
+
 def cos(a, b):
     if a is None or b is None:
         return None
@@ -160,6 +170,12 @@ def main():
                     help="only clips with at least this many tracks (impostors need two)")
     ap.add_argument("--reid", default=os.environ.get("SMARTROOM_REID_MODEL", "yolo26n-reid.onnx"),
                     help="ReID onnx to score as a baseline on the same pairs ('' to skip)")
+    ap.add_argument("--templates", action="store_true",
+                    help="compare accumulated TEMPLATES (each track split in half) "
+                         "instead of single frames — this is what the trackers do")
+    ap.add_argument("--max-gap", type=float, default=0.0,
+                    help="only genuine pairs this close in time (0 = any). A long-gap "
+                         "'genuine' pair may be a ByteTrack id switch, i.e. two people")
     ap.add_argument("--sweep", action="store_true",
                     help="sweep the chroma/lightness balance and the shirt/trouser "
                          "weighting instead of reporting one configuration")
@@ -197,20 +213,42 @@ def main():
         if len(sampled) < args.min_tracks:
             continue
         used += 1
-        # genuine: same track, different frames
-        for tid, rows in sampled.items():
-            for a in range(len(rows)):
-                for b in range(a + 1, len(rows)):
-                    pairs["g"].append((rows[a][1], rows[b][1], cos(rows[a][2], rows[b][2])))
-        # impostor: two tracks whose samples are close in time (both on screen)
-        ids = list(sampled)
-        for a in range(len(ids)):
-            for b in range(a + 1, len(ids)):
-                for ta, da, ea in sampled[ids[a]]:
-                    for tb, db, eb in sampled[ids[b]]:
-                        if abs(ta - tb) > 0.2:
+        if args.templates:
+            # One template per HALF of each track: genuine = a person's own two
+            # halves, impostor = two different tracks' templates. This is the
+            # comparison the trackers actually make (an EMA template vs a fresh
+            # observation), so single-frame noise is not the thing being measured.
+            halves = {}
+            for tid, rows in sampled.items():
+                if len(rows) < 4:
+                    continue
+                mid = len(rows) // 2
+                halves[tid] = [_template(rows[:mid]), _template(rows[mid:])]
+            for tid, (h1, h2) in halves.items():
+                pairs["g"].append((h1[0], h2[0], cos(h1[1], h2[1])))
+            ids = list(halves)
+            for a in range(len(ids)):
+                for b in range(a + 1, len(ids)):
+                    for ha in halves[ids[a]]:
+                        for hb in halves[ids[b]]:
+                            pairs["i"].append((ha[0], hb[0], cos(ha[1], hb[1])))
+        else:
+            # genuine: same track, different frames
+            for tid, rows in sampled.items():
+                for a in range(len(rows)):
+                    for b in range(a + 1, len(rows)):
+                        if args.max_gap and abs(rows[a][0] - rows[b][0]) > args.max_gap:
                             continue
-                        pairs["i"].append((da, db, cos(ea, eb)))
+                        pairs["g"].append((rows[a][1], rows[b][1], cos(rows[a][2], rows[b][2])))
+            # impostor: two tracks whose samples are close in time (both on screen)
+            ids = list(sampled)
+            for a in range(len(ids)):
+                for b in range(a + 1, len(ids)):
+                    for ta, da, ea in sampled[ids[a]]:
+                        for tb, db, eb in sampled[ids[b]]:
+                            if abs(ta - tb) > 0.2:
+                                continue
+                            pairs["i"].append((da, db, cos(ea, eb)))
         print(f"  {det.parent.relative_to(root)}: {len(sampled)} tracks", file=sys.stderr)
 
     def score(key, wt, wb):
