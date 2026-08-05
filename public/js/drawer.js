@@ -42,7 +42,9 @@ function personPanel(id, entries, actions) {
   for (const e of entries) for (const [l, p] of entryTop(e)) peak.set(l, Math.max(peak.get(l) ?? 0, p));
   const rows = [...peak.entries()].sort((a, b) => b[1] - a[1]).slice(0, TOP_N).map(([l]) => l);
 
-  const headerLab = h("span", { class: "lab" }, "idle");
+  // An em dash, not "idle": the analyser now writes action:null when it had
+  // nothing confident to say, and printing "idle" turned that into a claim.
+  const headerLab = h("span", { class: "lab" }, "\u2014");
   const bars = rows.map((label) => {
     const fill = h("div", { class: `bfill ${barClass(label, actions)}`, style: "width:0%" });
     const val = h("span", { class: "bval" }, "0.00");
@@ -100,7 +102,7 @@ function personPanel(id, entries, actions) {
   const update = (t) => {
     const at = distAt(entries, t);
     const kept = !!at && at.ref.kept !== false;
-    headerLab.textContent = at ? at.ref.action : "idle";
+    headerLab.textContent = (at && at.ref.action) || "\u2014";
     headerLab.className = `lab ${kept ? "on" : ""}`;
     for (const b of bars) {
       const p = at?.dist.get(b.label) ?? 0;

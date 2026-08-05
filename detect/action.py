@@ -30,7 +30,8 @@ SMARTROOM_STGCN_CONFIG, SMARTROOM_STGCN_CKPT, SMARTROOM_ACTION_WINDOW (48),
 SMARTROOM_ACTION_STRIDE (2), SMARTROOM_ACTION_OFFSET_FRAC (0.35),
 SMARTROOM_ACTION_TEMP (softmax temperature; >1 flattens),
 SMARTROOM_ACTION_MIN_CONF (absolute abstention threshold; overrides the
-per-variant k×chance default — below it a window is labelled "idle").
+per-variant k×chance default — below it a window gets NO label: action is null
+and `kept` is false).
 """
 
 import argparse
@@ -365,15 +366,19 @@ OFFSET_FRAC = float(os.environ.get("SMARTROOM_ACTION_OFFSET_FRAC", "0.15"))
 #   TEMP (temperature scaling) — divides the recovered logits before softmax so
 #     the confidence number is calibrated (the recognizer is overconfident).
 #     T=1 is a no-op; T>1 flattens. See Guo et al. temperature scaling.
-#   MIN_CONF (abstention) — below this calibrated confidence, emit no label
-#     ("idle") instead of guessing, à la the "background class when all scores
+#   MIN_CONF (abstention) — below this calibrated confidence, emit NO LABEL AT ALL
+#     rather than guessing, à la the "background class when all scores
 #     are weak" rule in streaming action-detection work. Expressed as a MULTIPLE
 #     OF CHANCE (1/num_classes), because a 60-way softmax max is naturally small
 #     (and our webcam poses are out-of-distribution for these models, so output
 #     sits near uniform); "k× chance" auto-adapts to 60 vs 51 classes. A raw
 #     absolute override is also accepted (SMARTROOM_ACTION_MIN_CONF).
 # Both are per-variant; the env vars, when set, override both variants.
-IDLE = "idle"
+# Abstention used to be reported as the label "idle", which reads as a positive
+# finding ("this person is idle") when it means the opposite: the classifier had
+# nothing confident to say. The window still exists, with its confidence and its
+# top-K, and `kept: false` marks it — but `action` is now null, so a consumer
+# either shows a real label or shows nothing.
 # A person whose bounding box is flush against the frame edge is cut off, so their
 # skeleton is partial and the classifier would just guess. Label such windows
 # "not fully in frame" (not kept — no vote, no chip, no classifier call) instead.
@@ -826,8 +831,8 @@ def _ava_pass(src, framedata, boxes_by_frame, width, height, native_fps,
                 label = labs[0][0] if labs else None
                 conf = labs[0][1] if labs else 0.0
                 ev_idx[tid].append(g)
-                ev_lab[tid].append(label or IDLE)
-                timeline[tid].append({"t": round(t, 3), "action": label or IDLE,
+                ev_lab[tid].append(label or "")
+                timeline[tid].append({"t": round(t, 3), "action": label,
                                       "conf": round(conf, 3),
                                       "kept": label is not None,
                                       # multi-label: EVERY class above threshold
@@ -1030,11 +1035,12 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
                         if len(win) < WINDOW:
                             win = [win[0]] * (WINDOW - len(win)) + win
                         label, cf, top = classify(win)
-                        action_lab = label or IDLE
+                        action_lab = label
                     ev_idx[tid].append(idx)
-                    # overlay shows "idle"/"not fully in frame" rather than a stale or
-                    # guessed label; the summary vote + chips only count confident windows.
-                    ev_lab[tid].append(action_lab)
+                    # The burned-in overlay shows "not fully in frame" where that
+                    # applies and NOTHING where the classifier abstained; the summary
+                    # vote + chips only ever counted confident windows.
+                    ev_lab[tid].append(action_lab or "")
                     # Every window goes in the timeline (with its top-K for the live
                     # bar graph); `kept` marks the confident ones that vote + chip.
                     t = max(0.0, (idx - offset_frames) / native_fps)
@@ -1140,8 +1146,13 @@ def process_clip(model, infer, pose, mp4: Path, variant: dict,
     # is kept in a *separate* file (camera_main.centroids.<model>.json) below.
     def _segments(tl):
         # Collapse consecutive equal-label windows into {action,start,end,conf} ranges.
+        # Abstained windows (action null) are not ranges of anything, so they are
+        # skipped rather than becoming null-labelled segments; a gap in the segment
+        # list IS the "nothing confident here" statement.
         segs = []
         for p in tl:
+            if not p.get("action"):
+                continue
             if segs and segs[-1]["action"] == p["action"]:
                 segs[-1]["end"] = p["t"]
                 segs[-1]["_c"].append(p["conf"])

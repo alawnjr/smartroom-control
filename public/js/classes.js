@@ -66,7 +66,7 @@ function render() {
     h("div", { class: "classes-hd" },
       h("div", {},
         h("h2", { class: "h2", style: "margin-bottom:0" }, "Action classes"),
-        h("p", { class: "sub" }, "Toggle classes off to mask them at inference — the model picks the best enabled class or falls back to idle. Re-analyze clips to apply.")),
+        h("p", { class: "sub" }, "Toggle classes off to mask them at inference — the model picks the best enabled class, or reports nothing when none is confident. Re-analyze clips to apply.")),
       h("label", { class: "search" }, "🔍", search)),
     ...datasets.map(datasetCard));
 }

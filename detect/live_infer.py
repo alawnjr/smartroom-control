@@ -2526,6 +2526,12 @@ def infer_loop(shared: Shared, geom: dict, weights: str, device: str, flip: bool
             lab = shared.get_label(tid) if (skeleton or ava) else None
             # multi-label: every class the classifier put above threshold
             acts = [list(a) for a in lab["top"]] if (lab and lab.get("top")) else []
+            # A skeleton variant reports its whole top-K whatever the confidence,
+            # so an abstained window still had a name attached to it here — the
+            # argmax of a distribution the classifier itself did not believe. AVA
+            # only ever reports classes over its threshold; match that.
+            if lab is not None and skeleton and not lab.get("action"):
+                acts = []
             # geometric jump detector — independent of the classifier; when airborne
             # add "jump" to the set (at the front) rather than replacing it.
             comy, body_h = _hip_com(p)
