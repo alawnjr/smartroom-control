@@ -296,6 +296,19 @@ def main():
     if any(rc is not None for _, _, rc in pairs["g"]):
         g, i = score("reid", 0, 0)
         row("reid embedding", g, i)
+        # The actual question behind "weight colour more heavily": does colour add
+        # anything ON TOP of the embedding, and at what weight? Score only pairs
+        # where BOTH signals exist, so the comparison is like-for-like.
+        print()
+        for w in (0.0, 0.15, 0.3, 0.5, 0.7, 1.0):
+            fused = {"g": [], "i": []}
+            for pop in ("g", "i"):
+                for da, db, rc in pairs[pop]:
+                    s, _ = A.similarity(da, db, 1, 1)
+                    if s is None or rc is None:
+                        continue
+                    fused[pop].append((1 - w) * rc + w * s)
+            row(f"reid+colour w={w:.2f}", fused["g"], fused["i"])
     print("\nFA@90% = impostor pairs accepted at the threshold that keeps 90% of "
           "genuine pairs. Lower is better; 100% means the signal is useless.")
     return 0
