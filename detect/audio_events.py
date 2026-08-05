@@ -52,7 +52,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 MODEL_KEY = os.environ.get("SMARTROOM_AUDIO_MODEL_KEY", "audio-passt")
 SCHEMA_VERSION = 1
 SAMPLE_RATE = 32000                       # PaSST's native rate; also the mp3's
-WINDOW_S = float(os.environ.get("SMARTROOM_AUDIO_WINDOW_S", "10.0"))
+# 9.98 s, not 10.0: the mel front end hops every 320 samples, so 10.0 s yields 1000
+# frames where PaSST's positional embeddings expect 998, and hear21passt then
+# interpolates them with a warning on every batch. 9.98 s hits the trained geometry
+# exactly — same window to the ear, no resampling of the position grid.
+WINDOW_S = float(os.environ.get("SMARTROOM_AUDIO_WINDOW_S", "9.98"))
 HOP_S = float(os.environ.get("SMARTROOM_AUDIO_HOP_S", "2.0"))
 # Report every class over this probability. AudioSet models are calibrated loosely
 # and the tail is long; 0.2 keeps quiet-but-real events (a door, a cough) while
