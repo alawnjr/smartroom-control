@@ -25,9 +25,22 @@ Environment=SMARTROOM_SAVE_DIR=/mnt/data4/intern26/recordings
 # to 1 (or remove) if you want browser-playable boxes-burned-in videos back —
 # the encode now uses the GPU (NVENC), so it's much cheaper than before.
 Environment=SMARTROOM_DETECT_ANNOTATE=0
-# Action classification from RGB pixels (SlowFast-AVA), not skeletons — the same
-# model the live service runs. See detect/ava_model.py.
-Environment=SMARTROOM_ACTION_VARIANTS=ava
+# TWO action models per clip, and they see different things:
+#   ava  — SlowFast-AVA, RGB pixels + each person's box: carried objects, posture,
+#          scene context, multi-label. The same model the live service runs.
+#   hmdb — PoseC3D on HMDB51, KEYPOINTS only: blind to objects and appearance, but
+#          it reads gait, so it separates walk/run/turn from stand/sit, which AVA
+#          conflates. Skeleton-only also means it survives lighting changes.
+# Each writes its own sidecar set (action-ava / action-hmdb); the dashboard's
+# "Action model" buttons switch which one drives the labels. Neither overwrites
+# the other, and dropping one from this list just stops refreshing it.
+# HMDB51's vocabulary is sports/consumer video, so on office footage its rare
+# classes ("dribble", "draw sword") are what an out-of-distribution argmax looks
+# like — temperature + abstention already suppress the weak ones, and
+# action-classes.json can mask any class outright (see detect/action.py).
+# Cost: PoseC3D is a 3D-CNN — budget ~1.5 min per 30 s clip on one GPU, sharded
+# across all of them by run-analysis.sh.
+Environment=SMARTROOM_ACTION_VARIANTS=ava,hmdb
 # Spatial estimation comes from the DEPTH camera, full stop — same allowlist the
 # live service runs under. Without it, localize.py falls back to the ankle
 # floor-ray on any clip with no depth track, i.e. it would guess room positions
